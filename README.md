@@ -53,8 +53,10 @@ In the cached harness, `handoff` is effectively tied with the direct `BytesMut`
 behavior-preserving baseline on coalesced input, and is faster on fragmented
 input because small prefixes are copied into compact `Bytes` and tiny tunnel
 reads are coalesced before entering the write handoff. The flush threshold is a
-caller policy; the crate's write coalescer defaults to 1 KiB and can model
-immediate flushing with `WriteCoalescerConfig::immediate()`.
+caller policy; the crate's write coalescer uses a TCP/MSS-tuned 16 KiB default
+and can model immediate flushing with `WriteCoalescerConfig::immediate()`. Use
+the harness tuner on your workload to pick a throughput-efficient point within
+your downstream visibility-latency budget.
 
 ## Examples
 
@@ -80,6 +82,10 @@ use bytes::Bytes;
 use bytes_handoff::HandoffBuffer;
 
 /// Reads available bytes, splits one complete line, and hands it off.
+///
+/// `if let` drains at most one frame per read for illustration; real protocol
+/// loops typically use `while let` to drain every complete frame before the
+/// next `read_available` call. See `examples/line_protocol.rs`.
 async fn read_one_line<R>(reader: &mut R) -> Result<(), Box<dyn std::error::Error>>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -127,17 +133,146 @@ where
 
 `WriteCoalescer` is an optional fire-and-forget helper around `WriteHandoff`.
 It collects small adjacent writes up to a byte threshold before submitting one
-owned `Bytes` chunk to the writer task. The default threshold is 1 KiB
+owned `Bytes` chunk to the writer task. The default threshold is 16 KiB
 (`DEFAULT_WRITE_COALESCE_THRESHOLD`). Configure it with
 `WriteCoalescer::with_threshold`, or use `WriteCoalescerConfig::immediate()` for
 flush-every-write behavior. Always call `flush()` at message boundaries, before
-switching modes when downstream latency matters, and before closing.
+switching modes when downstream latency matters, and before closing. Keep the
+`WriteHandoffConfig` pending-byte budget at least as large as the coalescing
+threshold.
 
 The tradeoff is direct: a larger threshold reduces queueing, notification, and
 writer-task overhead under tiny fragmented input; a smaller threshold makes
-bytes visible to the downstream writer sooner. Completion-ticket writes are not
-coalesced by this helper, because their completion boundary is part of the
-observable behavior.
+bytes visible to the downstream writer sooner. The benchmark harness includes a
+tuner that maps measured oldest-byte flush delay against throughput and chooses
+the knee of that curve.
+Completion-ticket writes are not coalesced by this helper, because their
+completion boundary is part of the observable behavior.
+
+## Coalescing Tuning
+
+The tuner is intentionally not "pick the fastest number." It uses flush delay as
+one axis and throughput as the other. With coalescer stats enabled, flush delay
+is the measured oldest-byte wait from the first buffered byte until the batch is
+flushed. Without stats, the tuner falls back to estimated
+`input_chunks_per_flush` as a portable visibility-delay proxy.
+
+The scorer builds the Pareto frontier of the measured curve, normalizes both
+axes, and chooses the point with the largest distance above the straight line
+from the lowest-delay point to the highest-throughput point. That is a discrete
+knee/inflection estimate: the point where the throughput gained by waiting
+longer starts to flatten. Optional budgets such as `max_reads_per_flush`,
+`max_avg_flush_wait_micros`, `max_max_flush_wait_micros`, or
+`max_connection_p99_micros` are hard constraints applied before the knee is
+chosen.
+
+For discovery runs, use `WriteCoalescingSearch` or
+`cargo run --release --bin tune_coalescing -- --next`. The adaptive search starts
+with the minimum threshold, maximum threshold, and log-space midpoint; fills the
+largest unknown gaps until it has enough curve shape; then probes the immediate
+neighbors around the current recommendation and the current throughput peak. It
+stops when those local neighbors are measured, or when `max_threshold_points` is
+reached. This gives a binary-search-style hardware tuning loop without requiring
+a full sweep. For cached or duplex Linux harness runs, set `TASKSET_CORES`
+alongside `WORKER_THREADS` so the tuner measures the CPU shape you plan to run.
+Use `./bench/run-tcp-model-tuner.sh` or pass `--input-model tcp` to model a
+TCP stream as MSS-sized source chunks. The default `--tcp-mss-bytes 1460`
+matches the usual TCP payload carried by a 1500-byte Ethernet MTU with IPv4/TCP
+headers. That standard Ethernet MSS is the packet-size shape used for testing;
+it is not the same thing as a userspace `read()` size, which can be larger when
+the kernel has already coalesced multiple segments.
+
+When coalescer stats are enabled, the CLI reports the measured
+`input_chunks_per_flush` from the harness. Without stats, it falls back to
+`ceil(threshold_bytes / input_fragment_bytes)`. For example, with 64 byte source
+chunks and a 16 KiB threshold, bytes can wait for up to 256 source chunks before
+the tunnel chunk is flushed. With `--input-model tcp`, that fallback uses
+`tcp_mss_bytes` instead of userspace `read()` size.
+
+On the current TCP/MSS cached tuning shape, the adaptive tuner selected the
+16 KiB default. This run used 1460-byte TCP source chunks, 128 cached
+connections, 16 workers, 1 MiB tunnel payloads, coalescer stats enabled, and
+5 second target runs:
+
+| threshold | input chunks per flush | throughput | p99 latency | avg flush wait |
+|---:|---:|---:|---:|---:|
+| flush every chunk | 1.00 | 10821 MiB/s | 12.6 ms | 0 us |
+| 2 KiB | 2.00 | 15587 MiB/s | 8.04 ms | 15.8 us |
+| 8 KiB | 6.00 | 26621 MiB/s | 4.40 ms | 19.4 us |
+| **16 KiB** | **12.00** | **33336 MiB/s** | **3.28 ms** | **17.0 us** |
+| 32 KiB | 22.50 | 33780 MiB/s | 3.30 ms | 32.2 us |
+| 64 KiB | 45.00 | 31820 MiB/s | 3.51 ms | 67.9 us |
+| 256 KiB | 180.00 | 23693 MiB/s | 5.05 ms | 352 us |
+
+The 32 KiB point had slightly higher raw throughput, but the tuner chose
+16 KiB because it is within about 1.3% throughput while cutting the measured
+flush wait roughly in half.
+
+```rust
+use bytes_handoff::{
+    WriteCoalescingMeasurement, WriteCoalescingTuner, WriteCoalescingTunerConfig,
+};
+
+let tuner = WriteCoalescingTuner::new(WriteCoalescingTunerConfig {
+    ..WriteCoalescingTunerConfig::default()
+})?;
+
+let recommendation = tuner.recommend([
+    WriteCoalescingMeasurement {
+        threshold_bytes: 64,
+        input_fragment_bytes: 64,
+        observed_input_chunks_per_flush: None,
+        throughput_mib_per_sec: 100.0,
+        cpu_ns_per_byte: 0.0,
+        connection_p99_micros: None,
+        avg_flush_wait_micros: Some(1.0),
+        max_flush_wait_micros: None,
+    },
+    WriteCoalescingMeasurement {
+        threshold_bytes: 1024,
+        input_fragment_bytes: 64,
+        observed_input_chunks_per_flush: None,
+        throughput_mib_per_sec: 900.0,
+        cpu_ns_per_byte: 0.0,
+        connection_p99_micros: None,
+        avg_flush_wait_micros: Some(10.0),
+        max_flush_wait_micros: None,
+    },
+    WriteCoalescingMeasurement {
+        threshold_bytes: 8192,
+        input_fragment_bytes: 64,
+        observed_input_chunks_per_flush: None,
+        throughput_mib_per_sec: 980.0,
+        cpu_ns_per_byte: 0.0,
+        connection_p99_micros: None,
+        avg_flush_wait_micros: Some(50.0),
+        max_flush_wait_micros: None,
+    },
+    WriteCoalescingMeasurement {
+        threshold_bytes: 16384,
+        input_fragment_bytes: 64,
+        observed_input_chunks_per_flush: None,
+        throughput_mib_per_sec: 1000.0,
+        cpu_ns_per_byte: 0.0,
+        connection_p99_micros: None,
+        avg_flush_wait_micros: Some(100.0),
+        max_flush_wait_micros: None,
+    },
+])?;
+
+assert_eq!(recommendation.threshold_bytes(), 1024);
+assert_eq!(recommendation.reads_per_flush(), 16);
+```
+
+The same ranking is available as an adaptive planner:
+
+```rust
+use bytes_handoff::{WriteCoalescingSearch, WriteCoalescingSearchConfig};
+
+let search = WriteCoalescingSearch::new(WriteCoalescingSearchConfig::default())?;
+let first_step = search.step(std::iter::empty())?;
+assert_eq!(first_step.thresholds(), &[1]);
+```
 
 ## Monoio Feature
 
@@ -206,14 +341,19 @@ measurement. Use `--transport tcp` for a localhost TCP service/sink harness. Use
 Monoio read/write handoff path against the Tokio cached path; see
 [`bench/README.md`](bench/README.md).
 
-### Latest Linux Harness Results
+### Cached Implementation Comparison
 
-These are cached end-to-end harness results from a 16 physical core Ubuntu
-24.04 Linux server, not Criterion microbenchmarks. The cached transport feeds
-each proxy from prebuilt payload bytes and writes into a counting sink, so
-client, sink, TCP, and kernel scheduling costs are not part of the headline
-number. Treat these rows as runtime and handoff-path comparisons, not as TCP
-socket throughput.
+These are cached end-to-end harness results from a 16 physical core Linux host,
+not Criterion microbenchmarks. The cached transport feeds each proxy from
+prebuilt payload bytes and writes into a counting sink, so client, sink, live
+TCP, and kernel scheduling costs are not part of the headline number. Treat
+these rows as runtime and handoff-path comparisons for an explicit cached
+workload shape, not as socket throughput.
+
+The fragmented TCP rows use the harness TCP/MSS input model: payload is
+delivered to the reader in 1460-byte source chunks, then protocol route frames
+inside that stream are 64 bytes each. This models packet-sized arrivals without
+measuring the operating system's socket path.
 
 Run shape:
 
@@ -224,8 +364,11 @@ Run shape:
 - route frame payload: 63 bytes
 - tunnel payload per connection: 1 MiB
 - read reserve: 16 KiB
-- tunnel handoff flush threshold: 16 KiB (`read_reserve`)
-- handoff write pending budget: 32 KiB default (`2 * read_reserve`)
+- tunnel handoff flush threshold: immediate or the 16 KiB default, as shown
+- fragmented TCP/MSS rows: 512 KiB handoff write pending budget, so the
+  threshold comparison is not primarily a backpressure measurement
+- coalesced table: 32 KiB default handoff write pending budget
+  (`2 * read_reserve`)
 - completion mode: fire-and-forget
 - runs: 2 per point
 - target duration: 5 seconds per run
@@ -246,47 +389,60 @@ The implementations are:
 - `raw_copy`: unparsed async copy; this is a lower bound and does less protocol
   work than `handoff`.
 
-Coalesced input, where the cached reader yields 16 KiB chunks:
+Immediate fragmented input with the TCP/MSS source model, where `handoff`
+submits every tunnel read as soon as it is observed:
 
 | implementation | throughput | avg CPU used | cost | p99 latency |
 |---|---:|---:|---:|---:|
-| `handoff` | 38220 MiB/s | 15.38 cores | 0.38 ns/B | 3.15 ms |
-| `bytesmut_handoff` | 38328 MiB/s | 15.38 cores | 0.38 ns/B | 3.15 ms |
-| `manual_vec` | 43259 MiB/s | 14.84 cores | 0.33 ns/B | 0.574 ms |
-| `raw_copy` | 43305 MiB/s | 14.83 cores | 0.33 ns/B | 0.509 ms |
-| `monoio_handoff` | 41447 MiB/s | 16.06 cores | 0.37 ns/B | 3.26 ms |
+| `handoff` | 10776 MiB/s | 13.18 cores | 1.17 ns/B | 13.0 ms |
+| `bytesmut_handoff` | 10816 MiB/s | 13.15 cores | 1.16 ns/B | 12.5 ms |
+| `manual_vec` | 41863 MiB/s | 14.08 cores | 0.32 ns/B | 0.400 ms |
+| `raw_copy` | 42592 MiB/s | 14.50 cores | 0.33 ns/B | 0.396 ms |
+| `monoio_handoff` | 10149 MiB/s | 14.79 cores | 1.39 ns/B | 13.1 ms |
 
-Fragmented input, where the cached reader yields 64 byte chunks:
+16 KiB default fragmented input with the TCP/MSS source model, where the default
+threshold batches tunnel bytes until 16 KiB or end-of-stream:
 
 | implementation | throughput | avg CPU used | cost | p99 latency |
 |---|---:|---:|---:|---:|
-| `handoff` | 33364 MiB/s | 15.36 cores | 0.44 ns/B | 3.63 ms |
-| `bytesmut_handoff` | 29748 MiB/s | 15.48 cores | 0.50 ns/B | 4.11 ms |
-| `manual_vec` | 42654 MiB/s | 14.82 cores | 0.33 ns/B | 0.482 ms |
-| `raw_copy` | 42666 MiB/s | 14.80 cores | 0.33 ns/B | 0.502 ms |
-| `monoio_handoff` | 26218 MiB/s | 16.06 cores | 0.58 ns/B | 4.99 ms |
+| `handoff` | 33522 MiB/s | 13.69 cores | 0.39 ns/B | 3.27 ms |
+| `bytesmut_handoff` | 34211 MiB/s | 13.69 cores | 0.38 ns/B | 3.22 ms |
+| `manual_vec` | 41940 MiB/s | 14.32 cores | 0.33 ns/B | 0.400 ms |
+| `raw_copy` | 42589 MiB/s | 14.25 cores | 0.32 ns/B | 0.395 ms |
+| `monoio_handoff` | 20827 MiB/s | 16.04 cores | 0.73 ns/B | 6.34 ms |
+
+Coalesced input, where the cached reader yields 16 KiB chunks and the default
+16 KiB threshold writes each tunnel chunk directly:
+
+| implementation | throughput | avg CPU used | cost | p99 latency |
+|---|---:|---:|---:|---:|
+| `handoff` | 36553 MiB/s | 13.98 cores | 0.36 ns/B | 3.22 ms |
+| `bytesmut_handoff` | 36750 MiB/s | 14.02 cores | 0.36 ns/B | 3.20 ms |
+| `manual_vec` | 42711 MiB/s | 14.18 cores | 0.32 ns/B | 0.407 ms |
+| `raw_copy` | 42730 MiB/s | 14.52 cores | 0.33 ns/B | 0.394 ms |
+| `monoio_handoff` | 39305 MiB/s | 16.04 cores | 0.39 ns/B | 3.40 ms |
 
 Interpretation:
 
-- Coalesced cached input shows the steady-state cost of the introspectable
-  handoff path without socket noise. `handoff` matches the direct
-  `BytesMut`/`read_buf` handoff baseline and is about 12% behind the direct
-  parser baseline while preserving the safer buffer lifecycle, owned prefix
-  handoff, bounded write queue, and mode-switch tail preservation.
-- Fragmented cached input is now protected by a 16 KiB tunnel flush threshold.
-  That removes the old per-64-byte write-handoff cliff while still preserving
-  byte-zero routing and exact output bytes.
-- The direct `BytesMut` handoff baseline is the closest behavior-preserving
-  comparison for the read-mutable path. `handoff` is effectively tied with it on
-  coalesced input and is about 12% faster on fragmented input because tiny
-  prefixes are copied into compact `Bytes` instead of freezing `split_to` views
-  that keep larger buffer allocations alive until the write handoff drains them.
-- `monoio_handoff` uses the available workers fully in both cached workloads.
-  After tunnel coalescing, the Tokio handoff path is faster in fragmented cached
-  input, while Monoio remains close on coalesced input.
-- `raw_copy` is useful as a lower bound, but it is not a semantic replacement:
-  it does not parse route frames, preserve parser state, or hand off owned
-  prefixes.
+- Immediate fragmented input is the latency-floor policy: tunnel bytes become
+  visible downstream as soon as each read completes, but per-read handoff,
+  queueing, and notification costs dominate throughput.
+- The 16 KiB default threshold batches roughly MSS-sized arrivals before
+  submitting the tunnel write. In this TCP/MSS model, that recovers most of the
+  coalesced-path throughput for `handoff` and `bytesmut_handoff` while still
+  bounding downstream visibility latency by the configured threshold.
+- Coalesced cached input shows the steady-state cost when reads already arrive
+  at the default threshold size. `handoff` matches the direct
+  `BytesMut`/`read_buf` handoff baseline while preserving the crate behavior:
+  byte-zero inspection, owned prefix handoff, bounded queued writes, and
+  mode-switch tail preservation.
+- The direct-parser controls, `manual_vec` and `raw_copy`, are useful upper and
+  lower bounds, but they are not semantic replacements: they omit the owned
+  cross-task handoff and bounded write-queue behavior this crate provides.
+- `monoio_handoff` remains strong on coalesced cached input. In the TCP/MSS
+  fragmented cached path, the 16 KiB policy now batches about 12 MSS-sized
+  chunks per flush without copying them into a contiguous buffer, roughly
+  doubling throughput over immediate flushing in this run.
 
 The current optimization target is fragmented Tokio handoff: preserve byte-zero
 inspection, tail preservation, owned prefix handoff, bounded queued writes, and

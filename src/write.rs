@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(feature = "monoio")]
 use std::task::Waker;
+use std::time::Instant;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc, oneshot};
 
@@ -17,7 +18,7 @@ use crate::{WriteBackpressure, WriteError};
 
 const MAX_BATCH_ITEMS: usize = 64;
 const MAX_BATCH_BYTES: usize = 1024 * 1024;
-pub const DEFAULT_WRITE_COALESCE_THRESHOLD: usize = 1024;
+pub const DEFAULT_WRITE_COALESCE_THRESHOLD: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub struct WriteHandoffConfig {
@@ -37,6 +38,75 @@ impl WriteHandoffConfig {
 #[derive(Clone, Copy, Debug)]
 pub struct WriteCoalescerConfig {
     pub threshold_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WriteCoalescerStats {
+    pub input_chunks: usize,
+    pub input_bytes: usize,
+    pub flushes: usize,
+    pub flush_bytes: usize,
+    pub buffered_flushes: usize,
+    pub direct_flushes: usize,
+    pub buffered_input_chunks: usize,
+    pub max_chunks_per_flush: usize,
+    pub max_bytes_per_flush: usize,
+    pub max_pending_bytes: usize,
+    pub total_flush_wait_nanos: u128,
+    pub max_flush_wait_nanos: u64,
+}
+
+impl WriteCoalescerStats {
+    pub fn merge(&mut self, other: Self) {
+        self.input_chunks = self.input_chunks.saturating_add(other.input_chunks);
+        self.input_bytes = self.input_bytes.saturating_add(other.input_bytes);
+        self.flushes = self.flushes.saturating_add(other.flushes);
+        self.flush_bytes = self.flush_bytes.saturating_add(other.flush_bytes);
+        self.buffered_flushes = self.buffered_flushes.saturating_add(other.buffered_flushes);
+        self.direct_flushes = self.direct_flushes.saturating_add(other.direct_flushes);
+        self.buffered_input_chunks = self
+            .buffered_input_chunks
+            .saturating_add(other.buffered_input_chunks);
+        self.max_chunks_per_flush = self.max_chunks_per_flush.max(other.max_chunks_per_flush);
+        self.max_bytes_per_flush = self.max_bytes_per_flush.max(other.max_bytes_per_flush);
+        self.max_pending_bytes = self.max_pending_bytes.max(other.max_pending_bytes);
+        self.total_flush_wait_nanos = self
+            .total_flush_wait_nanos
+            .saturating_add(other.total_flush_wait_nanos);
+        self.max_flush_wait_nanos = self.max_flush_wait_nanos.max(other.max_flush_wait_nanos);
+    }
+
+    pub fn avg_bytes_per_flush(self) -> f64 {
+        average(self.flush_bytes, self.flushes)
+    }
+
+    pub fn avg_chunks_per_flush(self) -> f64 {
+        average(self.input_chunks, self.flushes)
+    }
+
+    pub fn avg_buffered_chunks_per_flush(self) -> f64 {
+        average(self.buffered_input_chunks, self.buffered_flushes)
+    }
+
+    pub fn avg_flush_wait_nanos(self) -> f64 {
+        if self.buffered_flushes == 0 {
+            0.0
+        } else {
+            (self.total_flush_wait_nanos as f64) / (self.buffered_flushes as f64)
+        }
+    }
+}
+
+fn average(total: usize, count: usize) -> f64 {
+    if count == 0 {
+        0.0
+    } else {
+        (total as f64) / (count as f64)
+    }
+}
+
+fn nanos_u64(duration: std::time::Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
 impl WriteCoalescerConfig {
@@ -69,6 +139,9 @@ pub struct WriteCoalescer {
     handoff: WriteHandoff,
     threshold_bytes: usize,
     pending: BytesMut,
+    pending_started_at: Option<Instant>,
+    pending_chunks: usize,
+    stats: Option<WriteCoalescerStats>,
 }
 
 #[cfg(feature = "monoio")]
@@ -80,7 +153,11 @@ pub struct MonoioWriteHandoff {
 pub struct MonoioWriteCoalescer {
     handoff: MonoioWriteHandoff,
     threshold_bytes: usize,
-    pending: BytesMut,
+    pending: Vec<Bytes>,
+    pending_bytes: usize,
+    pending_started_at: Option<Instant>,
+    pending_chunks: usize,
+    stats: Option<WriteCoalescerStats>,
 }
 
 #[derive(Debug)]
@@ -106,9 +183,18 @@ enum WriteMessage {
 
 struct Budget {
     pending: AtomicUsize,
+    waiters: AtomicUsize,
     closed: AtomicBool,
     notify: Notify,
     limit: usize,
+}
+
+struct BudgetWaiter<'a>(&'a AtomicUsize);
+
+impl Drop for BudgetWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[cfg(feature = "monoio")]
@@ -333,12 +419,25 @@ impl WriteCoalescer {
         Self::with_config(handoff, WriteCoalescerConfig::new(threshold_bytes))
     }
 
+    pub fn with_threshold_and_stats(handoff: WriteHandoff, threshold_bytes: usize) -> Self {
+        Self::with_config_and_stats(handoff, WriteCoalescerConfig::new(threshold_bytes))
+    }
+
     pub fn with_config(handoff: WriteHandoff, config: WriteCoalescerConfig) -> Self {
         Self {
             handoff,
             threshold_bytes: config.threshold_bytes.max(1),
             pending: BytesMut::new(),
+            pending_started_at: None,
+            pending_chunks: 0,
+            stats: None,
         }
+    }
+
+    pub fn with_config_and_stats(handoff: WriteHandoff, config: WriteCoalescerConfig) -> Self {
+        let mut coalescer = Self::with_config(handoff, config);
+        coalescer.stats = Some(WriteCoalescerStats::default());
+        coalescer
     }
 
     pub fn threshold_bytes(&self) -> usize {
@@ -357,26 +456,42 @@ impl WriteCoalescer {
         &self.handoff
     }
 
+    pub fn stats(&self) -> WriteCoalescerStats {
+        self.stats.unwrap_or_default()
+    }
+
+    pub fn stats_enabled(&self) -> bool {
+        self.stats.is_some()
+    }
+
     pub async fn write_fire_and_forget(&mut self, bytes: Bytes) -> Result<(), WriteError> {
         if bytes.is_empty() {
             return self.flush().await;
         }
+        self.record_input(bytes.len());
         if self.threshold_bytes == 1 {
             self.flush().await?;
-            return self.handoff.write_fire_and_forget(bytes).await;
+            return self.write_direct(bytes).await;
         }
         if self.pending.is_empty() && bytes.len() >= self.threshold_bytes {
-            return self.handoff.write_fire_and_forget(bytes).await;
+            return self.write_direct(bytes).await;
         }
         if !self.pending.is_empty()
             && bytes.len() >= self.threshold_bytes
             && self.pending.len() < self.threshold_bytes
         {
             self.flush().await?;
-            return self.handoff.write_fire_and_forget(bytes).await;
+            return self.write_direct(bytes).await;
         }
 
+        if self.pending.is_empty() && self.stats.is_some() {
+            self.pending_started_at = Some(Instant::now());
+        }
         self.pending.extend_from_slice(&bytes);
+        if let Some(stats) = &mut self.stats {
+            self.pending_chunks = self.pending_chunks.saturating_add(1);
+            stats.max_pending_bytes = stats.max_pending_bytes.max(self.pending.len());
+        }
         if self.pending.len() >= self.threshold_bytes {
             self.flush().await?;
         }
@@ -388,12 +503,69 @@ impl WriteCoalescer {
             return Ok(());
         }
         let bytes = self.pending.split().freeze();
+        let chunks = std::mem::take(&mut self.pending_chunks);
+        let started_at = self.pending_started_at.take();
         let restore = bytes.clone();
-        if let Err(err) = self.handoff.write_fire_and_forget(bytes).await {
+        if let Err(err) = self.enqueue_fire_and_forget(bytes).await {
             self.pending.extend_from_slice(&restore);
+            self.pending_chunks = chunks;
+            self.pending_started_at = started_at;
             return Err(err);
         }
+        self.record_buffered_flush(restore.len(), chunks, started_at);
         Ok(())
+    }
+
+    async fn write_direct(&mut self, bytes: Bytes) -> Result<(), WriteError> {
+        let len = bytes.len();
+        self.enqueue_fire_and_forget(bytes).await?;
+        self.record_direct_flush(len);
+        Ok(())
+    }
+
+    async fn enqueue_fire_and_forget(&self, bytes: Bytes) -> Result<(), WriteError> {
+        if let Err(err) = self.handoff.try_write_fire_and_forget(bytes) {
+            self.handoff.write_fire_and_forget(err.into_bytes()).await?;
+        }
+        Ok(())
+    }
+
+    fn record_input(&mut self, bytes: usize) {
+        let Some(stats) = &mut self.stats else {
+            return;
+        };
+        stats.input_chunks = stats.input_chunks.saturating_add(1);
+        stats.input_bytes = stats.input_bytes.saturating_add(bytes);
+    }
+
+    fn record_direct_flush(&mut self, bytes: usize) {
+        let Some(stats) = &mut self.stats else {
+            return;
+        };
+        stats.flushes = stats.flushes.saturating_add(1);
+        stats.flush_bytes = stats.flush_bytes.saturating_add(bytes);
+        stats.direct_flushes = stats.direct_flushes.saturating_add(1);
+        stats.max_chunks_per_flush = stats.max_chunks_per_flush.max(1);
+        stats.max_bytes_per_flush = stats.max_bytes_per_flush.max(bytes);
+    }
+
+    fn record_buffered_flush(&mut self, bytes: usize, chunks: usize, started_at: Option<Instant>) {
+        let Some(stats) = &mut self.stats else {
+            return;
+        };
+        stats.flushes = stats.flushes.saturating_add(1);
+        stats.flush_bytes = stats.flush_bytes.saturating_add(bytes);
+        stats.buffered_flushes = stats.buffered_flushes.saturating_add(1);
+        stats.buffered_input_chunks = stats.buffered_input_chunks.saturating_add(chunks);
+        stats.max_chunks_per_flush = stats.max_chunks_per_flush.max(chunks);
+        stats.max_bytes_per_flush = stats.max_bytes_per_flush.max(bytes);
+        if let Some(started_at) = started_at {
+            let wait = nanos_u64(started_at.elapsed());
+            stats.total_flush_wait_nanos = stats
+                .total_flush_wait_nanos
+                .saturating_add(u128::from(wait));
+            stats.max_flush_wait_nanos = stats.max_flush_wait_nanos.max(wait);
+        }
     }
 }
 
@@ -465,12 +637,12 @@ impl MonoioWriteHandoff {
             return Err(WriteBackpressure::queue_full(bytes));
         }
 
-        state.pending_bytes = attempted;
         state.queue.push_back(WriteRequest {
             bytes,
             completion,
             budget_bytes: len,
         });
+        state.pending_bytes = attempted;
         let writer_waker = state.writer_waker.take();
         drop(state);
         wake_one(writer_waker);
@@ -509,18 +681,83 @@ impl MonoioWriteHandoff {
             } else {
                 (None, None)
             };
-            state.pending_bytes = attempted;
             state.queue.push_back(WriteRequest {
                 bytes,
                 completion,
                 budget_bytes: len,
             });
+            state.pending_bytes = attempted;
             let writer_waker = state.writer_waker.take();
             drop(state);
             wake_one(writer_waker);
             std::task::Poll::Ready(Ok(ticket))
         })
         .await
+    }
+
+    async fn write_many_fire_and_forget(
+        &self,
+        chunks: Vec<Bytes>,
+    ) -> Result<Vec<Bytes>, (WriteError, Vec<Bytes>)> {
+        let mut chunks = Some(chunks);
+        let result = std::future::poll_fn(|cx| {
+            let chunks_ref = chunks.as_ref().expect("chunks available until enqueue");
+            let mut item_count = 0usize;
+            let mut total_len = 0usize;
+            for bytes in chunks_ref {
+                if bytes.is_empty() {
+                    continue;
+                }
+                item_count = item_count.saturating_add(1);
+                total_len = total_len.saturating_add(bytes.len());
+            }
+            if item_count == 0 {
+                return std::task::Poll::Ready(Ok(chunks.take().expect("chunks returned once")));
+            }
+
+            let mut state = self.inner.borrow_mut();
+            if state.closed {
+                return std::task::Poll::Ready(Err(WriteError::Closed));
+            }
+            if total_len > state.byte_limit {
+                return std::task::Poll::Ready(Err(WriteError::ByteBudgetExceeded {
+                    attempted: state.pending_bytes.saturating_add(total_len),
+                    limit: state.byte_limit,
+                }));
+            }
+
+            let attempted = state.pending_bytes.saturating_add(total_len);
+            if attempted > state.byte_limit
+                || state.queue.len().saturating_add(item_count) > state.queue_limit
+            {
+                state.store_sender_waker(cx.waker());
+                return std::task::Poll::Pending;
+            }
+
+            let mut chunks = chunks.take().expect("chunks enqueued once");
+            for bytes in chunks.drain(..) {
+                if bytes.is_empty() {
+                    continue;
+                }
+                let len = bytes.len();
+                state.queue.push_back(WriteRequest {
+                    bytes,
+                    completion: None,
+                    budget_bytes: len,
+                });
+            }
+            state.pending_bytes = attempted;
+            let writer_waker = state.writer_waker.take();
+            drop(state);
+            wake_one(writer_waker);
+            std::task::Poll::Ready(Ok(chunks))
+        })
+        .await;
+
+        match result {
+            Ok(chunks) => Ok(chunks),
+            Err(err) => Err((err, chunks.take().unwrap_or_default())),
+        }
     }
 }
 
@@ -534,12 +771,29 @@ impl MonoioWriteCoalescer {
         Self::with_config(handoff, WriteCoalescerConfig::new(threshold_bytes))
     }
 
+    pub fn with_threshold_and_stats(handoff: MonoioWriteHandoff, threshold_bytes: usize) -> Self {
+        Self::with_config_and_stats(handoff, WriteCoalescerConfig::new(threshold_bytes))
+    }
+
     pub fn with_config(handoff: MonoioWriteHandoff, config: WriteCoalescerConfig) -> Self {
         Self {
             handoff,
             threshold_bytes: config.threshold_bytes.max(1),
-            pending: BytesMut::new(),
+            pending: Vec::new(),
+            pending_bytes: 0,
+            pending_started_at: None,
+            pending_chunks: 0,
+            stats: None,
         }
+    }
+
+    pub fn with_config_and_stats(
+        handoff: MonoioWriteHandoff,
+        config: WriteCoalescerConfig,
+    ) -> Self {
+        let mut coalescer = Self::with_config(handoff, config);
+        coalescer.stats = Some(WriteCoalescerStats::default());
+        coalescer
     }
 
     pub fn threshold_bytes(&self) -> usize {
@@ -547,38 +801,55 @@ impl MonoioWriteCoalescer {
     }
 
     pub fn pending_bytes(&self) -> usize {
-        self.pending.len()
+        self.pending_bytes
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pending.is_empty()
+        self.pending_bytes == 0
     }
 
     pub fn handoff(&self) -> &MonoioWriteHandoff {
         &self.handoff
     }
 
+    pub fn stats(&self) -> WriteCoalescerStats {
+        self.stats.unwrap_or_default()
+    }
+
+    pub fn stats_enabled(&self) -> bool {
+        self.stats.is_some()
+    }
+
     pub async fn write_fire_and_forget(&mut self, bytes: Bytes) -> Result<(), WriteError> {
         if bytes.is_empty() {
             return self.flush().await;
         }
+        self.record_input(bytes.len());
         if self.threshold_bytes == 1 {
             self.flush().await?;
-            return self.handoff.write_fire_and_forget(bytes).await;
+            return self.write_direct(bytes).await;
         }
         if self.pending.is_empty() && bytes.len() >= self.threshold_bytes {
-            return self.handoff.write_fire_and_forget(bytes).await;
+            return self.write_direct(bytes).await;
         }
         if !self.pending.is_empty()
             && bytes.len() >= self.threshold_bytes
-            && self.pending.len() < self.threshold_bytes
+            && self.pending_bytes < self.threshold_bytes
         {
             self.flush().await?;
-            return self.handoff.write_fire_and_forget(bytes).await;
+            return self.write_direct(bytes).await;
         }
 
-        self.pending.extend_from_slice(&bytes);
-        if self.pending.len() >= self.threshold_bytes {
+        if self.pending.is_empty() && self.stats.is_some() {
+            self.pending_started_at = Some(Instant::now());
+        }
+        self.pending_bytes = self.pending_bytes.saturating_add(bytes.len());
+        self.pending.push(bytes);
+        if let Some(stats) = &mut self.stats {
+            self.pending_chunks = self.pending_chunks.saturating_add(1);
+            stats.max_pending_bytes = stats.max_pending_bytes.max(self.pending_bytes);
+        }
+        if self.pending_bytes >= self.threshold_bytes {
             self.flush().await?;
         }
         Ok(())
@@ -588,13 +859,76 @@ impl MonoioWriteCoalescer {
         if self.pending.is_empty() {
             return Ok(());
         }
-        let bytes = self.pending.split().freeze();
-        let restore = bytes.clone();
-        if let Err(err) = self.handoff.write_fire_and_forget(bytes).await {
-            self.pending.extend_from_slice(&restore);
-            return Err(err);
+        let bytes = std::mem::take(&mut self.pending_bytes);
+        let pending = std::mem::take(&mut self.pending);
+        let chunks = std::mem::take(&mut self.pending_chunks);
+        let started_at = self.pending_started_at.take();
+        match self.handoff.write_many_fire_and_forget(pending).await {
+            Ok(reusable) => {
+                self.pending = reusable;
+            }
+            Err((err, restore)) => {
+                self.pending = restore;
+                self.pending_bytes = bytes;
+                self.pending_chunks = chunks;
+                self.pending_started_at = started_at;
+                return Err(err);
+            }
+        }
+        self.record_buffered_flush(bytes, chunks, started_at);
+        Ok(())
+    }
+
+    async fn write_direct(&mut self, bytes: Bytes) -> Result<(), WriteError> {
+        let len = bytes.len();
+        self.enqueue_fire_and_forget(bytes).await?;
+        self.record_direct_flush(len);
+        Ok(())
+    }
+
+    async fn enqueue_fire_and_forget(&self, bytes: Bytes) -> Result<(), WriteError> {
+        if let Err(err) = self.handoff.try_write_fire_and_forget(bytes) {
+            self.handoff.write_fire_and_forget(err.into_bytes()).await?;
         }
         Ok(())
+    }
+
+    fn record_input(&mut self, bytes: usize) {
+        let Some(stats) = &mut self.stats else {
+            return;
+        };
+        stats.input_chunks = stats.input_chunks.saturating_add(1);
+        stats.input_bytes = stats.input_bytes.saturating_add(bytes);
+    }
+
+    fn record_direct_flush(&mut self, bytes: usize) {
+        let Some(stats) = &mut self.stats else {
+            return;
+        };
+        stats.flushes = stats.flushes.saturating_add(1);
+        stats.flush_bytes = stats.flush_bytes.saturating_add(bytes);
+        stats.direct_flushes = stats.direct_flushes.saturating_add(1);
+        stats.max_chunks_per_flush = stats.max_chunks_per_flush.max(1);
+        stats.max_bytes_per_flush = stats.max_bytes_per_flush.max(bytes);
+    }
+
+    fn record_buffered_flush(&mut self, bytes: usize, chunks: usize, started_at: Option<Instant>) {
+        let Some(stats) = &mut self.stats else {
+            return;
+        };
+        stats.flushes = stats.flushes.saturating_add(1);
+        stats.flush_bytes = stats.flush_bytes.saturating_add(bytes);
+        stats.buffered_flushes = stats.buffered_flushes.saturating_add(1);
+        stats.buffered_input_chunks = stats.buffered_input_chunks.saturating_add(chunks);
+        stats.max_chunks_per_flush = stats.max_chunks_per_flush.max(chunks);
+        stats.max_bytes_per_flush = stats.max_bytes_per_flush.max(bytes);
+        if let Some(started_at) = started_at {
+            let wait = nanos_u64(started_at.elapsed());
+            stats.total_flush_wait_nanos = stats
+                .total_flush_wait_nanos
+                .saturating_add(u128::from(wait));
+            stats.max_flush_wait_nanos = stats.max_flush_wait_nanos.max(wait);
+        }
     }
 }
 
@@ -629,6 +963,7 @@ impl Budget {
     fn new(limit: usize) -> Self {
         Self {
             pending: AtomicUsize::new(0),
+            waiters: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             notify: Notify::new(),
             limit,
@@ -686,13 +1021,23 @@ impl Budget {
         }
 
         loop {
+            let waiter = self.waiter();
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             match self.try_acquire(bytes) {
-                Ok(acquired) => return Ok(acquired),
-                Err(BudgetAcquireError::Closed) => return Err(BudgetAcquireError::Closed),
+                Ok(acquired) => {
+                    drop(waiter);
+                    return Ok(acquired);
+                }
+                Err(BudgetAcquireError::Closed) => {
+                    drop(waiter);
+                    return Err(BudgetAcquireError::Closed);
+                }
                 Err(BudgetAcquireError::LimitExceeded { .. }) => {}
             }
             notified.await;
+            drop(waiter);
         }
     }
 
@@ -702,7 +1047,9 @@ impl Budget {
         }
         let previous = self.pending.fetch_sub(bytes, Ordering::AcqRel);
         debug_assert!(previous >= bytes, "released more bytes than acquired");
-        self.notify.notify_waiters();
+        if self.waiters.load(Ordering::Acquire) > 0 {
+            self.notify.notify_waiters();
+        }
     }
 
     fn pending(&self) -> usize {
@@ -712,6 +1059,11 @@ impl Budget {
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.notify.notify_waiters();
+    }
+
+    fn waiter(&self) -> BudgetWaiter<'_> {
+        self.waiters.fetch_add(1, Ordering::AcqRel);
+        BudgetWaiter(&self.waiters)
     }
 }
 
@@ -1004,10 +1356,9 @@ where
         let bytes = std::mem::take(&mut request.bytes);
         let (result, bytes) = writer.write_all(bytes).await;
         request.bytes = bytes;
-        result.map(|_| ())
-    } else {
-        write_monoio_vectored_batch(writer, requests, batch_buffers).await
+        return result.map(|_| ());
     }
+    write_monoio_vectored_batch(writer, requests, batch_buffers).await
 }
 
 #[cfg(all(feature = "monoio", unix))]
@@ -1132,14 +1483,24 @@ fn fill_io_slices<'a>(
 }
 
 fn complete_ok(budget: &Budget, requests: &mut [WriteRequest]) {
+    let released = take_budget(requests);
+    budget.release(released);
     for request in requests {
-        complete_request(budget, request, Ok(()));
+        if let Some(completion) = request.completion.take() {
+            let _ = completion.send(WriteCompletion { result: Ok(()) });
+        }
     }
 }
 
 fn complete_closed(budget: &Budget, requests: &mut [WriteRequest]) {
+    let released = take_budget(requests);
+    budget.release(released);
     for request in requests {
-        complete_request(budget, request, Err(WriteError::Closed));
+        if let Some(completion) = request.completion.take() {
+            let _ = completion.send(WriteCompletion {
+                result: Err(WriteError::Closed),
+            });
+        }
     }
 }
 
@@ -1149,6 +1510,15 @@ fn complete_request(budget: &Budget, request: &mut WriteRequest, result: Result<
     if let Some(completion) = request.completion.take() {
         let _ = completion.send(WriteCompletion { result });
     }
+}
+
+fn take_budget(requests: &mut [WriteRequest]) -> usize {
+    let mut released = 0usize;
+    for request in requests {
+        released = released.saturating_add(request.budget_bytes);
+        request.budget_bytes = 0;
+    }
+    released
 }
 
 #[cfg(feature = "monoio")]
@@ -1348,7 +1718,7 @@ mod tests {
         let writer = CountingWriter::default();
         let output = writer.output.clone();
         let handoff = WriteHandoff::spawn(writer, WriteHandoffConfig::new(4, 64));
-        let mut coalescer = WriteCoalescer::with_threshold(handoff, 4);
+        let mut coalescer = WriteCoalescer::with_threshold_and_stats(handoff, 4);
 
         coalescer
             .write_fire_and_forget(Bytes::from_static(b"ab"))
@@ -1371,6 +1741,16 @@ mod tests {
 
         assert_eq!(&*output.lock().expect("output mutex"), b"abcd");
         assert_eq!(coalescer.pending_bytes(), 0);
+        let stats = coalescer.stats();
+        assert_eq!(stats.input_chunks, 2);
+        assert_eq!(stats.input_bytes, 4);
+        assert_eq!(stats.flushes, 1);
+        assert_eq!(stats.buffered_flushes, 1);
+        assert_eq!(stats.direct_flushes, 0);
+        assert_eq!(stats.flush_bytes, 4);
+        assert_eq!(stats.max_chunks_per_flush, 2);
+        assert_eq!(stats.max_bytes_per_flush, 4);
+        assert_eq!(stats.max_pending_bytes, 4);
     }
 
     #[tokio::test]
@@ -1401,7 +1781,8 @@ mod tests {
         let writer = CountingWriter::default();
         let output = writer.output.clone();
         let handoff = WriteHandoff::spawn(writer, WriteHandoffConfig::new(4, 64));
-        let mut coalescer = WriteCoalescer::with_config(handoff, WriteCoalescerConfig::immediate());
+        let mut coalescer =
+            WriteCoalescer::with_config_and_stats(handoff, WriteCoalescerConfig::immediate());
 
         coalescer
             .write_fire_and_forget(Bytes::from_static(b"abc"))
@@ -1416,6 +1797,58 @@ mod tests {
 
         assert_eq!(&*output.lock().expect("output mutex"), b"abc");
         assert_eq!(coalescer.pending_bytes(), 0);
+        let stats = coalescer.stats();
+        assert_eq!(stats.input_chunks, 1);
+        assert_eq!(stats.flushes, 1);
+        assert_eq!(stats.buffered_flushes, 0);
+        assert_eq!(stats.direct_flushes, 1);
+        assert_eq!(stats.avg_bytes_per_flush(), 3.0);
+        assert_eq!(stats.avg_chunks_per_flush(), 1.0);
+    }
+
+    #[test]
+    fn coalescer_stats_merge_preserves_totals_and_maxima() {
+        let mut left = WriteCoalescerStats {
+            input_chunks: 2,
+            input_bytes: 8,
+            flushes: 1,
+            flush_bytes: 8,
+            buffered_flushes: 1,
+            direct_flushes: 0,
+            buffered_input_chunks: 2,
+            max_chunks_per_flush: 2,
+            max_bytes_per_flush: 8,
+            max_pending_bytes: 8,
+            total_flush_wait_nanos: 10,
+            max_flush_wait_nanos: 10,
+        };
+        left.merge(WriteCoalescerStats {
+            input_chunks: 1,
+            input_bytes: 16,
+            flushes: 1,
+            flush_bytes: 16,
+            buffered_flushes: 0,
+            direct_flushes: 1,
+            buffered_input_chunks: 0,
+            max_chunks_per_flush: 1,
+            max_bytes_per_flush: 16,
+            max_pending_bytes: 0,
+            total_flush_wait_nanos: 0,
+            max_flush_wait_nanos: 0,
+        });
+
+        assert_eq!(left.input_chunks, 3);
+        assert_eq!(left.input_bytes, 24);
+        assert_eq!(left.flushes, 2);
+        assert_eq!(left.flush_bytes, 24);
+        assert_eq!(left.buffered_flushes, 1);
+        assert_eq!(left.direct_flushes, 1);
+        assert_eq!(left.buffered_input_chunks, 2);
+        assert_eq!(left.max_chunks_per_flush, 2);
+        assert_eq!(left.max_bytes_per_flush, 16);
+        assert_eq!(left.max_pending_bytes, 8);
+        assert_eq!(left.total_flush_wait_nanos, 10);
+        assert_eq!(left.max_flush_wait_nanos, 10);
     }
 
     #[tokio::test]
@@ -1573,6 +2006,47 @@ mod tests {
 
             assert_eq!(&*output.lock().expect("output mutex"), b"abcdef");
             assert_eq!(handoff.pending_bytes(), 0);
+        });
+    }
+
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn monoio_coalescer_buffers_until_threshold_or_flush() {
+        monoio::start::<monoio::LegacyDriver, _>(async {
+            let writer = MonoioCaptureWriter::default();
+            let output = writer.output.clone();
+            let handoff = WriteHandoff::spawn_monoio(writer, WriteHandoffConfig::new(8, 64));
+            let mut coalescer = MonoioWriteCoalescer::with_threshold_and_stats(handoff.clone(), 4);
+
+            coalescer
+                .write_fire_and_forget(Bytes::from_static(b"ab"))
+                .await
+                .expect("buffer small monoio write");
+            assert_eq!(&*output.lock().expect("output mutex"), b"");
+            assert_eq!(coalescer.pending_bytes(), 2);
+
+            coalescer
+                .write_fire_and_forget(Bytes::from_static(b"cd"))
+                .await
+                .expect("threshold flush");
+            let barrier = handoff
+                .write(Bytes::new())
+                .await
+                .expect("submit monoio barrier");
+            barrier.wait().await.expect("monoio barrier completes");
+
+            assert_eq!(&*output.lock().expect("output mutex"), b"abcd");
+            assert_eq!(coalescer.pending_bytes(), 0);
+            let stats = coalescer.stats();
+            assert_eq!(stats.input_chunks, 2);
+            assert_eq!(stats.input_bytes, 4);
+            assert_eq!(stats.flushes, 1);
+            assert_eq!(stats.buffered_flushes, 1);
+            assert_eq!(stats.direct_flushes, 0);
+            assert_eq!(stats.flush_bytes, 4);
+            assert_eq!(stats.max_chunks_per_flush, 2);
+            assert_eq!(stats.max_bytes_per_flush, 4);
+            assert_eq!(stats.max_pending_bytes, 4);
         });
     }
 

@@ -1,7 +1,7 @@
 use bytes::{Bytes, BytesMut};
 use bytes_handoff::{
     DEFAULT_WRITE_COALESCE_THRESHOLD, HandoffBuffer, HandoffBufferConfig, MonoioWriteCoalescer,
-    MonoioWriteHandoff, WriteCoalescer, WriteHandoff, WriteHandoffConfig,
+    MonoioWriteHandoff, WriteCoalescer, WriteCoalescerStats, WriteHandoff, WriteHandoffConfig,
 };
 use hdrhistogram::Histogram;
 use monoio::buf::IoBufMut as _;
@@ -22,6 +22,8 @@ mod process_usage {
     include!("process_usage.rs");
 }
 use process_usage::ProcessCpuSnapshot;
+
+const DEFAULT_TCP_MSS_BYTES: usize = 1_460;
 
 #[derive(Clone, Copy)]
 enum Scenario {
@@ -91,6 +93,29 @@ impl CompletionMode {
         match self {
             Self::Ticket => "ticket",
             Self::FireAndForget => "fire_and_forget",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InputModel {
+    Fixed,
+    Tcp,
+}
+
+impl InputModel {
+    fn parse(value: &str) -> Self {
+        match value {
+            "fixed" => Self::Fixed,
+            "tcp" => Self::Tcp,
+            _ => panic!("invalid --input-model: {value} (expected fixed|tcp)"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Tcp => "tcp",
         }
     }
 }
@@ -167,8 +192,11 @@ struct Config {
     frame_len: usize,
     tunnel_bytes: usize,
     input_fragment: usize,
+    input_model: InputModel,
+    tcp_mss_bytes: usize,
     read_reserve: usize,
     handoff_flush_bytes: usize,
+    coalescer_stats: bool,
     write_pending_bytes: usize,
     duplex_capacity: usize,
     iterations: usize,
@@ -232,6 +260,7 @@ struct RunResult {
     iterations: usize,
     total_seconds: f64,
     latency: LatencySummary,
+    coalescer: WriteCoalescerStats,
 }
 
 struct WorkerRunResult {
@@ -239,6 +268,7 @@ struct WorkerRunResult {
     total_streams: usize,
     iterations: usize,
     latency: Histogram<u64>,
+    coalescer: WriteCoalescerStats,
 }
 
 impl WorkerRunResult {
@@ -248,12 +278,14 @@ impl WorkerRunResult {
             total_streams: 0,
             iterations: 0,
             latency: latency_histogram(),
+            coalescer: WriteCoalescerStats::default(),
         }
     }
 
     fn record(&mut self, result: ConnectionResult) {
         self.total_bytes += result.bytes;
         self.total_streams += 1;
+        self.coalescer.merge(result.coalescer);
         self.latency
             .record(result.latency_micros.max(1))
             .expect("record stream latency");
@@ -263,6 +295,80 @@ impl WorkerRunResult {
 struct ConnectionResult {
     bytes: usize,
     latency_micros: u64,
+    coalescer: WriteCoalescerStats,
+}
+
+#[derive(Default)]
+struct ProxyMetrics {
+    coalescer: WriteCoalescerStats,
+}
+
+struct BufferedTunnelRecorder {
+    enabled: bool,
+    pending_chunks: usize,
+    pending_started_at: Option<Instant>,
+    stats: WriteCoalescerStats,
+}
+
+impl BufferedTunnelRecorder {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            pending_chunks: 0,
+            pending_started_at: None,
+            stats: WriteCoalescerStats::default(),
+        }
+    }
+
+    fn note_input(&mut self, pending_bytes: usize) {
+        if !self.enabled {
+            return;
+        }
+        if self.pending_chunks == 0 {
+            self.pending_started_at = Some(Instant::now());
+        }
+        self.pending_chunks = self.pending_chunks.saturating_add(1);
+        self.stats.max_pending_bytes = self.stats.max_pending_bytes.max(pending_bytes);
+    }
+
+    fn record_flush(&mut self, bytes: usize, threshold_bytes: usize) {
+        if !self.enabled {
+            return;
+        }
+        let chunks = std::mem::take(&mut self.pending_chunks).max(1);
+        let started_at = self.pending_started_at.take();
+        self.stats.input_chunks = self.stats.input_chunks.saturating_add(chunks);
+        self.stats.input_bytes = self.stats.input_bytes.saturating_add(bytes);
+        self.stats.flushes = self.stats.flushes.saturating_add(1);
+        self.stats.flush_bytes = self.stats.flush_bytes.saturating_add(bytes);
+        self.stats.max_chunks_per_flush = self.stats.max_chunks_per_flush.max(chunks);
+        self.stats.max_bytes_per_flush = self.stats.max_bytes_per_flush.max(bytes);
+
+        if chunks == 1 && bytes >= threshold_bytes {
+            self.stats.direct_flushes = self.stats.direct_flushes.saturating_add(1);
+            return;
+        }
+
+        self.stats.buffered_flushes = self.stats.buffered_flushes.saturating_add(1);
+        self.stats.buffered_input_chunks =
+            self.stats.buffered_input_chunks.saturating_add(chunks);
+        if let Some(started_at) = started_at {
+            let wait = duration_nanos_u64(started_at.elapsed());
+            self.stats.total_flush_wait_nanos = self
+                .stats
+                .total_flush_wait_nanos
+                .saturating_add(u128::from(wait));
+            self.stats.max_flush_wait_nanos = self.stats.max_flush_wait_nanos.max(wait);
+        }
+    }
+
+    fn stats(self) -> WriteCoalescerStats {
+        self.stats
+    }
+}
+
+fn duration_nanos_u64(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
 #[derive(Clone, Copy)]
@@ -299,8 +405,11 @@ fn parse_args() -> Cli {
     let mut tunnel_bytes = 64 * 1024usize;
     let mut input_fragment_set = false;
     let mut input_fragment = 64usize;
+    let mut input_model = InputModel::Fixed;
+    let mut tcp_mss_bytes = DEFAULT_TCP_MSS_BYTES;
     let mut read_reserve = 16 * 1024usize;
     let mut handoff_flush_bytes = 0usize;
+    let mut coalescer_stats = false;
     let mut write_pending_bytes = 0usize;
     let mut duplex_capacity = 256 * 1024usize;
     let mut iterations = 1usize;
@@ -367,6 +476,16 @@ fn parse_args() -> Cli {
                 input_fragment_set = true;
                 i += 2;
             }
+            "--input-model" if i + 1 < args.len() => {
+                input_model = InputModel::parse(&args[i + 1]);
+                i += 2;
+            }
+            "--tcp-mss-bytes" if i + 1 < args.len() => {
+                tcp_mss_bytes = args[i + 1]
+                    .parse()
+                    .expect("--tcp-mss-bytes must be an integer");
+                i += 2;
+            }
             "--read-reserve" if i + 1 < args.len() => {
                 read_reserve = args[i + 1].parse().expect("--read-reserve must be an integer");
                 i += 2;
@@ -376,6 +495,10 @@ fn parse_args() -> Cli {
                     .parse()
                     .expect("--handoff-flush-bytes must be an integer");
                 i += 2;
+            }
+            "--coalescer-stats" => {
+                coalescer_stats = true;
+                i += 1;
             }
             "--write-pending-bytes" if i + 1 < args.len() => {
                 write_pending_bytes = args[i + 1]
@@ -421,7 +544,7 @@ fn parse_args() -> Cli {
             }
             "--help" => {
                 println!(
-                    "Usage: bench_stream_harness [--transport duplex|cached|tcp] [--role integrated|tcp-service|tcp-driver] [--implementation handoff|monoio_handoff|bytesmut_handoff|manual_vec|raw_copy] [--scenario fragmented|coalesced] [--completion ticket|fire_and_forget] [--worker-threads N] [--connections N] [--route-frames N] [--frame-len N] [--tunnel-bytes N] [--input-fragment N] [--read-reserve N] [--handoff-flush-bytes N] [--write-pending-bytes N] [--duplex-capacity N] [--iterations N] [--duration-seconds N] [--service-addr HOST:PORT] [--sink-addr HOST:PORT] [--ready-file PATH] [--idle-timeout-millis N]"
+                    "Usage: bench_stream_harness [--transport duplex|cached|tcp] [--role integrated|tcp-service|tcp-driver] [--implementation handoff|monoio_handoff|bytesmut_handoff|manual_vec|raw_copy] [--scenario fragmented|coalesced] [--completion ticket|fire_and_forget] [--worker-threads N] [--connections N] [--route-frames N] [--frame-len N] [--tunnel-bytes N] [--input-fragment N] [--input-model fixed|tcp] [--tcp-mss-bytes N] [--read-reserve N] [--handoff-flush-bytes N] [--coalescer-stats] [--write-pending-bytes N] [--duplex-capacity N] [--iterations N] [--duration-seconds N] [--service-addr HOST:PORT] [--sink-addr HOST:PORT] [--ready-file PATH] [--idle-timeout-millis N]"
                 );
                 println!("  duplex: in-memory client/proxy/sink transport");
                 println!("  cached: prebuilt payload reader plus counting sink, without driver/sink tasks");
@@ -437,6 +560,10 @@ fn parse_args() -> Cli {
                 println!("  raw_copy: unparsed async copy lower bound");
                 println!("  fragmented: many small client writes, default input fragment 64 bytes");
                 println!("  coalesced: larger client writes, default input fragment = read reserve");
+                println!("  input-model=fixed: every source read/write uses --input-fragment");
+                println!(
+                    "  input-model=tcp: source chunks are capped at --tcp-mss-bytes, default 1460"
+                );
                 std::process::exit(0);
             }
             arg => panic!("unknown arg: {arg}"),
@@ -449,6 +576,7 @@ fn parse_args() -> Cli {
     assert!(frame_len >= 16, "--frame-len must be >= 16");
     assert!(tunnel_bytes >= 1, "--tunnel-bytes must be >= 1");
     assert!(read_reserve >= 1, "--read-reserve must be >= 1");
+    assert!(tcp_mss_bytes >= 1, "--tcp-mss-bytes must be >= 1");
     assert!(
         write_pending_bytes == 0 || write_pending_bytes >= read_reserve,
         "--write-pending-bytes must be zero/default or >= --read-reserve"
@@ -508,8 +636,11 @@ fn parse_args() -> Cli {
         frame_len,
         tunnel_bytes,
         input_fragment,
+        input_model,
+        tcp_mss_bytes,
         read_reserve,
         handoff_flush_bytes,
+        coalescer_stats,
         write_pending_bytes,
         duplex_capacity,
         iterations,
@@ -541,6 +672,29 @@ fn payload(connection_id: usize, config: Config) -> Bytes {
     Bytes::from(out)
 }
 
+fn input_chunk_len(
+    payload_len: usize,
+    offset: usize,
+    destination_remaining: usize,
+    config: Config,
+) -> usize {
+    let remaining = payload_len.saturating_sub(offset);
+    if remaining == 0 || destination_remaining == 0 {
+        return 0;
+    }
+
+    let model_limit = match config.input_model {
+        InputModel::Fixed => config.input_fragment,
+        InputModel::Tcp => tcp_model_chunk_limit(offset, config),
+    };
+    remaining.min(destination_remaining).min(model_limit.max(1))
+}
+
+fn tcp_model_chunk_limit(offset: usize, config: Config) -> usize {
+    let _ = offset;
+    config.tcp_mss_bytes.min(config.read_reserve).max(1)
+}
+
 fn run(config: Config) -> RunResult {
     if matches!(config.implementation, Implementation::MonoioHandoff) {
         return run_monoio(config);
@@ -554,11 +708,12 @@ fn run(config: Config) -> RunResult {
         .expect("build benchmark runtime");
 
     let start = Instant::now();
-    let (total_bytes, total_streams, iterations, latency) = runtime.block_on(async {
+    let (total_bytes, total_streams, iterations, latency, coalescer) = runtime.block_on(async {
         let mut total_bytes = 0usize;
         let mut total_streams = 0usize;
         let mut iterations = 0usize;
         let mut latency = latency_histogram();
+        let mut coalescer = WriteCoalescerStats::default();
         let deadline = if config.duration_seconds > 0.0 {
             Some(Instant::now() + Duration::from_secs_f64(config.duration_seconds))
         } else {
@@ -574,6 +729,7 @@ fn run(config: Config) -> RunResult {
             for result in results {
                 total_bytes += result.bytes;
                 total_streams += 1;
+                coalescer.merge(result.coalescer);
                 latency
                     .record(result.latency_micros.max(1))
                     .expect("record stream latency");
@@ -586,7 +742,13 @@ fn run(config: Config) -> RunResult {
             }
         }
 
-        (total_bytes, total_streams, iterations, summarize_latency(&latency))
+        (
+            total_bytes,
+            total_streams,
+            iterations,
+            summarize_latency(&latency),
+            coalescer,
+        )
     });
 
     RunResult {
@@ -595,6 +757,7 @@ fn run(config: Config) -> RunResult {
         iterations,
         total_seconds: start.elapsed().as_secs_f64(),
         latency,
+        coalescer,
     }
 }
 
@@ -627,10 +790,12 @@ fn run_monoio(config: Config) -> RunResult {
     let mut total_bytes = 0usize;
     let mut total_streams = 0usize;
     let mut latency = latency_histogram();
+    let mut coalescer = WriteCoalescerStats::default();
     for handle in handles {
         let worker = handle.join().expect("monoio harness worker joins");
         total_bytes += worker.total_bytes;
         total_streams += worker.total_streams;
+        coalescer.merge(worker.coalescer);
         latency
             .add(&worker.latency)
             .expect("merge monoio worker latency histogram");
@@ -644,6 +809,7 @@ fn run_monoio(config: Config) -> RunResult {
         iterations,
         total_seconds: start.elapsed().as_secs_f64(),
         latency: summarize_latency(&latency),
+        coalescer,
     }
 }
 
@@ -721,17 +887,18 @@ async fn run_duplex_connection(config: Config, payload: Bytes) -> ConnectionResu
     let (outbound, sink) = tokio::io::duplex(config.duplex_capacity);
 
     let start = Instant::now();
-    let client = tokio::spawn(write_fragments(client, payload, config.input_fragment));
+    let client = tokio::spawn(write_payload(client, payload, config));
     let proxy = tokio::spawn(proxy_stream(inbound, outbound, config, expected_len));
     let sink = tokio::spawn(drain_expected(sink, expected_len));
 
     client.await.expect("client task joins");
-    proxy.await.expect("proxy task joins");
+    let metrics = proxy.await.expect("proxy task joins");
     let drained = sink.await.expect("sink task joins");
     assert_eq!(drained, expected_len);
     ConnectionResult {
         bytes: drained,
         latency_micros: start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+        coalescer: metrics.coalescer,
     }
 }
 
@@ -753,33 +920,34 @@ async fn run_cached(config: Config, payloads: PayloadSet) -> Vec<ConnectionResul
 
 async fn run_cached_connection(config: Config, payload: Bytes) -> ConnectionResult {
     let expected_len = payload.len();
-    let reader = CachedFragmentedReader::new(payload, config.input_fragment);
+    let reader = CachedFragmentedReader::new(payload, config);
     let sink = CountWriter::default();
     let output_bytes = sink.bytes.clone();
 
     let start = Instant::now();
-    proxy_stream(reader, sink, config, expected_len).await;
+    let metrics = proxy_stream(reader, sink, config, expected_len).await;
     let drained = output_bytes.load(Ordering::Acquire);
     assert_eq!(drained, expected_len);
 
     ConnectionResult {
         bytes: drained,
         latency_micros: start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+        coalescer: metrics.coalescer,
     }
 }
 
 struct CachedFragmentedReader {
     payload: Bytes,
     offset: usize,
-    fragment: usize,
+    config: Config,
 }
 
 impl CachedFragmentedReader {
-    fn new(payload: Bytes, fragment: usize) -> Self {
+    fn new(payload: Bytes, config: Config) -> Self {
         Self {
             payload,
             offset: 0,
-            fragment,
+            config,
         }
     }
 }
@@ -790,8 +958,12 @@ impl AsyncRead for CachedFragmentedReader {
         _cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let remaining = self.payload.len().saturating_sub(self.offset);
-        let read = remaining.min(self.fragment).min(buf.remaining());
+        let read = input_chunk_len(
+            self.payload.len(),
+            self.offset,
+            buf.remaining(),
+            self.config,
+        );
         if read > 0 {
             let start = self.offset;
             let end = start + read;
@@ -869,41 +1041,46 @@ async fn run_monoio_duplex_partition(
 
 async fn run_monoio_duplex_connection(config: Config, payload: Bytes) -> ConnectionResult {
     let expected_len = payload.len();
-    let reader = MonoioFragmentedReader::new(payload, config.input_fragment);
+    let reader = MonoioFragmentedReader::new(payload, config);
     let sink = MonoioCountWriter::default();
     let output_bytes = sink.bytes.clone();
 
     let start = Instant::now();
-    proxy_monoio_handoff(reader, sink, config, expected_len).await;
+    let metrics = proxy_monoio_handoff(reader, sink, config, expected_len).await;
     let drained = output_bytes.load(Ordering::Acquire);
     assert_eq!(drained, expected_len);
 
     ConnectionResult {
         bytes: drained,
         latency_micros: start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+        coalescer: metrics.coalescer,
     }
 }
 
 struct MonoioFragmentedReader {
     payload: Bytes,
     offset: usize,
-    fragment: usize,
+    config: Config,
 }
 
 impl MonoioFragmentedReader {
-    fn new(payload: Bytes, fragment: usize) -> Self {
+    fn new(payload: Bytes, config: Config) -> Self {
         Self {
             payload,
             offset: 0,
-            fragment,
+            config,
         }
     }
 }
 
 impl monoio::io::AsyncReadRent for MonoioFragmentedReader {
     async fn read<T: monoio::buf::IoBufMut>(&mut self, mut buf: T) -> monoio::BufResult<usize, T> {
-        let remaining = self.payload.len().saturating_sub(self.offset);
-        let read = remaining.min(self.fragment).min(buf.bytes_total());
+        let read = input_chunk_len(
+            self.payload.len(),
+            self.offset,
+            buf.bytes_total(),
+            self.config,
+        );
         if read > 0 {
             // SAFETY: `read` is capped by both source remaining bytes and
             // destination capacity, and the regions do not overlap.
@@ -934,8 +1111,12 @@ impl monoio::io::AsyncReadRent for MonoioFragmentedReader {
         else {
             return (Ok(0), buf_vec);
         };
-        let remaining = self.payload.len().saturating_sub(self.offset);
-        let read = remaining.min(self.fragment).min(raw.bytes_total());
+        let read = input_chunk_len(
+            self.payload.len(),
+            self.offset,
+            raw.bytes_total(),
+            self.config,
+        );
         if read > 0 {
             // SAFETY: `raw` points at the first valid output iovec and `read`
             // is capped to its capacity.
@@ -1074,6 +1255,7 @@ fn run_tcp_service_process(
         iterations: 1,
         total_seconds: active_seconds,
         latency: LatencySummary::empty(),
+        coalescer: WriteCoalescerStats::default(),
     }
 }
 
@@ -1125,6 +1307,7 @@ fn run_tcp_driver_process(
         iterations,
         total_seconds: start.elapsed().as_secs_f64(),
         latency,
+        coalescer: WriteCoalescerStats::default(),
     }
 }
 
@@ -1298,7 +1481,7 @@ async fn run_tcp_client(service_addr: SocketAddr, config: Config, payload: Bytes
     stream
         .set_nodelay(true)
         .expect("set nodelay on tcp client stream");
-    write_fragments(stream, payload, config.input_fragment).await;
+    write_payload(stream, payload, config).await;
 }
 
 async fn drain_connection<R>(reader: R, expected: usize) -> ConnectionResult
@@ -1310,15 +1493,23 @@ where
     ConnectionResult {
         bytes,
         latency_micros: start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+        coalescer: WriteCoalescerStats::default(),
     }
 }
 
-async fn write_fragments<W>(mut writer: W, payload: Bytes, fragment: usize)
+async fn write_payload<W>(mut writer: W, payload: Bytes, config: Config)
 where
     W: AsyncWrite + Unpin,
 {
-    for chunk in payload.chunks(fragment) {
-        writer.write_all(chunk).await.expect("write input fragment");
+    let mut offset = 0usize;
+    while offset < payload.len() {
+        let len = input_chunk_len(payload.len(), offset, usize::MAX, config);
+        let end = offset + len;
+        writer
+            .write_all(&payload[offset..end])
+            .await
+            .expect("write input fragment");
+        offset = end;
     }
     writer.shutdown().await.expect("shutdown input writer");
 }
@@ -1339,7 +1530,12 @@ where
     total
 }
 
-async fn proxy_stream<R, W>(reader: R, writer: W, config: Config, expected_len: usize)
+async fn proxy_stream<R, W>(
+    reader: R,
+    writer: W,
+    config: Config,
+    expected_len: usize,
+) -> ProxyMetrics
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -1357,7 +1553,12 @@ where
     }
 }
 
-async fn proxy_handoff<R, W>(mut reader: R, writer: W, config: Config, expected_len: usize)
+async fn proxy_handoff<R, W>(
+    mut reader: R,
+    writer: W,
+    config: Config,
+    expected_len: usize,
+) -> ProxyMetrics
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -1366,8 +1567,14 @@ where
         writer,
         WriteHandoffConfig::new(config.max_output_items(), config.write_pending_bytes()),
     );
-    let mut tunnel_coalescer =
-        WriteCoalescer::with_threshold(handoff.clone(), config.handoff_flush_bytes);
+    let read_buffer_coalescing = should_coalesce_in_read_buffer(config);
+    let mut tunnel_recorder =
+        BufferedTunnelRecorder::new(config.coalescer_stats && read_buffer_coalescing);
+    let mut tunnel_coalescer = if config.coalescer_stats && !read_buffer_coalescing {
+        WriteCoalescer::with_threshold_and_stats(handoff.clone(), config.handoff_flush_bytes)
+    } else {
+        WriteCoalescer::with_threshold(handoff.clone(), config.handoff_flush_bytes)
+    };
     let mut buffer = HandoffBuffer::with_config(
         HandoffBufferConfig::new(expected_len + config.read_reserve)
             .with_read_reserve(config.read_reserve),
@@ -1388,22 +1595,29 @@ where
         }
 
         if tunnel && !buffer.is_empty() {
-            submit_tunnel(
-                &handoff,
-                &mut tunnel_coalescer,
-                config.completion,
-                buffer.freeze_all(),
-            )
-            .await;
+            if read_buffer_coalescing {
+                tunnel_recorder.note_input(buffer.len());
+            }
+            if !read_buffer_coalescing || should_submit_tunnel_buffer(buffer.len(), config) {
+                let bytes = buffer.freeze_all();
+                if read_buffer_coalescing {
+                    tunnel_recorder.record_flush(bytes.len(), config.handoff_flush_bytes);
+                }
+                submit_tunnel(&handoff, &mut tunnel_coalescer, config.completion, bytes).await;
+            }
         }
     }
 
     if !buffer.is_empty() {
+        let bytes = buffer.freeze_all();
+        if read_buffer_coalescing {
+            tunnel_recorder.record_flush(bytes.len(), config.handoff_flush_bytes);
+        }
         submit_tunnel(
             &handoff,
             &mut tunnel_coalescer,
             config.completion,
-            buffer.freeze_all(),
+            bytes,
         )
         .await;
     }
@@ -1415,6 +1629,14 @@ where
         .expect("submit completion barrier");
     barrier.wait().await.expect("completion barrier");
     handoff.close();
+
+    ProxyMetrics {
+        coalescer: if read_buffer_coalescing {
+            tunnel_recorder.stats()
+        } else {
+            tunnel_coalescer.stats()
+        },
+    }
 }
 
 async fn proxy_monoio_handoff<R, W>(
@@ -1422,7 +1644,8 @@ async fn proxy_monoio_handoff<R, W>(
     writer: W,
     config: Config,
     expected_len: usize,
-) where
+) -> ProxyMetrics
+where
     R: monoio::io::AsyncReadRent,
     W: monoio::io::AsyncWriteRent + Unpin + 'static,
 {
@@ -1430,8 +1653,14 @@ async fn proxy_monoio_handoff<R, W>(
         writer,
         WriteHandoffConfig::new(config.max_output_items() + 1, config.write_pending_bytes()),
     );
-    let mut tunnel_coalescer =
-        MonoioWriteCoalescer::with_threshold(handoff.clone(), config.handoff_flush_bytes);
+    let read_buffer_coalescing = should_coalesce_in_read_buffer(config);
+    let mut tunnel_recorder =
+        BufferedTunnelRecorder::new(config.coalescer_stats && read_buffer_coalescing);
+    let mut tunnel_coalescer = if config.coalescer_stats && !read_buffer_coalescing {
+        MonoioWriteCoalescer::with_threshold_and_stats(handoff.clone(), config.handoff_flush_bytes)
+    } else {
+        MonoioWriteCoalescer::with_threshold(handoff.clone(), config.handoff_flush_bytes)
+    };
     let mut buffer = HandoffBuffer::with_config(
         HandoffBufferConfig::new(expected_len + config.read_reserve)
             .with_read_reserve(config.read_reserve),
@@ -1452,22 +1681,30 @@ async fn proxy_monoio_handoff<R, W>(
         }
 
         if tunnel && !buffer.is_empty() {
-            submit_monoio_tunnel(
-                &handoff,
-                &mut tunnel_coalescer,
-                config.completion,
-                buffer.freeze_all(),
-            )
-            .await;
+            if read_buffer_coalescing {
+                tunnel_recorder.note_input(buffer.len());
+            }
+            if !read_buffer_coalescing || should_submit_tunnel_buffer(buffer.len(), config) {
+                let bytes = buffer.freeze_all();
+                if read_buffer_coalescing {
+                    tunnel_recorder.record_flush(bytes.len(), config.handoff_flush_bytes);
+                }
+                submit_monoio_tunnel(&handoff, &mut tunnel_coalescer, config.completion, bytes)
+                    .await;
+            }
         }
     }
 
     if !buffer.is_empty() {
+        let bytes = buffer.freeze_all();
+        if read_buffer_coalescing {
+            tunnel_recorder.record_flush(bytes.len(), config.handoff_flush_bytes);
+        }
         submit_monoio_tunnel(
             &handoff,
             &mut tunnel_coalescer,
             config.completion,
-            buffer.freeze_all(),
+            bytes,
         )
         .await;
     }
@@ -1482,6 +1719,14 @@ async fn proxy_monoio_handoff<R, W>(
         .expect("submit monoio completion barrier");
     barrier.wait().await.expect("monoio completion barrier");
     handoff.close();
+
+    ProxyMetrics {
+        coalescer: if read_buffer_coalescing {
+            tunnel_recorder.stats()
+        } else {
+            tunnel_coalescer.stats()
+        },
+    }
 }
 
 async fn proxy_bytesmut_handoff<R, W>(
@@ -1489,7 +1734,8 @@ async fn proxy_bytesmut_handoff<R, W>(
     writer: W,
     config: Config,
     expected_len: usize,
-) where
+) -> ProxyMetrics
+where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
@@ -1497,8 +1743,14 @@ async fn proxy_bytesmut_handoff<R, W>(
         writer,
         WriteHandoffConfig::new(config.max_output_items(), config.write_pending_bytes()),
     );
-    let mut tunnel_coalescer =
-        WriteCoalescer::with_threshold(handoff.clone(), config.handoff_flush_bytes);
+    let read_buffer_coalescing = should_coalesce_in_read_buffer(config);
+    let mut tunnel_recorder =
+        BufferedTunnelRecorder::new(config.coalescer_stats && read_buffer_coalescing);
+    let mut tunnel_coalescer = if config.coalescer_stats && !read_buffer_coalescing {
+        WriteCoalescer::with_threshold_and_stats(handoff.clone(), config.handoff_flush_bytes)
+    } else {
+        WriteCoalescer::with_threshold(handoff.clone(), config.handoff_flush_bytes)
+    };
     let max_len = expected_len + config.read_reserve;
     let mut buffer = BytesMut::with_capacity(config.read_reserve);
     let mut tunnel = false;
@@ -1524,22 +1776,29 @@ async fn proxy_bytesmut_handoff<R, W>(
         }
 
         if tunnel && !buffer.is_empty() {
-            submit_tunnel(
-                &handoff,
-                &mut tunnel_coalescer,
-                config.completion,
-                buffer.split().freeze(),
-            )
-            .await;
+            if read_buffer_coalescing {
+                tunnel_recorder.note_input(buffer.len());
+            }
+            if !read_buffer_coalescing || should_submit_tunnel_buffer(buffer.len(), config) {
+                let bytes = buffer.split().freeze();
+                if read_buffer_coalescing {
+                    tunnel_recorder.record_flush(bytes.len(), config.handoff_flush_bytes);
+                }
+                submit_tunnel(&handoff, &mut tunnel_coalescer, config.completion, bytes).await;
+            }
         }
     }
 
     if !buffer.is_empty() {
+        let bytes = buffer.split().freeze();
+        if read_buffer_coalescing {
+            tunnel_recorder.record_flush(bytes.len(), config.handoff_flush_bytes);
+        }
         submit_tunnel(
             &handoff,
             &mut tunnel_coalescer,
             config.completion,
-            buffer.split().freeze(),
+            bytes,
         )
         .await;
     }
@@ -1551,9 +1810,17 @@ async fn proxy_bytesmut_handoff<R, W>(
         .expect("submit bytesmut completion barrier");
     barrier.wait().await.expect("bytesmut completion barrier");
     handoff.close();
+
+    ProxyMetrics {
+        coalescer: if read_buffer_coalescing {
+            tunnel_recorder.stats()
+        } else {
+            tunnel_coalescer.stats()
+        },
+    }
 }
 
-async fn proxy_manual_vec<R, W>(mut reader: R, mut writer: W, config: Config)
+async fn proxy_manual_vec<R, W>(mut reader: R, mut writer: W, config: Config) -> ProxyMetrics
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -1595,6 +1862,7 @@ where
             .expect("write manual baseline tail");
     }
     writer.shutdown().await.expect("shutdown manual baseline writer");
+    ProxyMetrics::default()
 }
 
 async fn write_manual_prefixes<W>(buf: &[u8], consumed: &mut usize, writer: &mut W) -> bool
@@ -1636,7 +1904,7 @@ fn compact_manual_buffer(buf: &mut Vec<u8>, consumed: &mut usize, read_reserve: 
     }
 }
 
-async fn proxy_raw_copy<R, W>(mut reader: R, mut writer: W)
+async fn proxy_raw_copy<R, W>(mut reader: R, mut writer: W) -> ProxyMetrics
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -1645,6 +1913,7 @@ where
         .await
         .expect("raw copy proxy stream");
     writer.shutdown().await.expect("shutdown raw copy writer");
+    ProxyMetrics::default()
 }
 
 async fn route_complete_prefixes(
@@ -1728,6 +1997,18 @@ async fn submit(handoff: &WriteHandoff, completion: CompletionMode, bytes: Bytes
                 .expect("harness write handoff accepts bytes");
         }
     }
+}
+
+fn should_submit_tunnel_buffer(bytes: usize, config: Config) -> bool {
+    matches!(config.completion, CompletionMode::Ticket)
+        || config.handoff_flush_bytes <= 1
+        || bytes >= config.handoff_flush_bytes
+}
+
+fn should_coalesce_in_read_buffer(config: Config) -> bool {
+    matches!(config.completion, CompletionMode::FireAndForget)
+        && !matches!(config.implementation, Implementation::MonoioHandoff)
+        && config.handoff_flush_bytes > 1
 }
 
 async fn submit_tunnel(
@@ -1840,8 +2121,11 @@ fn main() {
     println!("frame_len={}", config.frame_len);
     println!("tunnel_bytes={}", config.tunnel_bytes);
     println!("input_fragment={}", config.input_fragment);
+    println!("input_model={}", config.input_model.as_str());
+    println!("tcp_mss_bytes={}", config.tcp_mss_bytes);
     println!("read_reserve={}", config.read_reserve);
     println!("handoff_flush_bytes={}", config.handoff_flush_bytes);
+    println!("coalescer_stats_enabled={}", config.coalescer_stats);
     println!("write_pending_bytes={}", config.write_pending_bytes());
     println!("duplex_capacity={}", config.duplex_capacity);
     println!("configured_iterations={}", config.iterations);
@@ -1881,4 +2165,112 @@ fn main() {
     println!("latency_p99_micros={}", result.latency.p99_micros);
     println!("latency_p999_micros={}", result.latency.p999_micros);
     println!("latency_max_micros={}", result.latency.max_micros);
+    println!("coalescer_input_chunks={}", result.coalescer.input_chunks);
+    println!("coalescer_input_bytes={}", result.coalescer.input_bytes);
+    println!("coalescer_flushes={}", result.coalescer.flushes);
+    println!("coalescer_flush_bytes={}", result.coalescer.flush_bytes);
+    println!(
+        "coalescer_buffered_flushes={}",
+        result.coalescer.buffered_flushes
+    );
+    println!("coalescer_direct_flushes={}", result.coalescer.direct_flushes);
+    println!(
+        "coalescer_buffered_input_chunks={}",
+        result.coalescer.buffered_input_chunks
+    );
+    println!(
+        "coalescer_avg_bytes_per_flush={:.2}",
+        result.coalescer.avg_bytes_per_flush()
+    );
+    println!(
+        "coalescer_avg_chunks_per_flush={:.2}",
+        result.coalescer.avg_chunks_per_flush()
+    );
+    println!(
+        "coalescer_avg_buffered_chunks_per_flush={:.2}",
+        result.coalescer.avg_buffered_chunks_per_flush()
+    );
+    println!(
+        "coalescer_max_chunks_per_flush={}",
+        result.coalescer.max_chunks_per_flush
+    );
+    println!(
+        "coalescer_max_bytes_per_flush={}",
+        result.coalescer.max_bytes_per_flush
+    );
+    println!("coalescer_max_pending_bytes={}", result.coalescer.max_pending_bytes);
+    println!(
+        "coalescer_avg_flush_wait_nanos={:.2}",
+        result.coalescer.avg_flush_wait_nanos()
+    );
+    println!(
+        "coalescer_max_flush_wait_nanos={}",
+        result.coalescer.max_flush_wait_nanos
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config(input_model: InputModel) -> Config {
+        Config {
+            transport: Transport::Cached,
+            implementation: Implementation::Handoff,
+            scenario: Scenario::Fragmented,
+            completion: CompletionMode::FireAndForget,
+            worker_threads: 1,
+            connections: 1,
+            route_frames: 64,
+            frame_len: 63,
+            tunnel_bytes: 1024 * 1024,
+            input_fragment: 64,
+            input_model,
+            tcp_mss_bytes: DEFAULT_TCP_MSS_BYTES,
+            read_reserve: 16 * 1024,
+            handoff_flush_bytes: DEFAULT_WRITE_COALESCE_THRESHOLD,
+            coalescer_stats: false,
+            write_pending_bytes: 0,
+            duplex_capacity: 256 * 1024,
+            iterations: 1,
+            duration_seconds: 0.0,
+        }
+    }
+
+    #[test]
+    fn fixed_input_model_uses_configured_fragment() {
+        let config = test_config(InputModel::Fixed);
+
+        assert_eq!(input_chunk_len(1024, 0, usize::MAX, config), 64);
+        assert_eq!(input_chunk_len(1024, 0, 16, config), 16);
+    }
+
+    #[test]
+    fn tcp_input_model_uses_mss_sized_source_chunks() {
+        let config = test_config(InputModel::Tcp);
+        let payload_len = config.bytes_per_connection();
+
+        assert_eq!(
+            input_chunk_len(payload_len, 0, usize::MAX, config),
+            DEFAULT_TCP_MSS_BYTES
+        );
+        assert_eq!(
+            input_chunk_len(payload_len, 0, 512, config),
+            512
+        );
+        assert_eq!(
+            input_chunk_len(payload_len, payload_len - 100, usize::MAX, config),
+            100
+        );
+    }
+
+    #[test]
+    fn read_buffer_coalescing_stays_off_for_monoio_handoff() {
+        let mut config = test_config(InputModel::Tcp);
+        config.implementation = Implementation::Handoff;
+        assert!(should_coalesce_in_read_buffer(config));
+
+        config.implementation = Implementation::MonoioHandoff;
+        assert!(!should_coalesce_in_read_buffer(config));
+    }
 }

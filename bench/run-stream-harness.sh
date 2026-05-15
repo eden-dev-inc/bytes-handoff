@@ -20,14 +20,18 @@ ROUTE_FRAMES="64"
 FRAME_LEN="63"
 TUNNEL_BYTES="65536"
 INPUT_FRAGMENT=""
+INPUT_MODEL="fixed"
+TCP_MSS_BYTES="${TCP_MSS_BYTES:-1460}"
 READ_RESERVE="16384"
 HANDOFF_FLUSH_BYTES=""
+COALESCER_STATS="0"
 WRITE_PENDING_BYTES=""
 DUPLEX_CAPACITY="262144"
 ITERATIONS=""
 DURATION_SECONDS=""
 SERVICE_CORES=""
 DRIVER_CORES=""
+TASKSET_CORES="${TASKSET_CORES:-}"
 IDLE_TIMEOUT_MILLIS="2000"
 
 while [[ $# -gt 0 ]]; do
@@ -43,8 +47,11 @@ while [[ $# -gt 0 ]]; do
     --frame-len) FRAME_LEN="$2"; shift 2 ;;
     --tunnel-bytes) TUNNEL_BYTES="$2"; shift 2 ;;
     --input-fragment) INPUT_FRAGMENT="$2"; shift 2 ;;
+    --input-model) INPUT_MODEL="$2"; shift 2 ;;
+    --tcp-mss-bytes) TCP_MSS_BYTES="$2"; shift 2 ;;
     --read-reserve) READ_RESERVE="$2"; shift 2 ;;
     --handoff-flush-bytes) HANDOFF_FLUSH_BYTES="$2"; shift 2 ;;
+    --coalescer-stats) COALESCER_STATS="1"; shift ;;
     --write-pending-bytes) WRITE_PENDING_BYTES="$2"; shift 2 ;;
     --duplex-capacity) DUPLEX_CAPACITY="$2"; shift 2 ;;
     --iterations) ITERATIONS="$2"; shift 2 ;;
@@ -54,9 +61,12 @@ while [[ $# -gt 0 ]]; do
     --idle-timeout-millis) IDLE_TIMEOUT_MILLIS="$2"; shift 2 ;;
     --help)
       echo "Usage: $0 [--transport duplex|cached|tcp] [--implementation handoff|monoio_handoff|bytesmut_handoff|manual_vec|raw_copy] [--scenario fragmented|coalesced|all] [--completion ticket|fire_and_forget] [--worker-threads N] [--connections N] [--runs N]"
-      echo "          [--route-frames N] [--frame-len N] [--tunnel-bytes N] [--input-fragment N]"
-      echo "          [--read-reserve N] [--handoff-flush-bytes N] [--write-pending-bytes N] [--duplex-capacity N] [--iterations N] [--duration-seconds N]"
+      echo "          [--route-frames N] [--frame-len N] [--tunnel-bytes N] [--input-fragment N] [--input-model fixed|tcp] [--tcp-mss-bytes N]"
+      echo "          [--read-reserve N] [--handoff-flush-bytes N] [--coalescer-stats] [--write-pending-bytes N] [--duplex-capacity N] [--iterations N] [--duration-seconds N]"
       echo "          [--service-cores CPUSET --driver-cores CPUSET] [--idle-timeout-millis N]"
+      echo ""
+      echo "Environment:"
+      echo "  TASKSET_CORES=CPUSET pins integrated duplex/cached runs with taskset"
       exit 0
       ;;
     *)
@@ -91,6 +101,13 @@ case "$SCENARIO" in
     exit 1
     ;;
 esac
+case "$INPUT_MODEL" in
+  fixed|tcp) ;;
+  *)
+    echo "ERROR: unsupported --input-model '$INPUT_MODEL'"
+    exit 1
+    ;;
+esac
 case "$COMPLETION" in
   ticket|fire_and_forget) ;;
   *)
@@ -106,17 +123,21 @@ mkdir -p "$RUN_DIR"
 
 echo "=== bytes-handoff stream harness ==="
 echo "transport=$TRANSPORT implementation=$IMPLEMENTATION scenario=$SCENARIO completion=$COMPLETION worker_threads=$WORKER_THREADS connections=$CONNECTIONS runs=$RUNS"
-echo "route_frames=$ROUTE_FRAMES frame_len=$FRAME_LEN tunnel_bytes=$TUNNEL_BYTES read_reserve=$READ_RESERVE duplex_capacity=$DUPLEX_CAPACITY"
+echo "route_frames=$ROUTE_FRAMES frame_len=$FRAME_LEN tunnel_bytes=$TUNNEL_BYTES input_model=$INPUT_MODEL tcp_mss_bytes=$TCP_MSS_BYTES read_reserve=$READ_RESERVE duplex_capacity=$DUPLEX_CAPACITY"
 if [[ -n "$WRITE_PENDING_BYTES" ]]; then
   echo "write_pending_bytes=$WRITE_PENDING_BYTES"
 fi
 if [[ -n "$HANDOFF_FLUSH_BYTES" ]]; then
   echo "handoff_flush_bytes=$HANDOFF_FLUSH_BYTES"
 else
-  echo "handoff_flush_bytes=default_1024"
+  echo "handoff_flush_bytes=default_16384"
 fi
+echo "coalescer_stats_enabled=$COALESCER_STATS"
 if [[ -n "$SERVICE_CORES" || -n "$DRIVER_CORES" ]]; then
   echo "split_tcp_service_cores=${SERVICE_CORES:-none} split_tcp_driver_cores=${DRIVER_CORES:-none} idle_timeout_millis=$IDLE_TIMEOUT_MILLIS"
+fi
+if [[ -n "$TASKSET_CORES" ]]; then
+  echo "taskset_cores=$TASKSET_CORES"
 fi
 if [[ -n "$ITERATIONS" ]]; then
   echo "iterations=$ITERATIONS"
@@ -155,6 +176,8 @@ run_one_scenario() {
     --route-frames "$ROUTE_FRAMES"
     --frame-len "$FRAME_LEN"
     --tunnel-bytes "$TUNNEL_BYTES"
+    --input-model "$INPUT_MODEL"
+    --tcp-mss-bytes "$TCP_MSS_BYTES"
     --read-reserve "$READ_RESERVE"
     --duplex-capacity "$DUPLEX_CAPACITY"
   )
@@ -163,6 +186,9 @@ run_one_scenario() {
   fi
   if [[ -n "${HANDOFF_FLUSH_BYTES:-}" ]]; then
     cmd+=(--handoff-flush-bytes "$HANDOFF_FLUSH_BYTES")
+  fi
+  if [[ "$COALESCER_STATS" == "1" ]]; then
+    cmd+=(--coalescer-stats)
   fi
   if [[ -n "${ITERATIONS:-}" ]]; then
     cmd+=(--iterations "$ITERATIONS")
@@ -179,6 +205,15 @@ run_one_scenario() {
     split_tcp="true"
     if ! command -v taskset >/dev/null 2>&1; then
       echo "ERROR: --service-cores/--driver-cores require taskset"
+      exit 1
+    fi
+  elif [[ -n "$TASKSET_CORES" ]]; then
+    if [[ "$TRANSPORT" == "tcp" ]]; then
+      echo "ERROR: TASKSET_CORES only supports integrated duplex/cached runs; use --service-cores/--driver-cores for --transport tcp"
+      exit 1
+    fi
+    if ! command -v taskset >/dev/null 2>&1; then
+      echo "ERROR: TASKSET_CORES requires taskset"
       exit 1
     fi
   elif [[ -n "$SERVICE_CORES" || -n "$DRIVER_CORES" ]]; then
@@ -239,7 +274,11 @@ run_one_scenario() {
 
       wait "$service_pid"
     else
-      "${cmd[@]}" | tee "$out_dir/handoff-run-${run}.txt"
+      if [[ -n "$TASKSET_CORES" ]]; then
+        taskset -c "$TASKSET_CORES" "${cmd[@]}" | tee "$out_dir/handoff-run-${run}.txt"
+      else
+        "${cmd[@]}" | tee "$out_dir/handoff-run-${run}.txt"
+      fi
     fi
   done
   python3 "$SCRIPT_DIR/summarize_stream_harness.py" "$out_dir"

@@ -27,6 +27,21 @@ FIELDS = [
     "latency_p99_micros",
     "latency_p999_micros",
     "latency_max_micros",
+    "coalescer_input_chunks",
+    "coalescer_input_bytes",
+    "coalescer_flushes",
+    "coalescer_flush_bytes",
+    "coalescer_buffered_flushes",
+    "coalescer_direct_flushes",
+    "coalescer_buffered_input_chunks",
+    "coalescer_avg_bytes_per_flush",
+    "coalescer_avg_chunks_per_flush",
+    "coalescer_avg_buffered_chunks_per_flush",
+    "coalescer_max_chunks_per_flush",
+    "coalescer_max_bytes_per_flush",
+    "coalescer_max_pending_bytes",
+    "coalescer_avg_flush_wait_nanos",
+    "coalescer_max_flush_wait_nanos",
 ]
 
 RUN_COLUMNS = [
@@ -40,8 +55,11 @@ RUN_COLUMNS = [
     "frame_len",
     "tunnel_bytes",
     "input_fragment",
+    "input_model",
+    "tcp_mss_bytes",
     "read_reserve",
     "handoff_flush_bytes",
+    "coalescer_stats_enabled",
     "write_pending_bytes",
     "duplex_capacity",
     "configured_iterations",
@@ -120,6 +138,11 @@ def write_summary(
     if "latency_p99_micros" in runs[0]:
         latency_p99 = mean_field(runs, "latency_p99_micros")
         fields.append(f"mean_latency_p99_micros={latency_p99:.2f}")
+    if runs[0].get("coalescer_stats_enabled", "").lower() in {"1", "true", "yes"}:
+        wait_nanos = mean_field(runs, "coalescer_avg_flush_wait_nanos")
+        chunks = mean_field(runs, "coalescer_avg_buffered_chunks_per_flush")
+        fields.append(f"mean_coalescer_avg_flush_wait_nanos={wait_nanos:.2f}")
+        fields.append(f"mean_coalescer_avg_buffered_chunks_per_flush={chunks:.2f}")
     print(" ".join(fields))
     print(f"summary_csv={summary_path}")
     print(f"runs_csv={runs_path}")

@@ -29,6 +29,9 @@ buffering, splitting, write fan-in, and backpressure. This harness is different:
 ./bench/run-stream-harness.sh --scenario fragmented --completion fire_and_forget --runs 5
 ./bench/run-stream-harness.sh --scenario all --worker-threads 8 --connections 128 --runs 5
 ./bench/run-fragment-sweep.sh
+./bench/run-coalescing-tuner.sh
+./bench/run-tcp-model-tuner.sh
+cargo run --release --bin tune_coalescing -- bench/results --implementation handoff
 ```
 
 The default transport is `cached`, which reuses prebuilt payload bytes and avoids
@@ -82,18 +85,25 @@ taskset -c 0-15 ./bench/run-stream-harness.sh \
   --handoff-flush-bytes 16384
 ```
 
-`--input-fragment` controls how many bytes the cached reader yields per read.
+`--input-fragment` controls how many bytes the cached reader yields per read
+when `--input-model fixed` is selected. `--input-model tcp` instead uses
+MSS-sized source chunks, controlled by `--tcp-mss-bytes`; the default is 1460,
+which matches the usual TCP payload carried by a 1500-byte Ethernet MTU with
+IPv4/TCP headers. That standard Ethernet MSS is the packet-size shape used for
+testing, and it is intentionally separate from `read_reserve` because userspace
+`read()` calls can receive multiple coalesced TCP segments.
 `--handoff-flush-bytes` controls how many buffered tunnel bytes the handoff path
 collects before submitting one owned `Bytes` chunk to `WriteHandoff`. The
-default handoff flush threshold is `read_reserve`; pass
-`--handoff-flush-bytes 1` to model the old flush-every-read behavior.
+default handoff flush threshold is 16 KiB, matching
+`DEFAULT_WRITE_COALESCE_THRESHOLD`; pass `--handoff-flush-bytes 1` to model
+flush-every-read behavior.
 
 To find the crossover between tiny fragmented input and larger coalesced input,
 run:
 
 ```bash
 INPUT_FRAGMENTS="64 128 256 512 1024 2048 4096 8192 16384" \
-HANDOFF_FLUSH_BYTES_LIST="1 256 1024 4096 16384" \
+HANDOFF_FLUSH_BYTES_LIST="1 128 256 512 1024 2048 4096 8192 16384" \
 IMPLEMENTATIONS="handoff bytesmut_handoff monoio_handoff manual_vec raw_copy" \
 WORKER_THREADS=16 \
 CONNECTIONS=128 \
@@ -105,26 +115,102 @@ DURATION_SECONDS=5 \
 This holds the protocol frame shape constant and varies only input arrival size
 and tunnel handoff flush threshold.
 
-On a 16 physical core Ubuntu 24.04 Linux server, a focused one-run sweep of
+For adaptive discovery, let the tuner choose each next threshold and run the
+harness sequentially:
+
+```bash
+MAX_THRESHOLD_POINTS=8 \
+MIN_THRESHOLD_POINTS=5 \
+BATCH_SIZE=1 \
+THROUGHPUT_WITHIN=0.05 \
+./bench/run-coalescing-tuner.sh
+```
+
+For a TCP-like cached benchmark, run the wrapper:
+
+```bash
+./bench/run-tcp-model-tuner.sh
+```
+
+It sets `INPUT_MODEL=tcp`, keeps the cached transport, enables coalescer stats,
+uses `TCP_MSS_BYTES=1460`, and searches thresholds up to 256 KiB. Override
+`TASKSET_CORES`, `WORKER_THREADS`, `CONNECTIONS`, `TCP_MSS_BYTES`, or any
+regular tuner variable to match the runtime shape you care about.
+
+Run the tuner with the same worker count and CPU affinity you expect in
+deployment. For cached or duplex runs on Linux, `TASKSET_CORES` pins the
+integrated harness process while leaving Cargo/build work outside the measured
+process:
+
+```bash
+TASKSET_CORES=0 \
+WORKER_THREADS=1 \
+MAX_THRESHOLD_BYTES=262144 \
+MIN_THRESHOLD_POINTS=11 \
+MAX_THRESHOLD_POINTS=15 \
+BATCH_SIZE=3 \
+./bench/run-coalescing-tuner.sh
+
+TASKSET_CORES=0-15 \
+WORKER_THREADS=16 \
+MAX_THRESHOLD_BYTES=262144 \
+MIN_THRESHOLD_POINTS=11 \
+MAX_THRESHOLD_POINTS=15 \
+BATCH_SIZE=3 \
+./bench/run-coalescing-tuner.sh
+```
+
+That script enables `COALESCER_STATS=1` by default, calls
+`tune_coalescing --next`, runs the requested `--handoff-flush-bytes` value with
+the stream harness, then feeds the resulting `runs.csv` back into the tuner. The
+search starts with the range boundaries and a log-space midpoint, fills large
+unknown gaps until it has enough curve shape, and then probes neighbors around
+the current throughput peak and recommendation.
+
+To score an existing sweep without running more benchmarks, tune from the emitted
+`runs.csv` files:
+
+```bash
+cargo run --release --bin tune_coalescing -- bench/results \
+  --implementation handoff \
+  --throughput-within 0.05
+```
+
+The CLI uses the crate's `WriteCoalescingTuner` and `WriteCoalescingSearch`
+library APIs. It groups compatible runs and chooses the knee of the measured
+flush-delay/throughput curve: measured oldest-byte flush wait on one axis,
+throughput on the other. If coalescer stats are missing, it falls back to
+`input_chunks_per_flush` as the visibility-delay proxy. Use
+`--max-reads-per-flush`, `--max-avg-flush-wait-us`, `--max-max-flush-wait-us`, or
+`--max-connection-p99-us` for hard budgets before the knee is chosen.
+
+For diagnostic runs that also need observed coalescer-local wait time, pass
+`COALESCER_STATS=1` to the sweep or `--coalescer-stats` to
+`run-stream-harness.sh`, then tune with `--max-avg-flush-wait-us` or
+`--max-max-flush-wait-us`. Keep stats disabled for headline throughput numbers;
+the timer calls needed for wait measurement are deliberately opt-in.
+
+On a 16 physical core Linux host, a focused three-run TCP/MSS tuning sweep of
 `handoff` with 128 cached connections, 64 route frames, 1 MiB tunnel payloads,
-16 workers, and 3 second target runs showed why the default handoff flush
-threshold is 16 KiB:
+1460-byte TCP source chunks, 16 workers, coalescer stats enabled, and 5 second
+target runs selected the 16 KiB default:
 
-| input chunk | flush every read | flush at 16 KiB |
-|---:|---:|---:|
-| 64 B | 2045 MiB/s | 33289 MiB/s |
-| 128 B | 2210 MiB/s | 35600 MiB/s |
-| 256 B | 4588 MiB/s | 34836 MiB/s |
-| 512 B | 4531 MiB/s | 35101 MiB/s |
-| 1 KiB | 27181 MiB/s | 35408 MiB/s |
-| 2 KiB | 34290 MiB/s | 37233 MiB/s |
-| 4 KiB | 37499 MiB/s | 36199 MiB/s |
-| 8 KiB | 38040 MiB/s | 37642 MiB/s |
-| 16 KiB | 38624 MiB/s | 38291 MiB/s |
+| tunnel flush threshold | input chunks per flush | throughput | cost | connection p99 latency | avg flush wait |
+|---:|---:|---:|---:|---:|---:|
+| flush every chunk | 1.00 | 10821 MiB/s | 1.16 ns/B | 12.6 ms | 0 us |
+| 512 B | 1.00 | 10925 MiB/s | 1.15 ns/B | 12.6 ms | 0.769 us |
+| 2 KiB | 2.00 | 15587 MiB/s | 0.82 ns/B | 8.04 ms | 15.8 us |
+| 4 KiB | 3.00 | 19032 MiB/s | 0.69 ns/B | 6.52 ms | 17.7 us |
+| 8 KiB | 6.00 | 26621 MiB/s | 0.49 ns/B | 4.40 ms | 19.4 us |
+| **16 KiB** | **12.00** | **33336 MiB/s** | **0.39 ns/B** | **3.28 ms** | **17.0 us** |
+| 32 KiB | 22.50 | 33780 MiB/s | 0.39 ns/B | 3.30 ms | 32.2 us |
+| 64 KiB | 45.00 | 31820 MiB/s | 0.41 ns/B | 3.51 ms | 67.9 us |
+| 256 KiB | 180.00 | 23693 MiB/s | 0.58 ns/B | 5.05 ms | 352 us |
 
-The immediate flush path crosses into the same range around 2-4 KiB input
-chunks. Below that, per-chunk queueing and notification dominate, so collecting
-tunnel bytes up to `read_reserve` is the better default for this workload.
+The 32 KiB point has slightly higher raw throughput, but the tuner chooses the
+16 KiB knee because it is within about 1.3% throughput while roughly halving the
+measured oldest-byte flush wait. Thresholds below MSS effectively flush one TCP
+source chunk at a time, so they cluster near the same throughput.
 
 Use split-process TCP runs only when you want socket and kernel behavior. The
 proxy service can be pinned to a different logical CPU set than the driver and
@@ -184,8 +270,13 @@ Scenarios:
 - `fragmented`: small client writes, default 64-byte fragments.
 - `coalesced`: larger client writes, default fragment size equal to
   `read_reserve`.
+- `input_model=fixed`: every cached read or client write uses
+  `input_fragment`.
+- `input_model=tcp`: cached reads or client writes are capped at
+  `tcp_mss_bytes`, default 1460 bytes. This models standard Ethernet MSS-sized
+  TCP payloads for testing rather than a userspace `read()` buffer size.
 - `handoff_flush_bytes`: tunnel-mode flush threshold for the handoff
-  implementations. The default is `read_reserve`; use `1` for immediate flushes.
+  implementations. The default is 16 KiB; use `1` for immediate flushes.
 
 Useful fields in each run output:
 
@@ -195,7 +286,16 @@ Useful fields in each run output:
 - `cpu_avg_cores_per_worker`
 - `cpu_utilization_pct_per_worker`
 - `cpu_ns_per_byte`
+- `input_model`
+- `tcp_mss_bytes`
 - `handoff_flush_bytes`
+- `coalescer_stats_enabled`
+- `coalescer_input_chunks`
+- `coalescer_flushes`
+- `coalescer_avg_buffered_chunks_per_flush`
+- `coalescer_max_chunks_per_flush`
+- `coalescer_avg_flush_wait_nanos`
+- `coalescer_max_flush_wait_nanos`
 - `latency_p50_micros`
 - `latency_p95_micros`
 - `latency_p99_micros`

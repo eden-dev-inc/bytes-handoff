@@ -18,7 +18,7 @@ bytes = "1.11"
 hdrhistogram = { version = "7", optional = true }
 libc = { version = "0.2", optional = true }
 monoio = { version = "0.2.4", default-features = false, features = ["bytes", "legacy"], optional = true }
-thiserror = "1"
+thiserror = "2"
 tokio = { version = "1", features = ["io-util", "rt", "sync"] }
 
 [features]
@@ -52,3 +52,7 @@ harness = false
 name = "bench_stream_harness"
 path = "src/bin/bench_stream_harness.rs"
 required-features = ["bench-tools"]
+
+[[bin]]
+name = "tune_coalescing"
+path = "src/bin/tune_coalescing.rs"
