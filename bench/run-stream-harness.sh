@@ -9,7 +9,7 @@ detect_cpus() {
   nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4
 }
 
-TRANSPORT="duplex"
+TRANSPORT="cached"
 IMPLEMENTATION="handoff"
 SCENARIO="fragmented"
 COMPLETION="ticket"
@@ -21,6 +21,7 @@ FRAME_LEN="63"
 TUNNEL_BYTES="65536"
 INPUT_FRAGMENT=""
 READ_RESERVE="16384"
+HANDOFF_FLUSH_BYTES=""
 WRITE_PENDING_BYTES=""
 DUPLEX_CAPACITY="262144"
 ITERATIONS=""
@@ -43,6 +44,7 @@ while [[ $# -gt 0 ]]; do
     --tunnel-bytes) TUNNEL_BYTES="$2"; shift 2 ;;
     --input-fragment) INPUT_FRAGMENT="$2"; shift 2 ;;
     --read-reserve) READ_RESERVE="$2"; shift 2 ;;
+    --handoff-flush-bytes) HANDOFF_FLUSH_BYTES="$2"; shift 2 ;;
     --write-pending-bytes) WRITE_PENDING_BYTES="$2"; shift 2 ;;
     --duplex-capacity) DUPLEX_CAPACITY="$2"; shift 2 ;;
     --iterations) ITERATIONS="$2"; shift 2 ;;
@@ -51,9 +53,9 @@ while [[ $# -gt 0 ]]; do
     --driver-cores) DRIVER_CORES="$2"; shift 2 ;;
     --idle-timeout-millis) IDLE_TIMEOUT_MILLIS="$2"; shift 2 ;;
     --help)
-      echo "Usage: $0 [--transport duplex|tcp] [--implementation handoff|manual_vec|raw_copy] [--scenario fragmented|coalesced|all] [--completion ticket|fire_and_forget] [--worker-threads N] [--connections N] [--runs N]"
+      echo "Usage: $0 [--transport duplex|cached|tcp] [--implementation handoff|monoio_handoff|bytesmut_handoff|manual_vec|raw_copy] [--scenario fragmented|coalesced|all] [--completion ticket|fire_and_forget] [--worker-threads N] [--connections N] [--runs N]"
       echo "          [--route-frames N] [--frame-len N] [--tunnel-bytes N] [--input-fragment N]"
-      echo "          [--read-reserve N] [--write-pending-bytes N] [--duplex-capacity N] [--iterations N] [--duration-seconds N]"
+      echo "          [--read-reserve N] [--handoff-flush-bytes N] [--write-pending-bytes N] [--duplex-capacity N] [--iterations N] [--duration-seconds N]"
       echo "          [--service-cores CPUSET --driver-cores CPUSET] [--idle-timeout-millis N]"
       exit 0
       ;;
@@ -65,19 +67,23 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$TRANSPORT" in
-  duplex|tcp) ;;
+  duplex|cached|tcp) ;;
   *)
     echo "ERROR: unsupported --transport '$TRANSPORT'"
     exit 1
     ;;
 esac
 case "$IMPLEMENTATION" in
-  handoff|manual_vec|raw_copy) ;;
+  handoff|monoio_handoff|bytesmut_handoff|manual_vec|raw_copy) ;;
   *)
     echo "ERROR: unsupported --implementation '$IMPLEMENTATION'"
     exit 1
     ;;
 esac
+if [[ "$IMPLEMENTATION" == "monoio_handoff" && "$TRANSPORT" != "duplex" && "$TRANSPORT" != "cached" ]]; then
+  echo "ERROR: monoio_handoff currently supports --transport duplex|cached only"
+  exit 1
+fi
 case "$SCENARIO" in
   fragmented|coalesced|all) ;;
   *)
@@ -95,7 +101,7 @@ esac
 
 mkdir -p "$RESULTS_DIR"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-RUN_DIR="$RESULTS_DIR/stream_${TRANSPORT}_${IMPLEMENTATION}_${SCENARIO}_${COMPLETION}_${TIMESTAMP}"
+RUN_DIR="$RESULTS_DIR/stream_${TRANSPORT}_${IMPLEMENTATION}_${SCENARIO}_${COMPLETION}_${TIMESTAMP}_$$"
 mkdir -p "$RUN_DIR"
 
 echo "=== bytes-handoff stream harness ==="
@@ -103,6 +109,11 @@ echo "transport=$TRANSPORT implementation=$IMPLEMENTATION scenario=$SCENARIO com
 echo "route_frames=$ROUTE_FRAMES frame_len=$FRAME_LEN tunnel_bytes=$TUNNEL_BYTES read_reserve=$READ_RESERVE duplex_capacity=$DUPLEX_CAPACITY"
 if [[ -n "$WRITE_PENDING_BYTES" ]]; then
   echo "write_pending_bytes=$WRITE_PENDING_BYTES"
+fi
+if [[ -n "$HANDOFF_FLUSH_BYTES" ]]; then
+  echo "handoff_flush_bytes=$HANDOFF_FLUSH_BYTES"
+else
+  echo "handoff_flush_bytes=default_1024"
 fi
 if [[ -n "$SERVICE_CORES" || -n "$DRIVER_CORES" ]]; then
   echo "split_tcp_service_cores=${SERVICE_CORES:-none} split_tcp_driver_cores=${DRIVER_CORES:-none} idle_timeout_millis=$IDLE_TIMEOUT_MILLIS"
@@ -149,6 +160,9 @@ run_one_scenario() {
   )
   if [[ -n "${WRITE_PENDING_BYTES:-}" ]]; then
     cmd+=(--write-pending-bytes "$WRITE_PENDING_BYTES")
+  fi
+  if [[ -n "${HANDOFF_FLUSH_BYTES:-}" ]]; then
+    cmd+=(--handoff-flush-bytes "$HANDOFF_FLUSH_BYTES")
   fi
   if [[ -n "${ITERATIONS:-}" ]]; then
     cmd+=(--iterations "$ITERATIONS")

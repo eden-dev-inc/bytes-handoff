@@ -1,10 +1,19 @@
-use bytes::Bytes;
-use bytes_handoff::{HandoffBuffer, HandoffBufferConfig, WriteHandoff, WriteHandoffConfig};
+use bytes::{Bytes, BytesMut};
+use bytes_handoff::{
+    DEFAULT_WRITE_COALESCE_THRESHOLD, HandoffBuffer, HandoffBufferConfig, MonoioWriteCoalescer,
+    MonoioWriteHandoff, WriteCoalescer, WriteHandoff, WriteHandoffConfig,
+};
 use hdrhistogram::Histogram;
+use monoio::buf::IoBufMut as _;
+use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::runtime::Builder;
 use tokio::time::timeout;
@@ -40,6 +49,7 @@ impl Scenario {
 #[derive(Clone, Copy)]
 enum Transport {
     Duplex,
+    Cached,
     Tcp,
 }
 
@@ -47,14 +57,16 @@ impl Transport {
     fn parse(value: &str) -> Self {
         match value {
             "duplex" => Self::Duplex,
+            "cached" => Self::Cached,
             "tcp" => Self::Tcp,
-            _ => panic!("invalid --transport: {value} (expected duplex|tcp)"),
+            _ => panic!("invalid --transport: {value} (expected duplex|cached|tcp)"),
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
             Self::Duplex => "duplex",
+            Self::Cached => "cached",
             Self::Tcp => "tcp",
         }
     }
@@ -86,6 +98,8 @@ impl CompletionMode {
 #[derive(Clone, Copy)]
 enum Implementation {
     Handoff,
+    MonoioHandoff,
+    BytesMutHandoff,
     ManualVec,
     RawCopy,
 }
@@ -94,15 +108,21 @@ impl Implementation {
     fn parse(value: &str) -> Self {
         match value {
             "handoff" => Self::Handoff,
+            "monoio_handoff" => Self::MonoioHandoff,
+            "bytesmut_handoff" => Self::BytesMutHandoff,
             "manual_vec" => Self::ManualVec,
             "raw_copy" => Self::RawCopy,
-            _ => panic!("invalid --implementation: {value} (expected handoff|manual_vec|raw_copy)"),
+            _ => panic!(
+                "invalid --implementation: {value} (expected handoff|monoio_handoff|bytesmut_handoff|manual_vec|raw_copy)"
+            ),
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
             Self::Handoff => "handoff",
+            Self::MonoioHandoff => "monoio_handoff",
+            Self::BytesMutHandoff => "bytesmut_handoff",
             Self::ManualVec => "manual_vec",
             Self::RawCopy => "raw_copy",
         }
@@ -148,10 +168,31 @@ struct Config {
     tunnel_bytes: usize,
     input_fragment: usize,
     read_reserve: usize,
+    handoff_flush_bytes: usize,
     write_pending_bytes: usize,
     duplex_capacity: usize,
     iterations: usize,
     duration_seconds: f64,
+}
+
+#[derive(Clone)]
+struct PayloadSet {
+    payloads: Arc<Vec<Bytes>>,
+}
+
+impl PayloadSet {
+    fn new(config: Config) -> Self {
+        let payloads = (0..config.connections)
+            .map(|connection_id| payload(connection_id, config))
+            .collect();
+        Self {
+            payloads: Arc::new(payloads),
+        }
+    }
+
+    fn get(&self, connection_id: usize) -> Bytes {
+        self.payloads[connection_id % self.payloads.len()].clone()
+    }
 }
 
 struct Cli {
@@ -169,7 +210,11 @@ impl Config {
     }
 
     fn max_output_items(self) -> usize {
-        self.route_frames + (self.tunnel_bytes / self.read_reserve).saturating_add(16)
+        let tunnel_chunks = self
+            .tunnel_bytes
+            .saturating_add(self.handoff_flush_bytes.saturating_sub(1))
+            / self.handoff_flush_bytes;
+        self.route_frames + tunnel_chunks.saturating_add(16)
     }
 
     fn write_pending_bytes(self) -> usize {
@@ -187,6 +232,32 @@ struct RunResult {
     iterations: usize,
     total_seconds: f64,
     latency: LatencySummary,
+}
+
+struct WorkerRunResult {
+    total_bytes: usize,
+    total_streams: usize,
+    iterations: usize,
+    latency: Histogram<u64>,
+}
+
+impl WorkerRunResult {
+    fn new() -> Self {
+        Self {
+            total_bytes: 0,
+            total_streams: 0,
+            iterations: 0,
+            latency: latency_histogram(),
+        }
+    }
+
+    fn record(&mut self, result: ConnectionResult) {
+        self.total_bytes += result.bytes;
+        self.total_streams += 1;
+        self.latency
+            .record(result.latency_micros.max(1))
+            .expect("record stream latency");
+    }
 }
 
 struct ConnectionResult {
@@ -216,7 +287,7 @@ impl LatencySummary {
 }
 
 fn parse_args() -> Cli {
-    let mut transport = Transport::Duplex;
+    let mut transport = Transport::Cached;
     let mut implementation = Implementation::Handoff;
     let mut scenario = Scenario::Fragmented;
     let mut completion = CompletionMode::Ticket;
@@ -229,6 +300,7 @@ fn parse_args() -> Cli {
     let mut input_fragment_set = false;
     let mut input_fragment = 64usize;
     let mut read_reserve = 16 * 1024usize;
+    let mut handoff_flush_bytes = 0usize;
     let mut write_pending_bytes = 0usize;
     let mut duplex_capacity = 256 * 1024usize;
     let mut iterations = 1usize;
@@ -299,6 +371,12 @@ fn parse_args() -> Cli {
                 read_reserve = args[i + 1].parse().expect("--read-reserve must be an integer");
                 i += 2;
             }
+            "--handoff-flush-bytes" if i + 1 < args.len() => {
+                handoff_flush_bytes = args[i + 1]
+                    .parse()
+                    .expect("--handoff-flush-bytes must be an integer");
+                i += 2;
+            }
             "--write-pending-bytes" if i + 1 < args.len() => {
                 write_pending_bytes = args[i + 1]
                     .parse()
@@ -343,13 +421,18 @@ fn parse_args() -> Cli {
             }
             "--help" => {
                 println!(
-                    "Usage: bench_stream_harness [--transport duplex|tcp] [--role integrated|tcp-service|tcp-driver] [--implementation handoff|manual_vec|raw_copy] [--scenario fragmented|coalesced] [--completion ticket|fire_and_forget] [--worker-threads N] [--connections N] [--route-frames N] [--frame-len N] [--tunnel-bytes N] [--input-fragment N] [--read-reserve N] [--write-pending-bytes N] [--duplex-capacity N] [--iterations N] [--duration-seconds N] [--service-addr HOST:PORT] [--sink-addr HOST:PORT] [--ready-file PATH] [--idle-timeout-millis N]"
+                    "Usage: bench_stream_harness [--transport duplex|cached|tcp] [--role integrated|tcp-service|tcp-driver] [--implementation handoff|monoio_handoff|bytesmut_handoff|manual_vec|raw_copy] [--scenario fragmented|coalesced] [--completion ticket|fire_and_forget] [--worker-threads N] [--connections N] [--route-frames N] [--frame-len N] [--tunnel-bytes N] [--input-fragment N] [--read-reserve N] [--handoff-flush-bytes N] [--write-pending-bytes N] [--duplex-capacity N] [--iterations N] [--duration-seconds N] [--service-addr HOST:PORT] [--sink-addr HOST:PORT] [--ready-file PATH] [--idle-timeout-millis N]"
                 );
                 println!("  duplex: in-memory client/proxy/sink transport");
+                println!("  cached: prebuilt payload reader plus counting sink, without driver/sink tasks");
                 println!("  tcp: localhost TCP client/proxy/sink transport");
                 println!("  tcp-service: service-only process for split-core TCP runs");
                 println!("  tcp-driver: client plus sink process for split-core TCP runs");
                 println!("  handoff: HandoffBuffer plus WriteHandoff");
+                println!(
+                    "  monoio_handoff: Monoio HandoffBuffer plus WriteHandoff, duplex|cached transport only"
+                );
+                println!("  bytesmut_handoff: direct BytesMut read_buf plus WriteHandoff");
                 println!("  manual_vec: Vec-backed parser with direct writes");
                 println!("  raw_copy: unparsed async copy lower bound");
                 println!("  fragmented: many small client writes, default input fragment 64 bytes");
@@ -384,7 +467,35 @@ fn parse_args() -> Cli {
     if !input_fragment_set && matches!(scenario, Scenario::Coalesced) {
         input_fragment = read_reserve;
     }
+    if handoff_flush_bytes == 0 {
+        handoff_flush_bytes = DEFAULT_WRITE_COALESCE_THRESHOLD;
+    }
     assert!(input_fragment >= 1, "--input-fragment must be >= 1");
+    assert!(
+        handoff_flush_bytes >= 1,
+        "--handoff-flush-bytes must be >= 1"
+    );
+    let effective_write_pending_bytes = if write_pending_bytes == 0 {
+        read_reserve.saturating_mul(2)
+    } else {
+        write_pending_bytes
+    };
+    assert!(
+        !matches!(
+            implementation,
+            Implementation::Handoff | Implementation::MonoioHandoff | Implementation::BytesMutHandoff
+        ) || handoff_flush_bytes <= effective_write_pending_bytes,
+        "--handoff-flush-bytes must be <= effective write pending byte budget"
+    );
+    assert!(
+        !matches!(implementation, Implementation::MonoioHandoff)
+            || matches!(transport, Transport::Duplex | Transport::Cached),
+        "--implementation monoio_handoff currently supports --transport duplex|cached only"
+    );
+    assert!(
+        !matches!(implementation, Implementation::MonoioHandoff) || matches!(role, Role::Integrated),
+        "--implementation monoio_handoff currently supports --role integrated only"
+    );
 
     let config = Config {
         transport,
@@ -398,6 +509,7 @@ fn parse_args() -> Cli {
         tunnel_bytes,
         input_fragment,
         read_reserve,
+        handoff_flush_bytes,
         write_pending_bytes,
         duplex_capacity,
         iterations,
@@ -414,7 +526,7 @@ fn parse_args() -> Cli {
     }
 }
 
-fn payload(connection_id: usize, config: Config) -> Vec<u8> {
+fn payload(connection_id: usize, config: Config) -> Bytes {
     let mut out = Vec::with_capacity(config.bytes_per_connection());
     for frame_id in 0..config.route_frames {
         let label = format!("GET /tenant/{connection_id:04}/object/{frame_id:08}");
@@ -426,10 +538,15 @@ fn payload(connection_id: usize, config: Config) -> Vec<u8> {
     for byte in 0..config.tunnel_bytes {
         out.push(((connection_id + byte) % 251) as u8);
     }
-    out
+    Bytes::from(out)
 }
 
 fn run(config: Config) -> RunResult {
+    if matches!(config.implementation, Implementation::MonoioHandoff) {
+        return run_monoio(config);
+    }
+    let payloads = PayloadSet::new(config);
+
     let runtime = Builder::new_multi_thread()
         .worker_threads(config.worker_threads)
         .enable_all()
@@ -441,8 +558,7 @@ fn run(config: Config) -> RunResult {
         let mut total_bytes = 0usize;
         let mut total_streams = 0usize;
         let mut iterations = 0usize;
-        let mut latency =
-            Histogram::<u64>::new_with_max(60_000_000, 3).expect("create latency histogram");
+        let mut latency = latency_histogram();
         let deadline = if config.duration_seconds > 0.0 {
             Some(Instant::now() + Duration::from_secs_f64(config.duration_seconds))
         } else {
@@ -451,8 +567,9 @@ fn run(config: Config) -> RunResult {
 
         loop {
             let results = match config.transport {
-                Transport::Duplex => run_duplex(config).await,
-                Transport::Tcp => run_tcp(config).await,
+                Transport::Duplex => run_duplex(config, payloads.clone()).await,
+                Transport::Cached => run_cached(config, payloads.clone()).await,
+                Transport::Tcp => run_tcp(config, payloads.clone()).await,
             };
             for result in results {
                 total_bytes += result.bytes;
@@ -481,6 +598,97 @@ fn run(config: Config) -> RunResult {
     }
 }
 
+fn run_monoio(config: Config) -> RunResult {
+    assert!(
+        matches!(config.transport, Transport::Duplex | Transport::Cached),
+        "monoio_handoff currently supports duplex|cached transport only"
+    );
+    let payloads = PayloadSet::new(config);
+    let start = Instant::now();
+    let deadline = if config.duration_seconds > 0.0 {
+        Some(start + Duration::from_secs_f64(config.duration_seconds))
+    } else {
+        None
+    };
+    let worker_threads = config.worker_threads.min(config.connections);
+    let mut handles = Vec::with_capacity(worker_threads);
+    for worker_id in 0..worker_threads {
+        let payloads = payloads.clone();
+        handles.push(
+            std::thread::Builder::new()
+                .name(format!("monoio-harness-{worker_id}"))
+                .spawn(move || {
+                    run_monoio_worker(config, payloads, worker_id, worker_threads, deadline)
+                })
+                .expect("spawn monoio harness worker"),
+        );
+    }
+
+    let mut total_bytes = 0usize;
+    let mut total_streams = 0usize;
+    let mut latency = latency_histogram();
+    for handle in handles {
+        let worker = handle.join().expect("monoio harness worker joins");
+        total_bytes += worker.total_bytes;
+        total_streams += worker.total_streams;
+        latency
+            .add(&worker.latency)
+            .expect("merge monoio worker latency histogram");
+    }
+
+    let iterations = total_streams / config.connections;
+
+    RunResult {
+        total_bytes,
+        total_streams,
+        iterations,
+        total_seconds: start.elapsed().as_secs_f64(),
+        latency: summarize_latency(&latency),
+    }
+}
+
+fn run_monoio_worker(
+    config: Config,
+    payloads: PayloadSet,
+    worker_id: usize,
+    worker_threads: usize,
+    deadline: Option<Instant>,
+) -> WorkerRunResult {
+    let mut runtime = monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
+        .build()
+        .expect("build monoio benchmark runtime");
+
+    runtime.block_on(async move {
+        let mut result = WorkerRunResult::new();
+        loop {
+            let results = run_monoio_duplex_partition(
+                config,
+                payloads.clone(),
+                worker_id,
+                worker_threads,
+                result.iterations,
+            )
+            .await;
+            for connection in results {
+                result.record(connection);
+            }
+            result.iterations += 1;
+
+            if result.iterations >= config.iterations
+                && deadline.is_none_or(|end| Instant::now() >= end)
+            {
+                break;
+            }
+        }
+
+        result
+    })
+}
+
+fn latency_histogram() -> Histogram<u64> {
+    Histogram::<u64>::new_with_max(60_000_000, 3).expect("create latency histogram")
+}
+
 fn summarize_latency(histogram: &Histogram<u64>) -> LatencySummary {
     LatencySummary {
         p50_micros: histogram.value_at_quantile(0.50),
@@ -491,10 +699,13 @@ fn summarize_latency(histogram: &Histogram<u64>) -> LatencySummary {
     }
 }
 
-async fn run_duplex(config: Config) -> Vec<ConnectionResult> {
+async fn run_duplex(config: Config, payloads: PayloadSet) -> Vec<ConnectionResult> {
     let mut handles = Vec::with_capacity(config.connections);
     for connection_id in 0..config.connections {
-        handles.push(tokio::spawn(run_duplex_connection(connection_id, config)));
+        handles.push(tokio::spawn(run_duplex_connection(
+            config,
+            payloads.get(connection_id),
+        )));
     }
 
     let mut results = Vec::with_capacity(config.connections);
@@ -504,8 +715,7 @@ async fn run_duplex(config: Config) -> Vec<ConnectionResult> {
     results
 }
 
-async fn run_duplex_connection(connection_id: usize, config: Config) -> ConnectionResult {
-    let payload = payload(connection_id, config);
+async fn run_duplex_connection(config: Config, payload: Bytes) -> ConnectionResult {
     let expected_len = payload.len();
     let (client, inbound) = tokio::io::duplex(config.duplex_capacity);
     let (outbound, sink) = tokio::io::duplex(config.duplex_capacity);
@@ -525,7 +735,281 @@ async fn run_duplex_connection(connection_id: usize, config: Config) -> Connecti
     }
 }
 
-async fn run_tcp(config: Config) -> Vec<ConnectionResult> {
+async fn run_cached(config: Config, payloads: PayloadSet) -> Vec<ConnectionResult> {
+    let mut handles = Vec::with_capacity(config.connections);
+    for connection_id in 0..config.connections {
+        handles.push(tokio::spawn(run_cached_connection(
+            config,
+            payloads.get(connection_id),
+        )));
+    }
+
+    let mut results = Vec::with_capacity(config.connections);
+    for handle in handles {
+        results.push(handle.await.expect("cached connection task joins"));
+    }
+    results
+}
+
+async fn run_cached_connection(config: Config, payload: Bytes) -> ConnectionResult {
+    let expected_len = payload.len();
+    let reader = CachedFragmentedReader::new(payload, config.input_fragment);
+    let sink = CountWriter::default();
+    let output_bytes = sink.bytes.clone();
+
+    let start = Instant::now();
+    proxy_stream(reader, sink, config, expected_len).await;
+    let drained = output_bytes.load(Ordering::Acquire);
+    assert_eq!(drained, expected_len);
+
+    ConnectionResult {
+        bytes: drained,
+        latency_micros: start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+    }
+}
+
+struct CachedFragmentedReader {
+    payload: Bytes,
+    offset: usize,
+    fragment: usize,
+}
+
+impl CachedFragmentedReader {
+    fn new(payload: Bytes, fragment: usize) -> Self {
+        Self {
+            payload,
+            offset: 0,
+            fragment,
+        }
+    }
+}
+
+impl AsyncRead for CachedFragmentedReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let remaining = self.payload.len().saturating_sub(self.offset);
+        let read = remaining.min(self.fragment).min(buf.remaining());
+        if read > 0 {
+            let start = self.offset;
+            let end = start + read;
+            buf.put_slice(&self.payload[start..end]);
+            self.offset = end;
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[derive(Default)]
+struct CountWriter {
+    bytes: Arc<AtomicUsize>,
+}
+
+impl AsyncWrite for CountWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.bytes.fetch_add(buf.len(), Ordering::AcqRel);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let written = bufs.iter().map(|buf| buf.len()).sum();
+        self.bytes.fetch_add(written, Ordering::AcqRel);
+        Poll::Ready(Ok(written))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+async fn run_monoio_duplex_partition(
+    config: Config,
+    payloads: PayloadSet,
+    worker_id: usize,
+    worker_threads: usize,
+    iteration: usize,
+) -> Vec<ConnectionResult> {
+    let worker_connections = config
+        .connections
+        .saturating_add(worker_threads - 1 - worker_id)
+        / worker_threads;
+    let mut handles = Vec::with_capacity(worker_connections);
+    for connection_offset in (worker_id..config.connections).step_by(worker_threads) {
+        let connection_id = iteration * config.connections + connection_offset;
+        handles.push(monoio::spawn(run_monoio_duplex_connection(
+            config,
+            payloads.get(connection_id),
+        )));
+    }
+
+    let mut results = Vec::with_capacity(worker_connections);
+    for handle in handles {
+        results.push(handle.await);
+    }
+    results
+}
+
+async fn run_monoio_duplex_connection(config: Config, payload: Bytes) -> ConnectionResult {
+    let expected_len = payload.len();
+    let reader = MonoioFragmentedReader::new(payload, config.input_fragment);
+    let sink = MonoioCountWriter::default();
+    let output_bytes = sink.bytes.clone();
+
+    let start = Instant::now();
+    proxy_monoio_handoff(reader, sink, config, expected_len).await;
+    let drained = output_bytes.load(Ordering::Acquire);
+    assert_eq!(drained, expected_len);
+
+    ConnectionResult {
+        bytes: drained,
+        latency_micros: start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+    }
+}
+
+struct MonoioFragmentedReader {
+    payload: Bytes,
+    offset: usize,
+    fragment: usize,
+}
+
+impl MonoioFragmentedReader {
+    fn new(payload: Bytes, fragment: usize) -> Self {
+        Self {
+            payload,
+            offset: 0,
+            fragment,
+        }
+    }
+}
+
+impl monoio::io::AsyncReadRent for MonoioFragmentedReader {
+    async fn read<T: monoio::buf::IoBufMut>(&mut self, mut buf: T) -> monoio::BufResult<usize, T> {
+        let remaining = self.payload.len().saturating_sub(self.offset);
+        let read = remaining.min(self.fragment).min(buf.bytes_total());
+        if read > 0 {
+            // SAFETY: `read` is capped by both source remaining bytes and
+            // destination capacity, and the regions do not overlap.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.payload.as_ptr().add(self.offset),
+                    buf.write_ptr(),
+                    read,
+                );
+                buf.set_init(read);
+            }
+            self.offset += read;
+        } else {
+            // SAFETY: setting the initialized prefix to zero is always valid.
+            unsafe {
+                buf.set_init(0);
+            }
+        }
+
+        (Ok(read), buf)
+    }
+
+    async fn readv<T: monoio::buf::IoVecBufMut>(
+        &mut self,
+        mut buf_vec: T,
+    ) -> monoio::BufResult<usize, T> {
+        let Some(mut raw) = (unsafe { monoio::buf::RawBuf::new_from_iovec_mut(&mut buf_vec) })
+        else {
+            return (Ok(0), buf_vec);
+        };
+        let remaining = self.payload.len().saturating_sub(self.offset);
+        let read = remaining.min(self.fragment).min(raw.bytes_total());
+        if read > 0 {
+            // SAFETY: `raw` points at the first valid output iovec and `read`
+            // is capped to its capacity.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.payload.as_ptr().add(self.offset),
+                    raw.write_ptr(),
+                    read,
+                );
+                raw.set_init(read);
+                buf_vec.set_init(read);
+            }
+            self.offset += read;
+        } else {
+            // SAFETY: setting the initialized prefix to zero is always valid.
+            unsafe {
+                buf_vec.set_init(0);
+            }
+        }
+
+        (Ok(read), buf_vec)
+    }
+}
+
+#[derive(Default)]
+struct MonoioCountWriter {
+    bytes: Arc<AtomicUsize>,
+}
+
+impl monoio::io::AsyncWriteRent for MonoioCountWriter {
+    async fn write<T: monoio::buf::IoBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+        let len = buf.bytes_init();
+        self.bytes.fetch_add(len, Ordering::AcqRel);
+        (Ok(len), buf)
+    }
+
+    async fn writev<T: monoio::buf::IoVecBuf>(
+        &mut self,
+        buf_vec: T,
+    ) -> monoio::BufResult<usize, T> {
+        #[cfg(unix)]
+        {
+            let iovecs = unsafe {
+                std::slice::from_raw_parts(
+                    monoio::buf::IoVecBuf::read_iovec_ptr(&buf_vec),
+                    monoio::buf::IoVecBuf::read_iovec_len(&buf_vec),
+                )
+            };
+            let written = iovecs.iter().map(|iovec| iovec.iov_len).sum();
+            self.bytes.fetch_add(written, Ordering::AcqRel);
+            (Ok(written), buf_vec)
+        }
+        #[cfg(not(unix))]
+        {
+            (
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "monoio_handoff harness path does not use vectored writes",
+                )),
+                buf_vec,
+            )
+        }
+    }
+
+    async fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+async fn run_tcp(config: Config, payloads: PayloadSet) -> Vec<ConnectionResult> {
     let sink_listener = bind_tcp_listener(
         "127.0.0.1:0"
             .parse()
@@ -549,9 +1033,9 @@ async fn run_tcp(config: Config) -> Vec<ConnectionResult> {
     let mut clients = Vec::with_capacity(config.connections);
     for connection_id in 0..config.connections {
         clients.push(tokio::spawn(run_tcp_client(
-            connection_id,
             service_addr,
             config,
+            payloads.get(connection_id),
         )));
     }
 
@@ -575,8 +1059,7 @@ fn run_tcp_service_process(
         .build()
         .expect("build tcp service runtime");
 
-    let start = Instant::now();
-    let total_streams = runtime.block_on(async {
+    let (total_streams, active_seconds) = runtime.block_on(async {
         let listener = bind_tcp_listener(service_addr).expect("bind tcp service listener");
         if let Some(path) = ready_file {
             std::fs::write(path, listener.local_addr().expect("read service addr").to_string())
@@ -589,7 +1072,7 @@ fn run_tcp_service_process(
         total_bytes: total_streams * config.bytes_per_connection(),
         total_streams,
         iterations: 1,
-        total_seconds: start.elapsed().as_secs_f64(),
+        total_seconds: active_seconds,
         latency: LatencySummary::empty(),
     }
 }
@@ -600,6 +1083,7 @@ fn run_tcp_driver_process(
     sink_addr: SocketAddr,
     idle_timeout: Duration,
 ) -> RunResult {
+    let payloads = PayloadSet::new(config);
     let runtime = Builder::new_multi_thread()
         .worker_threads(config.worker_threads)
         .enable_all()
@@ -615,7 +1099,7 @@ fn run_tcp_driver_process(
             idle_timeout,
         ));
 
-        let iterations = run_tcp_clients_until_done(service_addr, config).await;
+        let iterations = run_tcp_clients_until_done(service_addr, config, payloads).await;
         let results = sinks.await.expect("tcp split sink task joins");
 
         let mut total_bytes = 0usize;
@@ -655,7 +1139,11 @@ fn bind_tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     socket.listen(1024)
 }
 
-async fn run_tcp_clients_until_done(service_addr: SocketAddr, config: Config) -> usize {
+async fn run_tcp_clients_until_done(
+    service_addr: SocketAddr,
+    config: Config,
+    payloads: PayloadSet,
+) -> usize {
     let mut iterations = 0usize;
     let deadline = if config.duration_seconds > 0.0 {
         Some(Instant::now() + Duration::from_secs_f64(config.duration_seconds))
@@ -668,9 +1156,9 @@ async fn run_tcp_clients_until_done(service_addr: SocketAddr, config: Config) ->
         for connection_id in 0..config.connections {
             let connection_id = iterations * config.connections + connection_id;
             clients.push(tokio::spawn(run_tcp_client(
-                connection_id,
                 service_addr,
                 config,
+                payloads.get(connection_id),
             )));
         }
 
@@ -692,11 +1180,13 @@ async fn accept_tcp_service_until_idle(
     sink_addr: SocketAddr,
     config: Config,
     idle_timeout: Duration,
-) -> usize {
+) -> (usize, f64) {
     let mut proxies = Vec::new();
+    let mut first_accept = None;
     loop {
         match timeout(idle_timeout, listener.accept()).await {
             Ok(Ok((inbound, _))) => {
+                first_accept.get_or_insert_with(Instant::now);
                 inbound
                     .set_nodelay(true)
                     .expect("set nodelay on service inbound stream");
@@ -712,7 +1202,8 @@ async fn accept_tcp_service_until_idle(
     for proxy in proxies {
         proxy.await.expect("tcp proxy task joins");
     }
-    total_streams
+    let active_seconds = first_accept.map_or(0.0, |start| start.elapsed().as_secs_f64());
+    (total_streams, active_seconds)
 }
 
 async fn accept_tcp_sinks_until_idle(
@@ -800,14 +1291,14 @@ async fn accept_tcp_sinks(listener: TcpListener, config: Config) -> Vec<Connecti
     results
 }
 
-async fn run_tcp_client(connection_id: usize, service_addr: SocketAddr, config: Config) {
+async fn run_tcp_client(service_addr: SocketAddr, config: Config, payload: Bytes) {
     let stream = TcpStream::connect(service_addr)
         .await
         .expect("connect tcp client to service");
     stream
         .set_nodelay(true)
         .expect("set nodelay on tcp client stream");
-    write_fragments(stream, payload(connection_id, config), config.input_fragment).await;
+    write_fragments(stream, payload, config.input_fragment).await;
 }
 
 async fn drain_connection<R>(reader: R, expected: usize) -> ConnectionResult
@@ -822,7 +1313,7 @@ where
     }
 }
 
-async fn write_fragments<W>(mut writer: W, payload: Vec<u8>, fragment: usize)
+async fn write_fragments<W>(mut writer: W, payload: Bytes, fragment: usize)
 where
     W: AsyncWrite + Unpin,
 {
@@ -855,6 +1346,12 @@ where
 {
     match config.implementation {
         Implementation::Handoff => proxy_handoff(reader, writer, config, expected_len).await,
+        Implementation::MonoioHandoff => {
+            panic!("monoio_handoff uses a dedicated Monoio cached/duplex harness path")
+        }
+        Implementation::BytesMutHandoff => {
+            proxy_bytesmut_handoff(reader, writer, config, expected_len).await
+        }
         Implementation::ManualVec => proxy_manual_vec(reader, writer, config).await,
         Implementation::RawCopy => proxy_raw_copy(reader, writer).await,
     }
@@ -869,6 +1366,8 @@ where
         writer,
         WriteHandoffConfig::new(config.max_output_items(), config.write_pending_bytes()),
     );
+    let mut tunnel_coalescer =
+        WriteCoalescer::with_threshold(handoff.clone(), config.handoff_flush_bytes);
     let mut buffer = HandoffBuffer::with_config(
         HandoffBufferConfig::new(expected_len + config.read_reserve)
             .with_read_reserve(config.read_reserve),
@@ -889,13 +1388,169 @@ where
         }
 
         if tunnel && !buffer.is_empty() {
-            submit(&handoff, config.completion, buffer.freeze_all()).await;
+            submit_tunnel(
+                &handoff,
+                &mut tunnel_coalescer,
+                config.completion,
+                buffer.freeze_all(),
+            )
+            .await;
         }
     }
 
     if !buffer.is_empty() {
-        submit(&handoff, config.completion, buffer.freeze_all()).await;
+        submit_tunnel(
+            &handoff,
+            &mut tunnel_coalescer,
+            config.completion,
+            buffer.freeze_all(),
+        )
+        .await;
     }
+    tunnel_coalescer.flush().await.expect("flush tunnel coalescer");
+
+    let barrier = handoff
+        .write(Bytes::new())
+        .await
+        .expect("submit completion barrier");
+    barrier.wait().await.expect("completion barrier");
+    handoff.close();
+}
+
+async fn proxy_monoio_handoff<R, W>(
+    mut reader: R,
+    writer: W,
+    config: Config,
+    expected_len: usize,
+) where
+    R: monoio::io::AsyncReadRent,
+    W: monoio::io::AsyncWriteRent + Unpin + 'static,
+{
+    let handoff = WriteHandoff::spawn_monoio(
+        writer,
+        WriteHandoffConfig::new(config.max_output_items() + 1, config.write_pending_bytes()),
+    );
+    let mut tunnel_coalescer =
+        MonoioWriteCoalescer::with_threshold(handoff.clone(), config.handoff_flush_bytes);
+    let mut buffer = HandoffBuffer::with_config(
+        HandoffBufferConfig::new(expected_len + config.read_reserve)
+            .with_read_reserve(config.read_reserve),
+    );
+    let mut tunnel = false;
+
+    loop {
+        let read = buffer
+            .read_available_monoio(&mut reader)
+            .await
+            .expect("read monoio harness input");
+        if read == 0 {
+            break;
+        }
+
+        if !tunnel {
+            tunnel = route_complete_prefixes_monoio(&mut buffer, &handoff, config.completion).await;
+        }
+
+        if tunnel && !buffer.is_empty() {
+            submit_monoio_tunnel(
+                &handoff,
+                &mut tunnel_coalescer,
+                config.completion,
+                buffer.freeze_all(),
+            )
+            .await;
+        }
+    }
+
+    if !buffer.is_empty() {
+        submit_monoio_tunnel(
+            &handoff,
+            &mut tunnel_coalescer,
+            config.completion,
+            buffer.freeze_all(),
+        )
+        .await;
+    }
+    tunnel_coalescer
+        .flush()
+        .await
+        .expect("flush monoio tunnel coalescer");
+
+    let barrier = handoff
+        .write(Bytes::new())
+        .await
+        .expect("submit monoio completion barrier");
+    barrier.wait().await.expect("monoio completion barrier");
+    handoff.close();
+}
+
+async fn proxy_bytesmut_handoff<R, W>(
+    mut reader: R,
+    writer: W,
+    config: Config,
+    expected_len: usize,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let handoff = WriteHandoff::spawn(
+        writer,
+        WriteHandoffConfig::new(config.max_output_items(), config.write_pending_bytes()),
+    );
+    let mut tunnel_coalescer =
+        WriteCoalescer::with_threshold(handoff.clone(), config.handoff_flush_bytes);
+    let max_len = expected_len + config.read_reserve;
+    let mut buffer = BytesMut::with_capacity(config.read_reserve);
+    let mut tunnel = false;
+
+    loop {
+        buffer.reserve(config.read_reserve);
+        let mut capped_reader = (&mut reader).take(config.read_reserve as u64);
+        let read = capped_reader
+            .read_buf(&mut buffer)
+            .await
+            .expect("read bytesmut baseline input");
+        if read == 0 {
+            break;
+        }
+        assert!(
+            buffer.len() <= max_len,
+            "bytesmut baseline exceeded configured buffer limit"
+        );
+
+        if !tunnel {
+            tunnel =
+                route_complete_prefixes_bytesmut(&mut buffer, &handoff, config.completion).await;
+        }
+
+        if tunnel && !buffer.is_empty() {
+            submit_tunnel(
+                &handoff,
+                &mut tunnel_coalescer,
+                config.completion,
+                buffer.split().freeze(),
+            )
+            .await;
+        }
+    }
+
+    if !buffer.is_empty() {
+        submit_tunnel(
+            &handoff,
+            &mut tunnel_coalescer,
+            config.completion,
+            buffer.split().freeze(),
+        )
+        .await;
+    }
+    tunnel_coalescer.flush().await.expect("flush tunnel coalescer");
+
+    let barrier = handoff
+        .write(Bytes::new())
+        .await
+        .expect("submit bytesmut completion barrier");
+    barrier.wait().await.expect("bytesmut completion barrier");
+    handoff.close();
 }
 
 async fn proxy_manual_vec<R, W>(mut reader: R, mut writer: W, config: Config)
@@ -1015,6 +1670,49 @@ async fn route_complete_prefixes(
     }
 }
 
+async fn route_complete_prefixes_monoio(
+    buffer: &mut HandoffBuffer,
+    handoff: &MonoioWriteHandoff,
+    completion: CompletionMode,
+) -> bool {
+    loop {
+        let bytes = buffer.peek();
+        if bytes.starts_with(b"TUNNEL\n") {
+            return true;
+        }
+        if bytes.starts_with(b"TUN") {
+            return false;
+        }
+        let Some(newline) = bytes.iter().position(|b| *b == b'\n') else {
+            return false;
+        };
+        let frame = buffer
+            .split_prefix(newline + 1)
+            .expect("newline prefix is in bounds");
+        submit_monoio(handoff, completion, frame).await;
+    }
+}
+
+async fn route_complete_prefixes_bytesmut(
+    buffer: &mut BytesMut,
+    handoff: &WriteHandoff,
+    completion: CompletionMode,
+) -> bool {
+    loop {
+        if buffer.starts_with(b"TUNNEL\n") {
+            return true;
+        }
+        if buffer.starts_with(b"TUN") {
+            return false;
+        }
+        let Some(newline) = buffer.iter().position(|b| *b == b'\n') else {
+            return false;
+        };
+        let frame = buffer.split_to(newline + 1).freeze();
+        submit(handoff, completion, frame).await;
+    }
+}
+
 async fn submit(handoff: &WriteHandoff, completion: CompletionMode, bytes: Bytes) {
     if bytes.is_empty() {
         return;
@@ -1029,6 +1727,60 @@ async fn submit(handoff: &WriteHandoff, completion: CompletionMode, bytes: Bytes
                 .await
                 .expect("harness write handoff accepts bytes");
         }
+    }
+}
+
+async fn submit_tunnel(
+    handoff: &WriteHandoff,
+    coalescer: &mut WriteCoalescer,
+    completion: CompletionMode,
+    bytes: Bytes,
+) {
+    match completion {
+        CompletionMode::Ticket => submit(handoff, completion, bytes).await,
+        CompletionMode::FireAndForget => coalescer
+            .write_fire_and_forget(bytes)
+            .await
+            .expect("harness coalesced write handoff accepts bytes"),
+    }
+}
+
+async fn submit_monoio(handoff: &MonoioWriteHandoff, completion: CompletionMode, bytes: Bytes) {
+    if bytes.is_empty() {
+        return;
+    }
+    match completion {
+        CompletionMode::Ticket => {
+            if let Err(err) = handoff.try_write(bytes) {
+                let _ = handoff
+                    .write(err.into_bytes())
+                    .await
+                    .expect("monoio harness write handoff accepts bytes");
+            }
+        }
+        CompletionMode::FireAndForget => {
+            if let Err(err) = handoff.try_write_fire_and_forget(bytes) {
+                handoff
+                    .write_fire_and_forget(err.into_bytes())
+                    .await
+                    .expect("monoio harness write handoff accepts bytes");
+            }
+        }
+    }
+}
+
+async fn submit_monoio_tunnel(
+    handoff: &MonoioWriteHandoff,
+    coalescer: &mut MonoioWriteCoalescer,
+    completion: CompletionMode,
+    bytes: Bytes,
+) {
+    match completion {
+        CompletionMode::Ticket => submit_monoio(handoff, completion, bytes).await,
+        CompletionMode::FireAndForget => coalescer
+            .write_fire_and_forget(bytes)
+            .await
+            .expect("monoio harness coalesced write handoff accepts bytes"),
     }
 }
 
@@ -1068,6 +1820,8 @@ fn main() {
         0.0
     };
     let cpu_utilization_pct = cpu_avg_cores * 100.0;
+    let cpu_avg_cores_per_worker = cpu_avg_cores / (config.worker_threads as f64);
+    let cpu_utilization_pct_per_worker = cpu_utilization_pct / (config.worker_threads as f64);
     let cpu_ns_per_byte = if result.total_bytes > 0 {
         (cpu_total_seconds * 1_000_000_000.0) / (result.total_bytes as f64)
     } else {
@@ -1087,6 +1841,7 @@ fn main() {
     println!("tunnel_bytes={}", config.tunnel_bytes);
     println!("input_fragment={}", config.input_fragment);
     println!("read_reserve={}", config.read_reserve);
+    println!("handoff_flush_bytes={}", config.handoff_flush_bytes);
     println!("write_pending_bytes={}", config.write_pending_bytes());
     println!("duplex_capacity={}", config.duplex_capacity);
     println!("configured_iterations={}", config.iterations);
@@ -1106,6 +1861,8 @@ fn main() {
     println!("cpu_total_seconds={cpu_total_seconds:.6}");
     println!("cpu_avg_cores={cpu_avg_cores:.6}");
     println!("cpu_utilization_pct={cpu_utilization_pct:.2}");
+    println!("cpu_avg_cores_per_worker={cpu_avg_cores_per_worker:.6}");
+    println!("cpu_utilization_pct_per_worker={cpu_utilization_pct_per_worker:.2}");
     println!("cpu_ns_per_byte={cpu_ns_per_byte:.2}");
     println!(
         "voluntary_context_switches={}",

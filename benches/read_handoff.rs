@@ -5,11 +5,21 @@ use memchr::memchr;
 use tokio::io::AsyncReadExt;
 use tokio::runtime::{Builder, Runtime};
 
+#[cfg(feature = "monoio")]
+type MonoioRuntime = monoio::Runtime<monoio::LegacyDriver>;
+
 fn runtime() -> Runtime {
     Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("build benchmark runtime")
+}
+
+#[cfg(feature = "monoio")]
+fn monoio_runtime() -> MonoioRuntime {
+    monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
+        .build()
+        .expect("build monoio benchmark runtime")
 }
 
 fn line_payload(line_count: usize, line_len: usize) -> Vec<u8> {
@@ -67,6 +77,31 @@ fn read_handoff_lines(rt: &Runtime, input: &[u8], read_reserve: usize) -> usize 
     })
 }
 
+#[cfg(feature = "monoio")]
+fn read_handoff_lines_monoio(rt: &mut MonoioRuntime, input: &[u8], read_reserve: usize) -> usize {
+    rt.block_on(async {
+        let mut reader = input;
+        let mut buffer = HandoffBuffer::with_config(
+            HandoffBufferConfig::new(input.len() + read_reserve).with_read_reserve(read_reserve),
+        );
+        let mut frames = 0;
+
+        while !reader.is_empty() {
+            let read = buffer
+                .read_available_monoio(&mut reader)
+                .await
+                .expect("read from monoio slice");
+            if read == 0 {
+                break;
+            }
+            frames += drain_lines(&mut buffer);
+        }
+
+        frames += drain_lines(&mut buffer);
+        black_box(frames)
+    })
+}
+
 fn read_raw_discard(rt: &Runtime, input: &[u8], read_size: usize) -> usize {
     rt.block_on(async {
         let mut reader = input;
@@ -75,6 +110,27 @@ fn read_raw_discard(rt: &Runtime, input: &[u8], read_size: usize) -> usize {
 
         loop {
             let read = reader.read(&mut scratch).await.expect("read from slice");
+            if read == 0 {
+                break;
+            }
+            total += read;
+        }
+
+        black_box(total)
+    })
+}
+
+#[cfg(feature = "monoio")]
+fn read_raw_discard_monoio(rt: &mut MonoioRuntime, input: &[u8], read_size: usize) -> usize {
+    rt.block_on(async {
+        let mut reader = input;
+        let mut scratch = Vec::with_capacity(read_size);
+        let mut total = 0;
+
+        loop {
+            let (result, buf) = monoio::io::AsyncReadRent::read(&mut reader, scratch).await;
+            let read = result.expect("read from monoio slice");
+            scratch = buf;
             if read == 0 {
                 break;
             }
@@ -161,6 +217,8 @@ fn read_bytesmut_split_lines(rt: &Runtime, input: &[u8], read_size: usize) -> us
 
 fn read_raw_lower_bound(c: &mut Criterion) {
     let rt = runtime();
+    #[cfg(feature = "monoio")]
+    let mut monoio_rt = monoio_runtime();
     let lines = line_payload(16 * 1024, 32);
 
     let mut discard = c.benchmark_group("read_raw_discard_lower_bound");
@@ -173,12 +231,22 @@ fn read_raw_lower_bound(c: &mut Criterion) {
                 b.iter(|| read_raw_discard(&rt, black_box(&lines), *read_size));
             },
         );
+        #[cfg(feature = "monoio")]
+        discard.bench_with_input(
+            BenchmarkId::new("monoio", read_size),
+            &read_size,
+            |b, read_size| {
+                b.iter(|| read_raw_discard_monoio(&mut monoio_rt, black_box(&lines), *read_size));
+            },
+        );
     }
     discard.finish();
 }
 
 fn read_owned_line_benches(c: &mut Criterion) {
     let rt = runtime();
+    #[cfg(feature = "monoio")]
+    let mut monoio_rt = monoio_runtime();
     let lines = line_payload(16 * 1024, 32);
 
     let mut group = c.benchmark_group("read_owned_lines");
@@ -205,12 +273,22 @@ fn read_owned_line_benches(c: &mut Criterion) {
                 b.iter(|| read_handoff_lines(&rt, black_box(&lines), *read_size));
             },
         );
+        #[cfg(feature = "monoio")]
+        group.bench_with_input(
+            BenchmarkId::new("monoio_handoff_buffer", read_size),
+            &read_size,
+            |b, read_size| {
+                b.iter(|| read_handoff_lines_monoio(&mut monoio_rt, black_box(&lines), *read_size));
+            },
+        );
     }
     group.finish();
 }
 
 fn read_handoff_fragmentation_sweep(c: &mut Criterion) {
     let rt = runtime();
+    #[cfg(feature = "monoio")]
+    let mut monoio_rt = monoio_runtime();
     let lines = line_payload(16 * 1024, 32);
 
     let mut group = c.benchmark_group("read_handoff_fragmentation_sweep");
@@ -221,6 +299,14 @@ fn read_handoff_fragmentation_sweep(c: &mut Criterion) {
             &reserve,
             |b, reserve| {
                 b.iter(|| read_handoff_lines(&rt, black_box(&lines), *reserve));
+            },
+        );
+        #[cfg(feature = "monoio")]
+        group.bench_with_input(
+            BenchmarkId::new("monoio", reserve),
+            &reserve,
+            |b, reserve| {
+                b.iter(|| read_handoff_lines_monoio(&mut monoio_rt, black_box(&lines), *reserve));
             },
         );
     }

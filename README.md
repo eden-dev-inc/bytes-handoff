@@ -24,11 +24,37 @@ each with bytes arriving in arbitrary fragments, where routing decisions depend
 on the stream content. In that setting the read buffer is protocol state, not
 temporary scratch memory.
 
-Use plain `read(&mut [u8])` when bytes are consumed immediately in the same
-function and then discarded. Use `bytes-handoff` when the read buffer itself is
-part of the protocol state: partial frames must survive, complete prefixes need
-owned handoff, or a parser may switch into a raw tunnel without losing already
-read bytes.
+`bytes-handoff` is for protocols where the read buffer itself is part of the
+protocol state: partial frames must survive, complete prefixes need owned
+handoff, or a parser may switch into a raw tunnel without losing already-read
+bytes.
+
+The performance goal is not to beat raw copying. The goal is to make byte-zero
+introspection, tail preservation, owned prefix handoff, and bounded queued
+writes cheap enough for hot content-routed streams. The meaningful comparison
+is therefore against code that preserves the same behavior. The benchmark suite
+also includes `manual_vec` and `raw_copy` controls, but those are lower bounds:
+they deliberately skip owned handoff, bounded queued writes, or parsing work
+that this crate keeps.
+
+## What This Optimizes
+
+The crate keeps the following behavior in the hot path:
+
+- incomplete frame tails must survive future reads
+- complete prefixes need to become owned `Bytes`
+- already-read tails must survive parser mode changes, such as routed prefix to
+  raw tunnel
+- many small prefixes should not retain large read-buffer allocations
+- queued writes need item and byte limits
+- producers may need optional completion tickets from the writer task
+
+In the cached harness, `handoff` is effectively tied with the direct `BytesMut`
+behavior-preserving baseline on coalesced input, and is faster on fragmented
+input because small prefixes are copied into compact `Bytes` and tiny tunnel
+reads are coalesced before entering the write handoff. The flush threshold is a
+caller policy; the crate's write coalescer defaults to 1 KiB and can model
+immediate flushing with `WriteCoalescerConfig::immediate()`.
 
 ## Examples
 
@@ -78,22 +104,54 @@ fn send_to_worker(_: Bytes) {}
 
 ```rust
 use bytes::Bytes;
-use bytes_handoff::{WriteHandoff, WriteHandoffConfig};
+use bytes_handoff::{WriteCoalescer, WriteHandoff, WriteHandoffConfig};
 
 /// Submits owned bytes to an async writer without blocking the producer.
-fn submit_owned_write<W>(writer: W) -> Result<(), Box<dyn std::error::Error>>
+async fn submit_owned_write<W>(writer: W) -> Result<(), Box<dyn std::error::Error>>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let handoff = WriteHandoff::spawn(writer, WriteHandoffConfig::new(1024, 8 * 1024 * 1024));
+    let mut coalescer = WriteCoalescer::new(handoff.clone());
 
-    handoff.try_write_fire_and_forget(Bytes::from_static(b"owned bytes"))?;
+    coalescer
+        .write_fire_and_forget(Bytes::from_static(b"owned bytes"))
+        .await?;
+    coalescer.flush().await?;
 
     // Use `try_write` or `write` instead when the producer needs a completion
     // ticket for this chunk.
     Ok(())
 }
 ```
+
+`WriteCoalescer` is an optional fire-and-forget helper around `WriteHandoff`.
+It collects small adjacent writes up to a byte threshold before submitting one
+owned `Bytes` chunk to the writer task. The default threshold is 1 KiB
+(`DEFAULT_WRITE_COALESCE_THRESHOLD`). Configure it with
+`WriteCoalescer::with_threshold`, or use `WriteCoalescerConfig::immediate()` for
+flush-every-write behavior. Always call `flush()` at message boundaries, before
+switching modes when downstream latency matters, and before closing.
+
+The tradeoff is direct: a larger threshold reduces queueing, notification, and
+writer-task overhead under tiny fragmented input; a smaller threshold makes
+bytes visible to the downstream writer sooner. Completion-ticket writes are not
+coalesced by this helper, because their completion boundary is part of the
+observable behavior.
+
+## Monoio Feature
+
+Enable `monoio` to use Monoio's ownership-based I/O traits directly:
+
+```toml
+bytes-handoff = { version = "1", features = ["monoio"] }
+```
+
+With the feature enabled, `HandoffBuffer::read_available_monoio` accepts
+`monoio::io::AsyncReadRent`, and `WriteHandoff::spawn_monoio` returns a
+single-threaded `MonoioWriteHandoff` that runs the background writer task with
+`monoio::spawn` over `monoio::io::AsyncWriteRent`. The Tokio API remains
+available unchanged.
 
 ## Benchmarks
 
@@ -130,7 +188,9 @@ For an end-to-end stream harness rather than a Criterion microbenchmark:
 ```bash
 ./bench/run-stream-harness.sh --scenario fragmented --runs 5
 ./bench/run-stream-harness.sh --scenario coalesced --runs 5
+./bench/run-stream-harness.sh --transport cached --scenario fragmented --runs 5
 ./bench/run-stream-harness.sh --transport tcp --scenario fragmented --runs 5
+./bench/run-stream-harness.sh --transport cached --implementation monoio_handoff --scenario fragmented --runs 5
 ./bench/run-stream-matrix.sh
 ./bench/run-stream-harness.sh --scenario fragmented --completion fire_and_forget --runs 5
 ```
@@ -139,75 +199,109 @@ The harness drives complete client/proxy/sink streams through fragmented input,
 content-routed prefixes, tunnel handoff, and `WriteHandoff` output. It writes
 machine-readable run artifacts under `bench/results/`, including throughput,
 latency percentiles, context switches, CPU cost, and peak RSS. Use
-`--transport tcp` for a localhost TCP service/sink harness; see
+`--transport cached`, now the default, to feed proxies from prebuilt payloads
+and write into a counting sink, which removes parallel client/sink CPU from the
+measurement. Use `--transport tcp` for a localhost TCP service/sink harness. Use
+`--implementation monoio_handoff` with `--transport cached` to compare the
+Monoio read/write handoff path against the Tokio cached path; see
 [`bench/README.md`](bench/README.md).
 
-### Latest TCP Harness Results
+### Latest Linux Harness Results
 
-These are end-to-end localhost TCP harness results from an Ubuntu 24.04 server
-(`adam`), not Criterion microbenchmarks. The driver/client and sink processes
-were pinned to a different CPU set than the proxy service so the service-side
-CPU cost can be read separately from load generation.
+These are cached end-to-end harness results from a 16 physical core Ubuntu
+24.04 Linux server, not Criterion microbenchmarks. The cached transport feeds
+each proxy from prebuilt payload bytes and writes into a counting sink, so
+client, sink, TCP, and kernel scheduling costs are not part of the headline
+number. Treat these rows as runtime and handoff-path comparisons, not as TCP
+socket throughput.
 
 Run shape:
 
-- transport: localhost TCP
-- worker threads: 16
+- transport: cached payload reader plus counting sink
+- worker threads: 16, one per physical core
 - concurrent connections: 128
 - route frames per connection: 64
 - route frame payload: 63 bytes
 - tunnel payload per connection: 1 MiB
 - read reserve: 16 KiB
+- tunnel handoff flush threshold: 16 KiB (`read_reserve`)
 - handoff write pending budget: 32 KiB default (`2 * read_reserve`)
 - completion mode: fire-and-forget
-- runs: 2 per point, 10 second target duration
+- runs: 2 per point
+- target duration: 5 seconds per run
 
 The implementations are:
 
 - `handoff`: `HandoffBuffer` plus `WriteHandoff`; this is the crate path.
-- `manual_vec`: a hand-written persistent `Vec<u8>` parser with direct writes;
-  this is the practical `read(&mut [u8])` comparison.
+- `monoio_handoff`: Monoio `AsyncReadRent`/`AsyncWriteRent` through
+  `HandoffBuffer` plus `MonoioWriteHandoff`; currently cached/duplex-only in the
+  harness.
+- `bytesmut_handoff`: direct `BytesMut::read_buf` plus
+  `split_to(...).freeze()`, with the same `WriteHandoff` output path as
+  `handoff`; this is the closest harness-level `read_mut`/`BytesMut`
+  behavior-preserving `BytesMut` baseline.
+- `manual_vec`: a persistent `Vec<u8>` parser with direct writes; this is a
+  direct-parser control that omits owned cross-task handoff and bounded queued
+  writes.
 - `raw_copy`: unparsed async copy; this is a lower bound and does less protocol
   work than `handoff`.
 
-Coalesced input, where client writes arrive in 16 KiB chunks:
+Coalesced input, where the cached reader yields 16 KiB chunks:
 
-| implementation | service throughput | service CPU | service cost | driver p99 latency |
+| implementation | throughput | avg CPU used | cost | p99 latency |
 |---|---:|---:|---:|---:|
-| `handoff` | 2860 MiB/s | 6.27 cores | 2.09 ns/B | 59.8 ms |
-| `manual_vec` | 3098 MiB/s | 5.09 cores | 1.57 ns/B | 48.9 ms |
-| `raw_copy` | 3072 MiB/s | 4.57 cores | 1.42 ns/B | 56.2 ms |
+| `handoff` | 38220 MiB/s | 15.38 cores | 0.38 ns/B | 3.15 ms |
+| `bytesmut_handoff` | 38328 MiB/s | 15.38 cores | 0.38 ns/B | 3.15 ms |
+| `manual_vec` | 43259 MiB/s | 14.84 cores | 0.33 ns/B | 0.574 ms |
+| `raw_copy` | 43305 MiB/s | 14.83 cores | 0.33 ns/B | 0.509 ms |
+| `monoio_handoff` | 41447 MiB/s | 16.06 cores | 0.37 ns/B | 3.26 ms |
 
-Fragmented input, where client writes arrive in 64 byte chunks:
+Fragmented input, where the cached reader yields 64 byte chunks:
 
-| implementation | service throughput | service CPU | service cost | driver p99 latency |
+| implementation | throughput | avg CPU used | cost | p99 latency |
 |---|---:|---:|---:|---:|
-| `handoff` | 103.1 MiB/s | 7.58 cores | 70.14 ns/B | 1195 ms |
-| `manual_vec` | 103.7 MiB/s | 6.69 cores | 61.64 ns/B | 1138 ms |
-| `raw_copy` | 104.5 MiB/s | 6.64 cores | 60.72 ns/B | 1138 ms |
+| `handoff` | 33364 MiB/s | 15.36 cores | 0.44 ns/B | 3.63 ms |
+| `bytesmut_handoff` | 29748 MiB/s | 15.48 cores | 0.50 ns/B | 4.11 ms |
+| `manual_vec` | 42654 MiB/s | 14.82 cores | 0.33 ns/B | 0.482 ms |
+| `raw_copy` | 42666 MiB/s | 14.80 cores | 0.33 ns/B | 0.502 ms |
+| `monoio_handoff` | 26218 MiB/s | 16.06 cores | 0.58 ns/B | 4.99 ms |
 
 Interpretation:
 
-- In the coalesced TCP workload, `handoff` is about 8% behind the practical
-  manual `Vec<u8>` baseline on throughput and uses about 23% more proxy-service
-  CPU. That is the current cost of the safer buffer lifecycle, owned prefix
+- Coalesced cached input shows the steady-state cost of the introspectable
+  handoff path without socket noise. `handoff` matches the direct
+  `BytesMut`/`read_buf` handoff baseline and is about 12% behind the direct
+  parser baseline while preserving the safer buffer lifecycle, owned prefix
   handoff, bounded write queue, and mode-switch tail preservation.
-- In the fragmented 64 byte workload, throughput is dominated by tiny socket
-  operations. All implementations cluster around 104 MiB/s; the difference is
-  mostly service CPU cost.
+- Fragmented cached input is now protected by a 16 KiB tunnel flush threshold.
+  That removes the old per-64-byte write-handoff cliff while still preserving
+  byte-zero routing and exact output bytes.
+- The direct `BytesMut` handoff baseline is the closest behavior-preserving
+  comparison for the read-mutable path. `handoff` is effectively tied with it on
+  coalesced input and is about 12% faster on fragmented input because tiny
+  prefixes are copied into compact `Bytes` instead of freezing `split_to` views
+  that keep larger buffer allocations alive until the write handoff drains them.
+- `monoio_handoff` uses the available workers fully in both cached workloads.
+  After tunnel coalescing, the Tokio handoff path is faster in fragmented cached
+  input, while Monoio remains close on coalesced input.
 - `raw_copy` is useful as a lower bound, but it is not a semantic replacement:
   it does not parse route frames, preserve parser state, or hand off owned
   prefixes.
+
+The current optimization target is fragmented Tokio handoff: preserve byte-zero
+inspection, tail preservation, owned prefix handoff, bounded queued writes, and
+completion semantics while further reducing route-prefix queueing, notification,
+and copy overhead.
 
 ### What The Read Benchmarks Measure
 
 The read benchmarks are split by workload so the output does not imply one
 single headline throughput number.
 
-| benchmark family | what it measures | when it should win |
+| benchmark family | what it measures | how to read it |
 |---|---|---|
-| `read_raw_discard_lower_bound` | Raw `read(&mut [u8])` into temporary scratch, then count and discard bytes. No parsing, persistent state, tail preservation, or owned handoff. | Immediate local consumption where bytes do not outlive the read call. Treat this as a lower bound, not a peer comparison. |
-| `read_owned_lines/manual_vec_copy` | Manual `read(&mut [u8])` loop that appends to persistent state, preserves partial lines, finds complete frames, and copies each frame into a new `Vec<u8>`. | Code that needs owned frames but does not use `BytesMut`/`Bytes` splitting. |
+| `read_raw_discard_lower_bound` | Raw `read(&mut [u8])` into temporary scratch, then count and discard bytes. No parsing, persistent state, tail preservation, or owned handoff. | Lower-bound control for bytes that do not outlive the read call; not a peer comparison. |
+| `read_owned_lines/manual_vec_copy` | Direct `read(&mut [u8])` loop that appends to persistent state, preserves partial lines, finds complete frames, and copies each frame into a new `Vec<u8>`. | Owned-frame control without `BytesMut`/`Bytes` splitting. |
 | `read_owned_lines/bytesmut_split` | Direct `BytesMut` implementation: read into persistent mutable state and split complete frames into owned `Bytes`. | The closest baseline for wrapper overhead. |
 | `read_owned_lines/handoff_buffer` | `HandoffBuffer`: same owned-frame workload, with max-length enforcement and the crate API around the buffer lifecycle. | Content-routed streams where buffering rules should live behind a small API. |
 | `read_handoff_fragmentation_sweep` | The same `HandoffBuffer` line workload at different read reserve sizes. | Understanding sensitivity to tiny, fragmented reads versus coalesced reads. |

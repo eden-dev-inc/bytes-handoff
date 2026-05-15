@@ -5,10 +5,14 @@ SAMPLE_SIZE="${SAMPLE_SIZE:-100}"
 MEASUREMENT_TIME="${MEASUREMENT_TIME:-5}"
 WARM_UP_TIME="${WARM_UP_TIME:-3}"
 BENCH="${BENCH:-all}"
+FEATURES="${FEATURES:-}"
 TASKSET_CORES="${TASKSET_CORES:-}"
 PERF_STAT="${PERF_STAT:-0}"
 
 cmd=(cargo bench)
+if [[ -n "$FEATURES" ]]; then
+  cmd+=(--features "$FEATURES")
+fi
 if [[ "$BENCH" != "all" ]]; then
   cmd+=(--bench "$BENCH")
 fi
@@ -35,5 +39,5 @@ if [[ "$PERF_STAT" == "1" ]]; then
 fi
 
 echo "=== bytes-handoff criterion baseline ==="
-echo "sample_size=$SAMPLE_SIZE measurement_time=$MEASUREMENT_TIME warm_up_time=$WARM_UP_TIME bench=$BENCH taskset_cores=${TASKSET_CORES:-none} perf_stat=$PERF_STAT"
+echo "sample_size=$SAMPLE_SIZE measurement_time=$MEASUREMENT_TIME warm_up_time=$WARM_UP_TIME bench=$BENCH features=${FEATURES:-none} taskset_cores=${TASKSET_CORES:-none} perf_stat=$PERF_STAT"
 "${cmd[@]}"
