@@ -190,27 +190,14 @@ For diagnostic runs that also need observed coalescer-local wait time, pass
 `--max-max-flush-wait-us`. Keep stats disabled for headline throughput numbers;
 the timer calls needed for wait measurement are deliberately opt-in.
 
-On a 16 physical core Linux host, a focused three-run TCP/MSS tuning sweep of
-`handoff` with 128 cached connections, 64 route frames, 1 MiB tunnel payloads,
-1460-byte TCP source chunks, 16 workers, coalescer stats enabled, and 5 second
-target runs selected the 16 KiB default:
-
-| tunnel flush threshold | input chunks per flush | throughput | cost | connection p99 latency | avg flush wait |
-|---:|---:|---:|---:|---:|---:|
-| flush every chunk | 1.00 | 10821 MiB/s | 1.16 ns/B | 12.6 ms | 0 us |
-| 512 B | 1.00 | 10925 MiB/s | 1.15 ns/B | 12.6 ms | 0.769 us |
-| 2 KiB | 2.00 | 15587 MiB/s | 0.82 ns/B | 8.04 ms | 15.8 us |
-| 4 KiB | 3.00 | 19032 MiB/s | 0.69 ns/B | 6.52 ms | 17.7 us |
-| 8 KiB | 6.00 | 26621 MiB/s | 0.49 ns/B | 4.40 ms | 19.4 us |
-| **16 KiB** | **12.00** | **33336 MiB/s** | **0.39 ns/B** | **3.28 ms** | **17.0 us** |
-| 32 KiB | 22.50 | 33780 MiB/s | 0.39 ns/B | 3.30 ms | 32.2 us |
-| 64 KiB | 45.00 | 31820 MiB/s | 0.41 ns/B | 3.51 ms | 67.9 us |
-| 256 KiB | 180.00 | 23693 MiB/s | 0.58 ns/B | 5.05 ms | 352 us |
-
-The 32 KiB point has slightly higher raw throughput, but the tuner chooses the
-16 KiB knee because it is within about 1.3% throughput while roughly halving the
-measured oldest-byte flush wait. Thresholds below MSS effectively flush one TCP
-source chunk at a time, so they cluster near the same throughput.
+The top-level README carries the latest release-validation comparison tables.
+Keep this harness document focused on reproducibility: for a fresh threshold
+decision, run `run-tcp-model-tuner.sh` on the target hardware and use the emitted
+`runs.csv` with `tune_coalescing`. Thresholds below the configured TCP/MSS size
+effectively flush one source chunk at a time, while larger thresholds trade
+oldest-byte flush delay for fewer handoff submissions. Headline throughput
+tables should be gathered with coalescer stats disabled; stats runs are for
+understanding the curve and choosing the knee.
 
 Use split-process TCP runs only when you want socket and kernel behavior. The
 proxy service can be pinned to a different logical CPU set than the driver and
@@ -331,9 +318,9 @@ When reading results:
 - `bytesmut_handoff` is the closest behavior-preserving read-side peer because
   it keeps the same `WriteHandoff` output path while replacing `HandoffBuffer`
   with direct `BytesMut::read_buf`. When fragmented input creates many tiny
-  prefixes, `HandoffBuffer` can be faster because it copies small prefixes into
-  compact owned `Bytes` instead of freezing views that retain larger `BytesMut`
-  allocations.
+  prefixes, compare both paths on the workload: `HandoffBuffer` uses compact
+  owned prefixes to avoid retaining larger read-buffer allocations, while the
+  direct `BytesMut` path is the lower-level baseline for read-mutable state.
 
 ## Criterion Baseline Discipline
 

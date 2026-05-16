@@ -61,3 +61,8 @@ required-features = ["bench-tools"]
 [[bin]]
 name = "tune_coalescing"
 path = "src/bin/tune_coalescing.rs"
+
+[[example]]
+name = "monoio_line_protocol"
+path = "examples/monoio_line_protocol.rs"
+required-features = ["monoio"]

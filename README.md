@@ -37,6 +37,21 @@ also includes `manual_vec` and `raw_copy` controls, but those are lower bounds:
 they deliberately skip owned handoff, bounded queued writes, or parsing work
 that this crate keeps.
 
+## Feature Flags
+
+The default crate API targets Tokio `AsyncRead` and `AsyncWrite`.
+
+Enable `monoio` when the application runs thread-local Monoio shards and wants
+to read from `monoio::io::AsyncReadRent` sources without changing the
+`HandoffBuffer` parsing model:
+
+```toml
+bytes-handoff = { version = "1", features = ["monoio"] }
+```
+
+The `bench-tools` feature is for this repository's harness binaries and should
+not be needed by library users.
+
 ## What This Optimizes
 
 The crate keeps the following behavior in the hot path:
@@ -49,14 +64,16 @@ The crate keeps the following behavior in the hot path:
 - queued writes need item and byte limits
 - producers may need optional completion tickets from the writer task
 
-In the cached harness, `handoff` is effectively tied with the direct `BytesMut`
-behavior-preserving baseline on coalesced input, and is faster on fragmented
-input because small prefixes are copied into compact `Bytes` and tiny tunnel
-reads are coalesced before entering the write handoff. The flush threshold is a
-caller policy; the crate's write coalescer uses a TCP/MSS-tuned 16 KiB default
-and can model immediate flushing with `WriteCoalescerConfig::immediate()`. Use
-the harness tuner on your workload to pick a throughput-efficient point within
-your downstream visibility-latency budget.
+In the cached harness, `handoff` stays close to the direct `BytesMut`
+behavior-preserving baseline while keeping the crate API guarantees. The
+16 KiB default coalescer recovers much of the fragmented-path throughput by
+batching MSS-sized tunnel arrivals; direct-parser controls remain faster
+because they skip owned cross-task handoff, bounded queued writes, or both. The
+flush threshold is a caller policy; the crate's write coalescer uses a
+TCP/MSS-tuned 16 KiB default and can model immediate flushing with
+`WriteCoalescerConfig::immediate()`. Use the harness tuner on your workload to
+pick a throughput-efficient point within your downstream visibility-latency
+budget.
 
 ## Examples
 
@@ -68,11 +85,20 @@ The repository includes small runnable examples:
 - `content_routing`: inspect buffered bytes, route complete safe prefixes, then
   switch to a raw tunnel while preserving already-read tail bytes.
 - `write_handoff`: submit owned bytes to an async writer and await completion.
+- `write_coalescer`: batch tiny fire-and-forget writes and flush at a message
+  boundary.
+- `coalescing_tuner`: choose a write coalescing threshold from measured
+  throughput and flush-delay points.
+- `monoio_line_protocol`: read newline-delimited frames from a Monoio
+  `AsyncReadRent` source. Requires the `monoio` feature.
 
 Run one with:
 
 ```bash
 cargo run --example content_routing
+cargo run --example write_coalescer
+cargo run --example coalescing_tuner
+cargo run --features monoio --example monoio_line_protocol
 ```
 
 ## Read Handoff
@@ -189,24 +215,16 @@ chunks and a 16 KiB threshold, bytes can wait for up to 256 source chunks before
 the tunnel chunk is flushed. With `--input-model tcp`, that fallback uses
 `tcp_mss_bytes` instead of userspace `read()` size.
 
-On the current TCP/MSS cached tuning shape, the adaptive tuner selected the
-16 KiB default. This run used 1460-byte TCP source chunks, 128 cached
-connections, 16 workers, 1 MiB tunnel payloads, coalescer stats enabled, and
-5 second target runs:
-
-| threshold | input chunks per flush | throughput | p99 latency | avg flush wait |
-|---:|---:|---:|---:|---:|
-| flush every chunk | 1.00 | 10821 MiB/s | 12.6 ms | 0 us |
-| 2 KiB | 2.00 | 15587 MiB/s | 8.04 ms | 15.8 us |
-| 8 KiB | 6.00 | 26621 MiB/s | 4.40 ms | 19.4 us |
-| **16 KiB** | **12.00** | **33336 MiB/s** | **3.28 ms** | **17.0 us** |
-| 32 KiB | 22.50 | 33780 MiB/s | 3.30 ms | 32.2 us |
-| 64 KiB | 45.00 | 31820 MiB/s | 3.51 ms | 67.9 us |
-| 256 KiB | 180.00 | 23693 MiB/s | 5.05 ms | 352 us |
-
-The 32 KiB point had slightly higher raw throughput, but the tuner chose
-16 KiB because it is within about 1.3% throughput while cutting the measured
-flush wait roughly in half.
+The release validation numbers below include both immediate TCP/MSS flushing and
+the 16 KiB default. On that cached shape, the default raises `handoff`
+throughput from 27002.68 MiB/s to 33523.05 MiB/s while keeping p99 connection
+latency in the same low-millisecond range. Read-side parsing still sees byte 0
+as soon as it is read; the threshold only controls when already accepted tunnel
+bytes are batched into the downstream writer. With standard 1460-byte TCP/MSS
+source chunks, 16 KiB is roughly twelve source chunks, or less at end-of-stream.
+That makes it a useful default, not a universal optimum. Run the tuner on the
+hardware and workload you plan to ship when visibility latency is part of the
+contract.
 
 ```rust
 use bytes_handoff::{
@@ -286,7 +304,9 @@ With the feature enabled, `HandoffBuffer::read_available_monoio` accepts
 `monoio::io::AsyncReadRent`. The intended Monoio shape is a true thread-local
 shard: one runtime per shard, local parser state, and direct
 `AsyncWriteRent` writes from the same shard task. The Tokio API remains
-available unchanged for cross-task owned write handoff.
+available unchanged for cross-task owned write handoff. See
+[`examples/monoio_line_protocol.rs`](examples/monoio_line_protocol.rs) for a
+minimal feature-gated read example.
 
 ## Benchmarks
 
@@ -359,12 +379,12 @@ See [`bench/README.md`](bench/README.md).
 
 ### Cached Implementation Comparison
 
-These are cached end-to-end harness results from a 16 physical core Linux host,
-not Criterion microbenchmarks. The cached transport feeds each proxy from
-prebuilt payload bytes and writes into a counting sink, so client, sink, live
-TCP, and kernel scheduling costs are not part of the headline number. Treat
-these rows as runtime and handoff-path comparisons for an explicit cached
-workload shape, not as socket throughput.
+These are cached end-to-end harness results from the v1.1.0 release validation
+run on a 16 physical core Linux host, not Criterion microbenchmarks. The cached
+transport feeds each proxy from prebuilt payload bytes and writes into a
+counting sink, so client, sink, live TCP, and kernel scheduling costs are not
+part of the headline number. Treat these rows as runtime and handoff-path
+comparisons for an explicit cached workload shape, not as socket throughput.
 
 The fragmented TCP rows use the harness TCP/MSS input model: payload is
 delivered to the reader in 1460-byte source chunks, then protocol route frames
@@ -375,6 +395,7 @@ Run shape:
 
 - transport: cached payload reader plus counting sink
 - worker threads: 16, one per physical core
+- CPU affinity: benchmark process pinned to 16 cores with `taskset`
 - concurrent connections: 128
 - route frames per connection: 64
 - route frame payload: 63 bytes
@@ -412,45 +433,45 @@ submits every tunnel read as soon as it is observed:
 
 | implementation | throughput | avg CPU used | cost | p99 latency |
 |---|---:|---:|---:|---:|
-| `handoff` | 10776 MiB/s | 13.18 cores | 1.17 ns/B | 13.0 ms |
-| `bytesmut_handoff` | 10816 MiB/s | 13.15 cores | 1.16 ns/B | 12.5 ms |
-| `manual_vec` | 41863 MiB/s | 14.08 cores | 0.32 ns/B | 0.400 ms |
-| `raw_copy` | 42592 MiB/s | 14.50 cores | 0.33 ns/B | 0.396 ms |
-| `monoio_handoff` | 44739 MiB/s | 16.06 cores | 0.34 ns/B | 0.388 ms |
+| `handoff` | 27002.68 MiB/s | 13.11 cores | 0.46 ns/B | 3.616 ms |
+| `bytesmut_handoff` | 26983.04 MiB/s | 13.16 cores | 0.46 ns/B | 3.631 ms |
+| `manual_vec` | 41722.74 MiB/s | 13.99 cores | 0.32 ns/B | 0.399 ms |
+| `raw_copy` | 42399.21 MiB/s | 14.23 cores | 0.32 ns/B | 0.395 ms |
+| `monoio_handoff` | 44693.40 MiB/s | 16.06 cores | 0.34 ns/B | 0.385 ms |
 
 16 KiB default fragmented input with the TCP/MSS source model, where the default
 threshold batches tunnel bytes until 16 KiB or end-of-stream:
 
 | implementation | throughput | avg CPU used | cost | p99 latency |
 |---|---:|---:|---:|---:|
-| `handoff` | 33522 MiB/s | 13.69 cores | 0.39 ns/B | 3.27 ms |
-| `bytesmut_handoff` | 34211 MiB/s | 13.69 cores | 0.38 ns/B | 3.22 ms |
-| `manual_vec` | 41940 MiB/s | 14.32 cores | 0.33 ns/B | 0.400 ms |
-| `raw_copy` | 42589 MiB/s | 14.25 cores | 0.32 ns/B | 0.395 ms |
-| `monoio_handoff` | 44719 MiB/s | 16.06 cores | 0.34 ns/B | 0.374 ms |
+| `handoff` | 33523.05 MiB/s | 13.84 cores | 0.39 ns/B | 3.239 ms |
+| `bytesmut_handoff` | 35117.47 MiB/s | 13.70 cores | 0.37 ns/B | 3.039 ms |
+| `manual_vec` | 41800.76 MiB/s | 14.05 cores | 0.32 ns/B | 0.399 ms |
+| `raw_copy` | 42404.23 MiB/s | 14.18 cores | 0.32 ns/B | 0.395 ms |
+| `monoio_handoff` | 44695.10 MiB/s | 16.06 cores | 0.34 ns/B | 0.374 ms |
 
 Coalesced input, where the cached reader yields 16 KiB chunks and the default
 16 KiB threshold writes each tunnel chunk directly:
 
 | implementation | throughput | avg CPU used | cost | p99 latency |
 |---|---:|---:|---:|---:|
-| `handoff` | 36553 MiB/s | 13.98 cores | 0.36 ns/B | 3.22 ms |
-| `bytesmut_handoff` | 36750 MiB/s | 14.02 cores | 0.36 ns/B | 3.20 ms |
-| `manual_vec` | 42711 MiB/s | 14.18 cores | 0.32 ns/B | 0.407 ms |
-| `raw_copy` | 42730 MiB/s | 14.52 cores | 0.33 ns/B | 0.394 ms |
-| `monoio_handoff` | 44684 MiB/s | 16.06 cores | 0.34 ns/B | 0.374 ms |
+| `handoff` | 35748.92 MiB/s | 14.03 cores | 0.38 ns/B | 3.250 ms |
+| `bytesmut_handoff` | 37484.27 MiB/s | 13.91 cores | 0.35 ns/B | 3.095 ms |
+| `manual_vec` | 42487.96 MiB/s | 13.99 cores | 0.32 ns/B | 0.407 ms |
+| `raw_copy` | 42463.62 MiB/s | 14.07 cores | 0.32 ns/B | 0.393 ms |
+| `monoio_handoff` | 45232.18 MiB/s | 16.06 cores | 0.34 ns/B | 0.396 ms |
 
 Interpretation:
 
 - Immediate fragmented input is the latency-floor policy: tunnel bytes become
-  visible downstream as soon as each read completes, but per-read handoff,
-  queueing, and notification costs dominate throughput.
+  visible downstream as soon as each read completes. It minimizes batching delay
+  but submits many more handoff writes than the default threshold.
 - The 16 KiB default threshold batches roughly MSS-sized arrivals before
   submitting the tunnel write. In this TCP/MSS model, that recovers most of the
   coalesced-path throughput for `handoff` and `bytesmut_handoff` while still
   bounding downstream visibility latency by the configured threshold.
 - Coalesced cached input shows the steady-state cost when reads already arrive
-  at the default threshold size. `handoff` matches the direct
+  at the default threshold size. `handoff` remains close to the direct
   `BytesMut`/`read_buf` handoff baseline while preserving the crate behavior:
   byte-zero inspection, owned prefix handoff, bounded queued writes, and
   mode-switch tail preservation.
