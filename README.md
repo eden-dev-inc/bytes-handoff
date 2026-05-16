@@ -283,10 +283,10 @@ bytes-handoff = { version = "1", features = ["monoio"] }
 ```
 
 With the feature enabled, `HandoffBuffer::read_available_monoio` accepts
-`monoio::io::AsyncReadRent`, and `WriteHandoff::spawn_monoio` returns a
-single-threaded `MonoioWriteHandoff` that runs the background writer task with
-`monoio::spawn` over `monoio::io::AsyncWriteRent`. The Tokio API remains
-available unchanged.
+`monoio::io::AsyncReadRent`. The intended Monoio shape is a true thread-local
+shard: one runtime per shard, local parser state, and direct
+`AsyncWriteRent` writes from the same shard task. The Tokio API remains
+available unchanged for cross-task owned write handoff.
 
 ## Benchmarks
 
@@ -338,8 +338,24 @@ latency percentiles, context switches, CPU cost, and peak RSS. Use
 and write into a counting sink, which removes parallel client/sink CPU from the
 measurement. Use `--transport tcp` for a localhost TCP service/sink harness. Use
 `--implementation monoio_handoff` with `--transport cached` to compare the
-Monoio read/write handoff path against the Tokio cached path; see
-[`bench/README.md`](bench/README.md).
+thread-local Monoio shard path against the Tokio cached path. On Linux,
+`monoio_handoff` also supports split TCP service runs with one Monoio
+runtime/listener per worker thread:
+
+```bash
+./bench/run-stream-harness.sh \
+  --transport tcp \
+  --implementation monoio_handoff \
+  --scenario fragmented \
+  --completion fire_and_forget \
+  --worker-threads 16 \
+  --connections 128 \
+  --input-model tcp \
+  --service-cores 0-15 \
+  --driver-cores 16-31
+```
+
+See [`bench/README.md`](bench/README.md).
 
 ### Cached Implementation Comparison
 
@@ -377,8 +393,10 @@ The implementations are:
 
 - `handoff`: `HandoffBuffer` plus `WriteHandoff`; this is the crate path.
 - `monoio_handoff`: Monoio `AsyncReadRent`/`AsyncWriteRent` through
-  `HandoffBuffer` plus `MonoioWriteHandoff`; currently cached/duplex-only in the
-  harness.
+  `HandoffBuffer`, with direct thread-local writes from the shard task. This is
+  the Monoio shape that avoids cross-thread and cross-task write handoff
+  coordination; the Linux TCP service path runs one thread-local Monoio
+  runtime/listener per worker.
 - `bytesmut_handoff`: direct `BytesMut::read_buf` plus
   `split_to(...).freeze()`, with the same `WriteHandoff` output path as
   `handoff`; this is the closest harness-level `read_mut`/`BytesMut`
@@ -398,7 +416,7 @@ submits every tunnel read as soon as it is observed:
 | `bytesmut_handoff` | 10816 MiB/s | 13.15 cores | 1.16 ns/B | 12.5 ms |
 | `manual_vec` | 41863 MiB/s | 14.08 cores | 0.32 ns/B | 0.400 ms |
 | `raw_copy` | 42592 MiB/s | 14.50 cores | 0.33 ns/B | 0.396 ms |
-| `monoio_handoff` | 10149 MiB/s | 14.79 cores | 1.39 ns/B | 13.1 ms |
+| `monoio_handoff` | 44739 MiB/s | 16.06 cores | 0.34 ns/B | 0.388 ms |
 
 16 KiB default fragmented input with the TCP/MSS source model, where the default
 threshold batches tunnel bytes until 16 KiB or end-of-stream:
@@ -409,7 +427,7 @@ threshold batches tunnel bytes until 16 KiB or end-of-stream:
 | `bytesmut_handoff` | 34211 MiB/s | 13.69 cores | 0.38 ns/B | 3.22 ms |
 | `manual_vec` | 41940 MiB/s | 14.32 cores | 0.33 ns/B | 0.400 ms |
 | `raw_copy` | 42589 MiB/s | 14.25 cores | 0.32 ns/B | 0.395 ms |
-| `monoio_handoff` | 20827 MiB/s | 16.04 cores | 0.73 ns/B | 6.34 ms |
+| `monoio_handoff` | 44719 MiB/s | 16.06 cores | 0.34 ns/B | 0.374 ms |
 
 Coalesced input, where the cached reader yields 16 KiB chunks and the default
 16 KiB threshold writes each tunnel chunk directly:
@@ -420,7 +438,7 @@ Coalesced input, where the cached reader yields 16 KiB chunks and the default
 | `bytesmut_handoff` | 36750 MiB/s | 14.02 cores | 0.36 ns/B | 3.20 ms |
 | `manual_vec` | 42711 MiB/s | 14.18 cores | 0.32 ns/B | 0.407 ms |
 | `raw_copy` | 42730 MiB/s | 14.52 cores | 0.33 ns/B | 0.394 ms |
-| `monoio_handoff` | 39305 MiB/s | 16.04 cores | 0.39 ns/B | 3.40 ms |
+| `monoio_handoff` | 44684 MiB/s | 16.06 cores | 0.34 ns/B | 0.374 ms |
 
 Interpretation:
 
@@ -439,15 +457,72 @@ Interpretation:
 - The direct-parser controls, `manual_vec` and `raw_copy`, are useful upper and
   lower bounds, but they are not semantic replacements: they omit the owned
   cross-task handoff and bounded write-queue behavior this crate provides.
-- `monoio_handoff` remains strong on coalesced cached input. In the TCP/MSS
-  fragmented cached path, the 16 KiB policy now batches about 12 MSS-sized
-  chunks per flush without copying them into a contiguous buffer, roughly
-  doubling throughput over immediate flushing in this run.
+- `monoio_handoff` is the fully thread-local Monoio path. Because it writes
+  directly from the shard task, the old local writer-queue overhead is gone;
+  immediate, 16 KiB fragmented, and coalesced cached input all land in the same
+  throughput class in this run.
 
-The current optimization target is fragmented Tokio handoff: preserve byte-zero
-inspection, tail preservation, owned prefix handoff, bounded queued writes, and
-completion semantics while further reducing route-prefix queueing, notification,
-and copy overhead.
+### Linux Split TCP Service Comparison
+
+These rows use the live localhost TCP split harness rather than the cached
+reader. The service process accepts client TCP streams, proxies them to a TCP
+sink, and the driver process supplies both clients and sink reads. The split
+timing excludes the configured idle-drain timeout, so CPU utilization reflects
+the active load window. CPU is shown separately for the driver/sink process and
+the service process because they are pinned independently.
+
+Run shape:
+
+- transport: live localhost TCP service plus TCP sink
+- input model: TCP/MSS source chunks, `--tcp-mss-bytes 1460`
+- worker threads: 16 service workers and 16 driver/sink workers
+- concurrent connections: 128
+- route frames per connection: 64
+- route frame payload: 63 bytes
+- tunnel payload per connection: 1 MiB
+- read reserve: 16 KiB
+- tunnel handoff flush threshold: 16 KiB default
+- handoff write pending budget: 512 KiB
+- completion mode: fire-and-forget
+- runs: 2 per point
+- target duration: 5 seconds per run
+
+Fragmented TCP/MSS input, 128 concurrent connections:
+
+| implementation | driver throughput | driver CPU | service CPU | total CPU | driver cost | service cost | p99 latency |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `handoff` | 2559 MiB/s | 14.93 cores | 9.85 cores | 24.78 cores | 5.56 ns/B | 3.63 ns/B | 55.0 ms |
+| `monoio_handoff` | 2557 MiB/s | 14.97 cores | 7.29 cores | 22.26 cores | 5.58 ns/B | 3.77 ns/B | 48.8 ms |
+
+The Monoio service path used all 16 thread-local listener shards. In one run,
+the accepted stream distribution was:
+
+```text
+762,798,826,837,782,848,792,777,812,845,782,774,775,748,812,830
+```
+
+So the split TCP result is not suffering from a single hot listener shard. A
+direct-shard run, where each worker binds a dedicated port and clients connect
+to `connection_id % worker_threads`, produced 2465 MiB/s with 51.1 ms p99
+latency. That confirms listener distribution is not the limiting factor. The
+driver/sink process is effectively saturated at about 15 cores; the service
+process uses fewer cores because the single-host TCP driver/kernel path does
+not feed it enough work to saturate all service workers.
+
+A 512-connection Monoio saturation probe raised throughput and service CPU, but
+with much higher queueing latency:
+
+| implementation | connections | driver throughput | driver CPU | service CPU | p99 latency |
+|---|---:|---:|---:|---:|---:|
+| `monoio_handoff` | 512 | 3202 MiB/s | 15.39 cores | 9.98 cores | 1878 ms |
+
+That probe is useful for understanding load generation, but the latency profile
+is not a good default operating point.
+
+The two runtime shapes now have different jobs: Tokio `handoff` preserves
+cross-task owned write handoff, bounded queued writes, and completion semantics;
+Monoio `monoio_handoff` is the thread-local shard path for users who can keep
+parsing and writing on the same runtime thread.
 
 ### What The Read Benchmarks Measure
 

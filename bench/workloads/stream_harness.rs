@@ -1,7 +1,7 @@
 use bytes::{Bytes, BytesMut};
 use bytes_handoff::{
-    DEFAULT_WRITE_COALESCE_THRESHOLD, HandoffBuffer, HandoffBufferConfig, MonoioWriteCoalescer,
-    MonoioWriteHandoff, WriteCoalescer, WriteCoalescerStats, WriteHandoff, WriteHandoffConfig,
+    DEFAULT_WRITE_COALESCE_THRESHOLD, HandoffBuffer, HandoffBufferConfig, WriteCoalescer,
+    WriteCoalescerStats, WriteHandoff, WriteHandoffConfig,
 };
 use hdrhistogram::Histogram;
 use monoio::buf::IoBufMut as _;
@@ -9,6 +9,10 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
+#[cfg(target_os = "linux")]
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
@@ -121,6 +125,29 @@ impl InputModel {
 }
 
 #[derive(Clone, Copy)]
+enum TcpShardMode {
+    Shared,
+    Direct,
+}
+
+impl TcpShardMode {
+    fn parse(value: &str) -> Self {
+        match value {
+            "shared" => Self::Shared,
+            "direct" => Self::Direct,
+            _ => panic!("invalid --tcp-shard-mode: {value} (expected shared|direct)"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::Direct => "direct",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 enum Implementation {
     Handoff,
     MonoioHandoff,
@@ -152,6 +179,10 @@ impl Implementation {
             Self::RawCopy => "raw_copy",
         }
     }
+}
+
+fn is_monoio_implementation(implementation: Implementation) -> bool {
+    matches!(implementation, Implementation::MonoioHandoff)
 }
 
 #[derive(Clone, Copy)]
@@ -194,6 +225,7 @@ struct Config {
     input_fragment: usize,
     input_model: InputModel,
     tcp_mss_bytes: usize,
+    tcp_shard_mode: TcpShardMode,
     read_reserve: usize,
     handoff_flush_bytes: usize,
     coalescer_stats: bool,
@@ -407,6 +439,7 @@ fn parse_args() -> Cli {
     let mut input_fragment = 64usize;
     let mut input_model = InputModel::Fixed;
     let mut tcp_mss_bytes = DEFAULT_TCP_MSS_BYTES;
+    let mut tcp_shard_mode = TcpShardMode::Shared;
     let mut read_reserve = 16 * 1024usize;
     let mut handoff_flush_bytes = 0usize;
     let mut coalescer_stats = false;
@@ -486,6 +519,10 @@ fn parse_args() -> Cli {
                     .expect("--tcp-mss-bytes must be an integer");
                 i += 2;
             }
+            "--tcp-shard-mode" if i + 1 < args.len() => {
+                tcp_shard_mode = TcpShardMode::parse(&args[i + 1]);
+                i += 2;
+            }
             "--read-reserve" if i + 1 < args.len() => {
                 read_reserve = args[i + 1].parse().expect("--read-reserve must be an integer");
                 i += 2;
@@ -544,7 +581,7 @@ fn parse_args() -> Cli {
             }
             "--help" => {
                 println!(
-                    "Usage: bench_stream_harness [--transport duplex|cached|tcp] [--role integrated|tcp-service|tcp-driver] [--implementation handoff|monoio_handoff|bytesmut_handoff|manual_vec|raw_copy] [--scenario fragmented|coalesced] [--completion ticket|fire_and_forget] [--worker-threads N] [--connections N] [--route-frames N] [--frame-len N] [--tunnel-bytes N] [--input-fragment N] [--input-model fixed|tcp] [--tcp-mss-bytes N] [--read-reserve N] [--handoff-flush-bytes N] [--coalescer-stats] [--write-pending-bytes N] [--duplex-capacity N] [--iterations N] [--duration-seconds N] [--service-addr HOST:PORT] [--sink-addr HOST:PORT] [--ready-file PATH] [--idle-timeout-millis N]"
+                    "Usage: bench_stream_harness [--transport duplex|cached|tcp] [--role integrated|tcp-service|tcp-driver] [--implementation handoff|monoio_handoff|bytesmut_handoff|manual_vec|raw_copy] [--scenario fragmented|coalesced] [--completion ticket|fire_and_forget] [--worker-threads N] [--connections N] [--route-frames N] [--frame-len N] [--tunnel-bytes N] [--input-fragment N] [--input-model fixed|tcp] [--tcp-mss-bytes N] [--tcp-shard-mode shared|direct] [--read-reserve N] [--handoff-flush-bytes N] [--coalescer-stats] [--write-pending-bytes N] [--duplex-capacity N] [--iterations N] [--duration-seconds N] [--service-addr HOST:PORT] [--sink-addr HOST:PORT] [--ready-file PATH] [--idle-timeout-millis N]"
                 );
                 println!("  duplex: in-memory client/proxy/sink transport");
                 println!("  cached: prebuilt payload reader plus counting sink, without driver/sink tasks");
@@ -553,7 +590,10 @@ fn parse_args() -> Cli {
                 println!("  tcp-driver: client plus sink process for split-core TCP runs");
                 println!("  handoff: HandoffBuffer plus WriteHandoff");
                 println!(
-                    "  monoio_handoff: Monoio HandoffBuffer plus WriteHandoff, duplex|cached transport only"
+                    "  monoio_handoff: Monoio HandoffBuffer with direct thread-local writes, no write handoff task"
+                );
+                println!(
+                    "  monoio_handoff + tcp: split TCP service/driver mode with one Monoio listener/runtime per worker thread on Linux"
                 );
                 println!("  bytesmut_handoff: direct BytesMut read_buf plus WriteHandoff");
                 println!("  manual_vec: Vec-backed parser with direct writes");
@@ -563,6 +603,9 @@ fn parse_args() -> Cli {
                 println!("  input-model=fixed: every source read/write uses --input-fragment");
                 println!(
                     "  input-model=tcp: source chunks are capped at --tcp-mss-bytes, default 1460"
+                );
+                println!(
+                    "  tcp-shard-mode=direct: monoio split TCP workers bind base_port + worker_id and clients connect by shard"
                 );
                 std::process::exit(0);
             }
@@ -616,13 +659,18 @@ fn parse_args() -> Cli {
         "--handoff-flush-bytes must be <= effective write pending byte budget"
     );
     assert!(
-        !matches!(implementation, Implementation::MonoioHandoff)
-            || matches!(transport, Transport::Duplex | Transport::Cached),
-        "--implementation monoio_handoff currently supports --transport duplex|cached only"
+        !is_monoio_implementation(implementation)
+            || matches!(transport, Transport::Duplex | Transport::Cached)
+            || (matches!(transport, Transport::Tcp)
+                && matches!(role, Role::TcpService | Role::TcpDriver)),
+        "--implementation monoio_handoff supports integrated duplex|cached runs, or split tcp-service/tcp-driver runs"
     );
     assert!(
-        !matches!(implementation, Implementation::MonoioHandoff) || matches!(role, Role::Integrated),
-        "--implementation monoio_handoff currently supports --role integrated only"
+        !matches!(tcp_shard_mode, TcpShardMode::Direct)
+            || (matches!(transport, Transport::Tcp)
+                && is_monoio_implementation(implementation)
+                && matches!(role, Role::TcpService | Role::TcpDriver)),
+        "--tcp-shard-mode direct currently requires monoio_handoff split tcp-service/tcp-driver mode"
     );
 
     let config = Config {
@@ -638,6 +686,7 @@ fn parse_args() -> Cli {
         input_fragment,
         input_model,
         tcp_mss_bytes,
+        tcp_shard_mode,
         read_reserve,
         handoff_flush_bytes,
         coalescer_stats,
@@ -696,7 +745,7 @@ fn tcp_model_chunk_limit(offset: usize, config: Config) -> usize {
 }
 
 fn run(config: Config) -> RunResult {
-    if matches!(config.implementation, Implementation::MonoioHandoff) {
+    if is_monoio_implementation(config.implementation) {
         return run_monoio(config);
     }
     let payloads = PayloadSet::new(config);
@@ -764,7 +813,7 @@ fn run(config: Config) -> RunResult {
 fn run_monoio(config: Config) -> RunResult {
     assert!(
         matches!(config.transport, Transport::Duplex | Transport::Cached),
-        "monoio_handoff currently supports duplex|cached transport only"
+        "monoio implementations currently support duplex|cached transport only"
     );
     let payloads = PayloadSet::new(config);
     let start = Instant::now();
@@ -1259,6 +1308,246 @@ fn run_tcp_service_process(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn run_monoio_tcp_service_process(
+    config: Config,
+    service_addr: SocketAddr,
+    sink_addr: SocketAddr,
+    ready_file: Option<PathBuf>,
+    idle_timeout: Duration,
+) -> RunResult {
+    assert!(
+        service_addr.port() != 0,
+        "monoio_handoff tcp-service requires an explicit --service-addr port"
+    );
+    let worker_threads = config.worker_threads.max(1);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let total_accepts = Arc::new(AtomicUsize::new(0));
+    let first_accept = Arc::new(Mutex::new(None::<Instant>));
+    let last_accept = Arc::new(Mutex::new(None::<Instant>));
+    let mut handles = Vec::with_capacity(worker_threads);
+
+    for worker_id in 0..worker_threads {
+        let ready_tx = ready_tx.clone();
+        let total_accepts = total_accepts.clone();
+        let first_accept = first_accept.clone();
+        let last_accept = last_accept.clone();
+        handles.push(
+            std::thread::Builder::new()
+                .name(format!("monoio-tcp-service-{worker_id}"))
+                .spawn(move || {
+                    run_monoio_tcp_service_worker(
+                        worker_id,
+                        config,
+                        service_addr,
+                        sink_addr,
+                        idle_timeout,
+                        ready_tx,
+                        total_accepts,
+                        first_accept,
+                        last_accept,
+                    )
+                })
+                .expect("spawn monoio tcp service worker"),
+        );
+    }
+    drop(ready_tx);
+
+    let mut bound_addr = None;
+    for _ in 0..worker_threads {
+        match ready_rx.recv().expect("monoio tcp service worker reports bind status") {
+            Ok(addr) => {
+                bound_addr.get_or_insert(addr);
+            }
+            Err(error) => panic!("bind monoio tcp service listener: {error}"),
+        }
+    }
+
+    if let Some(path) = ready_file {
+        let addr = bound_addr.expect("at least one monoio tcp service worker bound");
+        std::fs::write(path, addr.to_string()).expect("write monoio tcp service ready file");
+    }
+
+    let mut worker_streams = Vec::with_capacity(worker_threads);
+    for handle in handles {
+        worker_streams.push(handle.join().expect("monoio tcp service worker joins"));
+    }
+    let total_streams = worker_streams.iter().sum::<usize>();
+    let active_seconds = first_accept
+        .lock()
+        .expect("lock first accept timestamp")
+        .map_or(0.0, |start| {
+            start.elapsed().saturating_sub(idle_timeout).as_secs_f64()
+        });
+    println!(
+        "monoio_tcp_service_worker_streams={}",
+        worker_streams
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    println!(
+        "monoio_tcp_service_active_workers={}",
+        worker_streams.iter().filter(|&&streams| streams > 0).count()
+    );
+    println!(
+        "monoio_tcp_service_max_worker_streams={}",
+        worker_streams.iter().copied().max().unwrap_or(0)
+    );
+    println!(
+        "monoio_tcp_service_min_worker_streams={}",
+        worker_streams.iter().copied().min().unwrap_or(0)
+    );
+
+    RunResult {
+        total_bytes: total_streams * config.bytes_per_connection(),
+        total_streams,
+        iterations: 1,
+        total_seconds: active_seconds,
+        latency: LatencySummary::empty(),
+        coalescer: WriteCoalescerStats::default(),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_monoio_tcp_service_process(
+    _config: Config,
+    _service_addr: SocketAddr,
+    _sink_addr: SocketAddr,
+    _ready_file: Option<PathBuf>,
+    _idle_timeout: Duration,
+) -> RunResult {
+    panic!("monoio_handoff tcp-service requires Linux for SO_REUSEPORT sharded listeners");
+}
+
+#[cfg(target_os = "linux")]
+fn run_monoio_tcp_service_worker(
+    worker_id: usize,
+    config: Config,
+    service_addr: SocketAddr,
+    sink_addr: SocketAddr,
+    idle_timeout: Duration,
+    ready_tx: mpsc::Sender<Result<SocketAddr, String>>,
+    total_accepts: Arc<AtomicUsize>,
+    first_accept: Arc<Mutex<Option<Instant>>>,
+    last_accept: Arc<Mutex<Option<Instant>>>,
+) -> usize {
+    let mut runtime = monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
+        .enable_timer()
+        .build()
+        .expect("build monoio tcp service runtime");
+
+    runtime.block_on(async move {
+        let worker_service_addr = tcp_service_addr_for_worker(service_addr, worker_id, config);
+        let listener_opts = monoio::net::ListenerOpts::new()
+            .reuse_addr(true)
+            .reuse_port(matches!(config.tcp_shard_mode, TcpShardMode::Shared))
+            .backlog(4096);
+        let listener =
+            match monoio::net::TcpListener::bind_with_config(worker_service_addr, &listener_opts) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(format!("worker {worker_id}: {error}")));
+                    panic!("bind monoio tcp service listener on worker {worker_id}: {error}");
+                }
+            };
+        let local_addr = listener
+            .local_addr()
+            .expect("read monoio tcp service listener address");
+        ready_tx
+            .send(Ok(local_addr))
+            .expect("report monoio tcp service worker ready");
+
+        accept_monoio_tcp_service_until_idle(
+            listener,
+            sink_addr,
+            config,
+            idle_timeout,
+            total_accepts,
+            first_accept,
+            last_accept,
+        )
+        .await
+    })
+}
+
+#[cfg(target_os = "linux")]
+async fn accept_monoio_tcp_service_until_idle(
+    listener: monoio::net::TcpListener,
+    sink_addr: SocketAddr,
+    config: Config,
+    idle_timeout: Duration,
+    total_accepts: Arc<AtomicUsize>,
+    first_accept: Arc<Mutex<Option<Instant>>>,
+    last_accept: Arc<Mutex<Option<Instant>>>,
+) -> usize {
+    let mut proxies = Vec::new();
+    loop {
+        match monoio::time::timeout(idle_timeout, listener.accept()).await {
+            Ok(Ok((inbound, _))) => {
+                let now = Instant::now();
+                {
+                    let mut first = first_accept.lock().expect("lock first accept timestamp");
+                    first.get_or_insert(now);
+                }
+                {
+                    let mut last = last_accept.lock().expect("lock last accept timestamp");
+                    *last = Some(now);
+                }
+                total_accepts.fetch_add(1, Ordering::AcqRel);
+                inbound
+                    .set_nodelay(true)
+                    .expect("set nodelay on monoio service inbound stream");
+                proxies.push(monoio::spawn(run_monoio_tcp_proxy(
+                    inbound, sink_addr, config,
+                )));
+            }
+            Ok(Err(error)) => panic!("accept monoio tcp service client: {error}"),
+            Err(_) if monoio_tcp_service_is_idle(&last_accept, idle_timeout, &total_accepts) => {
+                break;
+            }
+            Err(_) => {}
+        }
+    }
+
+    let total_streams = proxies.len();
+    for proxy in proxies {
+        proxy.await;
+    }
+    total_streams
+}
+
+#[cfg(target_os = "linux")]
+fn monoio_tcp_service_is_idle(
+    last_accept: &Mutex<Option<Instant>>,
+    idle_timeout: Duration,
+    total_accepts: &AtomicUsize,
+) -> bool {
+    if total_accepts.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    last_accept
+        .lock()
+        .expect("lock last accept timestamp")
+        .is_some_and(|last| last.elapsed() >= idle_timeout)
+}
+
+#[cfg(target_os = "linux")]
+async fn run_monoio_tcp_proxy(
+    inbound: monoio::net::TcpStream,
+    sink_addr: SocketAddr,
+    config: Config,
+) {
+    let outbound = monoio::net::TcpStream::connect_addr(sink_addr)
+        .await
+        .expect("connect monoio tcp proxy to sink");
+    outbound
+        .set_nodelay(true)
+        .expect("set nodelay on monoio proxy outbound stream");
+    proxy_monoio_handoff(inbound, outbound, config, config.bytes_per_connection()).await;
+}
+
 fn run_tcp_driver_process(
     config: Config,
     service_addr: SocketAddr,
@@ -1272,8 +1561,7 @@ fn run_tcp_driver_process(
         .build()
         .expect("build tcp driver runtime");
 
-    let start = Instant::now();
-    let (total_bytes, total_streams, iterations, latency) = runtime.block_on(async {
+    let (total_bytes, total_streams, iterations, latency, active_seconds) = runtime.block_on(async {
         let sink_listener = bind_tcp_listener(sink_addr).expect("bind tcp sink listener");
         let sinks = tokio::spawn(accept_tcp_sinks_until_idle(
             sink_listener,
@@ -1281,8 +1569,10 @@ fn run_tcp_driver_process(
             idle_timeout,
         ));
 
+        let active_start = Instant::now();
         let iterations = run_tcp_clients_until_done(service_addr, config, payloads).await;
-        let results = sinks.await.expect("tcp split sink task joins");
+        let client_seconds = active_start.elapsed().as_secs_f64();
+        let (results, sink_seconds) = sinks.await.expect("tcp split sink task joins");
 
         let mut total_bytes = 0usize;
         let mut latency =
@@ -1298,6 +1588,7 @@ fn run_tcp_driver_process(
             results.len(),
             iterations,
             summarize_latency(&latency),
+            client_seconds.max(sink_seconds),
         )
     });
 
@@ -1305,7 +1596,7 @@ fn run_tcp_driver_process(
         total_bytes,
         total_streams,
         iterations,
-        total_seconds: start.elapsed().as_secs_f64(),
+        total_seconds: active_seconds,
         latency,
         coalescer: WriteCoalescerStats::default(),
     }
@@ -1338,8 +1629,9 @@ async fn run_tcp_clients_until_done(
         let mut clients = Vec::with_capacity(config.connections);
         for connection_id in 0..config.connections {
             let connection_id = iterations * config.connections + connection_id;
+            let shard_addr = tcp_service_addr_for_connection(service_addr, connection_id, config);
             clients.push(tokio::spawn(run_tcp_client(
-                service_addr,
+                shard_addr,
                 config,
                 payloads.get(connection_id),
             )));
@@ -1356,6 +1648,35 @@ async fn run_tcp_clients_until_done(
     }
 
     iterations
+}
+
+fn tcp_service_addr_for_connection(
+    service_addr: SocketAddr,
+    connection_id: usize,
+    config: Config,
+) -> SocketAddr {
+    tcp_service_addr_for_worker(
+        service_addr,
+        connection_id % config.worker_threads.max(1),
+        config,
+    )
+}
+
+fn tcp_service_addr_for_worker(
+    service_addr: SocketAddr,
+    worker_id: usize,
+    config: Config,
+) -> SocketAddr {
+    if !matches!(config.tcp_shard_mode, TcpShardMode::Direct) {
+        return service_addr;
+    }
+
+    let shard = u16::try_from(worker_id).expect("direct TCP shard index overflows u16");
+    let port = service_addr
+        .port()
+        .checked_add(shard)
+        .expect("direct TCP shard port overflows u16");
+    SocketAddr::new(service_addr.ip(), port)
 }
 
 async fn accept_tcp_service_until_idle(
@@ -1385,7 +1706,9 @@ async fn accept_tcp_service_until_idle(
     for proxy in proxies {
         proxy.await.expect("tcp proxy task joins");
     }
-    let active_seconds = first_accept.map_or(0.0, |start| start.elapsed().as_secs_f64());
+    let active_seconds = first_accept.map_or(0.0, |start| {
+        start.elapsed().saturating_sub(idle_timeout).as_secs_f64()
+    });
     (total_streams, active_seconds)
 }
 
@@ -1393,11 +1716,13 @@ async fn accept_tcp_sinks_until_idle(
     listener: TcpListener,
     config: Config,
     idle_timeout: Duration,
-) -> Vec<ConnectionResult> {
+) -> (Vec<ConnectionResult>, f64) {
     let mut sinks = Vec::new();
+    let mut first_accept = None;
     loop {
         match timeout(idle_timeout, listener.accept()).await {
             Ok(Ok((stream, _))) => {
+                first_accept.get_or_insert_with(Instant::now);
                 stream
                     .set_nodelay(true)
                     .expect("set nodelay on sink stream");
@@ -1418,7 +1743,10 @@ async fn accept_tcp_sinks_until_idle(
         assert_eq!(result.bytes, config.bytes_per_connection());
         results.push(result);
     }
-    results
+    let active_seconds = first_accept.map_or(0.0, |start| {
+        start.elapsed().saturating_sub(idle_timeout).as_secs_f64()
+    });
+    (results, active_seconds)
 }
 
 async fn accept_tcp_service(listener: TcpListener, sink_addr: SocketAddr, config: Config) {
@@ -1543,7 +1871,7 @@ where
     match config.implementation {
         Implementation::Handoff => proxy_handoff(reader, writer, config, expected_len).await,
         Implementation::MonoioHandoff => {
-            panic!("monoio_handoff uses a dedicated Monoio cached/duplex harness path")
+            panic!("monoio implementations use a dedicated Monoio cached/duplex harness path")
         }
         Implementation::BytesMutHandoff => {
             proxy_bytesmut_handoff(reader, writer, config, expected_len).await
@@ -1641,26 +1969,17 @@ where
 
 async fn proxy_monoio_handoff<R, W>(
     mut reader: R,
-    writer: W,
+    mut writer: W,
     config: Config,
     expected_len: usize,
 ) -> ProxyMetrics
 where
     R: monoio::io::AsyncReadRent,
-    W: monoio::io::AsyncWriteRent + Unpin + 'static,
+    W: monoio::io::AsyncWriteRent + Unpin,
 {
-    let handoff = WriteHandoff::spawn_monoio(
-        writer,
-        WriteHandoffConfig::new(config.max_output_items() + 1, config.write_pending_bytes()),
-    );
     let read_buffer_coalescing = should_coalesce_in_read_buffer(config);
     let mut tunnel_recorder =
         BufferedTunnelRecorder::new(config.coalescer_stats && read_buffer_coalescing);
-    let mut tunnel_coalescer = if config.coalescer_stats && !read_buffer_coalescing {
-        MonoioWriteCoalescer::with_threshold_and_stats(handoff.clone(), config.handoff_flush_bytes)
-    } else {
-        MonoioWriteCoalescer::with_threshold(handoff.clone(), config.handoff_flush_bytes)
-    };
     let mut buffer = HandoffBuffer::with_config(
         HandoffBufferConfig::new(expected_len + config.read_reserve)
             .with_read_reserve(config.read_reserve),
@@ -1677,7 +1996,7 @@ where
         }
 
         if !tunnel {
-            tunnel = route_complete_prefixes_monoio(&mut buffer, &handoff, config.completion).await;
+            tunnel = route_complete_prefixes_monoio(&mut buffer, &mut writer).await;
         }
 
         if tunnel && !buffer.is_empty() {
@@ -1689,8 +2008,7 @@ where
                 if read_buffer_coalescing {
                     tunnel_recorder.record_flush(bytes.len(), config.handoff_flush_bytes);
                 }
-                submit_monoio_tunnel(&handoff, &mut tunnel_coalescer, config.completion, bytes)
-                    .await;
+                write_monoio_direct(&mut writer, bytes).await;
             }
         }
     }
@@ -1700,32 +2018,16 @@ where
         if read_buffer_coalescing {
             tunnel_recorder.record_flush(bytes.len(), config.handoff_flush_bytes);
         }
-        submit_monoio_tunnel(
-            &handoff,
-            &mut tunnel_coalescer,
-            config.completion,
-            bytes,
-        )
-        .await;
+        write_monoio_direct(&mut writer, bytes).await;
     }
-    tunnel_coalescer
-        .flush()
-        .await
-        .expect("flush monoio tunnel coalescer");
 
-    let barrier = handoff
-        .write(Bytes::new())
+    writer
+        .shutdown()
         .await
-        .expect("submit monoio completion barrier");
-    barrier.wait().await.expect("monoio completion barrier");
-    handoff.close();
+        .expect("shutdown monoio local writer");
 
     ProxyMetrics {
-        coalescer: if read_buffer_coalescing {
-            tunnel_recorder.stats()
-        } else {
-            tunnel_coalescer.stats()
-        },
+        coalescer: tunnel_recorder.stats(),
     }
 }
 
@@ -1939,11 +2241,10 @@ async fn route_complete_prefixes(
     }
 }
 
-async fn route_complete_prefixes_monoio(
-    buffer: &mut HandoffBuffer,
-    handoff: &MonoioWriteHandoff,
-    completion: CompletionMode,
-) -> bool {
+async fn route_complete_prefixes_monoio<W>(buffer: &mut HandoffBuffer, writer: &mut W) -> bool
+where
+    W: monoio::io::AsyncWriteRent + Unpin,
+{
     loop {
         let bytes = buffer.peek();
         if bytes.starts_with(b"TUNNEL\n") {
@@ -1958,7 +2259,7 @@ async fn route_complete_prefixes_monoio(
         let frame = buffer
             .split_prefix(newline + 1)
             .expect("newline prefix is in bounds");
-        submit_monoio(handoff, completion, frame).await;
+        write_monoio_direct(writer, frame).await;
     }
 }
 
@@ -1980,6 +2281,19 @@ async fn route_complete_prefixes_bytesmut(
         let frame = buffer.split_to(newline + 1).freeze();
         submit(handoff, completion, frame).await;
     }
+}
+
+async fn write_monoio_direct<W>(writer: &mut W, bytes: Bytes)
+where
+    W: monoio::io::AsyncWriteRent + Unpin,
+{
+    if bytes.is_empty() {
+        return;
+    }
+    use monoio::io::AsyncWriteRentExt as _;
+
+    let (result, _bytes) = writer.write_all(bytes).await;
+    result.expect("monoio local write succeeds");
 }
 
 async fn submit(handoff: &WriteHandoff, completion: CompletionMode, bytes: Bytes) {
@@ -2007,7 +2321,6 @@ fn should_submit_tunnel_buffer(bytes: usize, config: Config) -> bool {
 
 fn should_coalesce_in_read_buffer(config: Config) -> bool {
     matches!(config.completion, CompletionMode::FireAndForget)
-        && !matches!(config.implementation, Implementation::MonoioHandoff)
         && config.handoff_flush_bytes > 1
 }
 
@@ -2026,51 +2339,21 @@ async fn submit_tunnel(
     }
 }
 
-async fn submit_monoio(handoff: &MonoioWriteHandoff, completion: CompletionMode, bytes: Bytes) {
-    if bytes.is_empty() {
-        return;
-    }
-    match completion {
-        CompletionMode::Ticket => {
-            if let Err(err) = handoff.try_write(bytes) {
-                let _ = handoff
-                    .write(err.into_bytes())
-                    .await
-                    .expect("monoio harness write handoff accepts bytes");
-            }
-        }
-        CompletionMode::FireAndForget => {
-            if let Err(err) = handoff.try_write_fire_and_forget(bytes) {
-                handoff
-                    .write_fire_and_forget(err.into_bytes())
-                    .await
-                    .expect("monoio harness write handoff accepts bytes");
-            }
-        }
-    }
-}
-
-async fn submit_monoio_tunnel(
-    handoff: &MonoioWriteHandoff,
-    coalescer: &mut MonoioWriteCoalescer,
-    completion: CompletionMode,
-    bytes: Bytes,
-) {
-    match completion {
-        CompletionMode::Ticket => submit_monoio(handoff, completion, bytes).await,
-        CompletionMode::FireAndForget => coalescer
-            .write_fire_and_forget(bytes)
-            .await
-            .expect("monoio harness coalesced write handoff accepts bytes"),
-    }
-}
-
 fn main() {
     let cli = parse_args();
     let config = cli.config;
     let cpu_start = ProcessCpuSnapshot::capture().ok();
     let result = match cli.role {
         Role::Integrated => run(config),
+        Role::TcpService if is_monoio_implementation(config.implementation) => {
+            run_monoio_tcp_service_process(
+                config,
+                cli.service_addr,
+                cli.sink_addr,
+                cli.ready_file,
+                cli.idle_timeout,
+            )
+        }
         Role::TcpService => run_tcp_service_process(
             config,
             cli.service_addr,
@@ -2123,6 +2406,7 @@ fn main() {
     println!("input_fragment={}", config.input_fragment);
     println!("input_model={}", config.input_model.as_str());
     println!("tcp_mss_bytes={}", config.tcp_mss_bytes);
+    println!("tcp_shard_mode={}", config.tcp_shard_mode.as_str());
     println!("read_reserve={}", config.read_reserve);
     println!("handoff_flush_bytes={}", config.handoff_flush_bytes);
     println!("coalescer_stats_enabled={}", config.coalescer_stats);
@@ -2227,6 +2511,7 @@ mod tests {
             input_fragment: 64,
             input_model,
             tcp_mss_bytes: DEFAULT_TCP_MSS_BYTES,
+            tcp_shard_mode: TcpShardMode::Shared,
             read_reserve: 16 * 1024,
             handoff_flush_bytes: DEFAULT_WRITE_COALESCE_THRESHOLD,
             coalescer_stats: false,
@@ -2265,12 +2550,12 @@ mod tests {
     }
 
     #[test]
-    fn read_buffer_coalescing_stays_off_for_monoio_handoff() {
+    fn read_buffer_coalescing_applies_to_monoio_handoff() {
         let mut config = test_config(InputModel::Tcp);
         config.implementation = Implementation::Handoff;
         assert!(should_coalesce_in_read_buffer(config));
 
         config.implementation = Implementation::MonoioHandoff;
-        assert!(!should_coalesce_in_read_buffer(config));
+        assert!(should_coalesce_in_read_buffer(config));
     }
 }

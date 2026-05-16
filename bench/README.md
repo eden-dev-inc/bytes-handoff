@@ -257,8 +257,9 @@ Scenarios:
 - `tcp`: localhost TCP transport with client, proxy, and sink sockets.
 - `handoff`: `HandoffBuffer` plus `WriteHandoff`; this is the crate path.
 - `monoio_handoff`: Monoio `AsyncReadRent`/`AsyncWriteRent` path through
-  `HandoffBuffer` plus the single-threaded `MonoioWriteHandoff`; currently
-  available for `duplex` and `cached` transport only.
+  `HandoffBuffer`, with direct thread-local writes from the shard task. This
+  is the Monoio path that avoids cross-thread and cross-task write handoff
+  coordination.
 - `bytesmut_handoff`: direct `BytesMut::read_buf` plus
   `split_to(...).freeze()` and the same `WriteHandoff` output path as
   `handoff`. Use this to compare against the read-mutable buffer path that
@@ -321,7 +322,7 @@ When reading results:
   baseline implementations.
 - `cpu_avg_cores_per_worker` divides total process CPU by `--worker-threads`;
   for `monoio_handoff`, each worker thread owns one Monoio runtime and a
-  partition of the cached or duplex connections.
+  partition of the cached, duplex, or split TCP connections.
 - `raw_copy` is a lower bound. It intentionally skips the route parsing and
   owned-prefix handoff work that `handoff` performs.
 - `manual_vec` is a direct-parser baseline, not a semantic peer for owned

@@ -6,6 +6,8 @@ use tokio::io::{AsyncRead, ReadBuf};
 use crate::BufferError;
 
 const SMALL_PREFIX_COPY_MAX: usize = 256;
+#[cfg(feature = "monoio")]
+const SPARSE_READ_COPY_DENOMINATOR: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
 pub struct HandoffBufferConfig {
@@ -45,7 +47,7 @@ impl HandoffBuffer {
             buf: BytesMut::new(),
             config,
             #[cfg(feature = "monoio")]
-            monoio_read_buf: BytesMut::new(),
+            monoio_read_buf: BytesMut::with_capacity(config.read_reserve),
         }
     }
 
@@ -60,7 +62,7 @@ impl HandoffBuffer {
             buf: tail,
             config,
             #[cfg(feature = "monoio")]
-            monoio_read_buf: BytesMut::new(),
+            monoio_read_buf: BytesMut::with_capacity(config.read_reserve),
         })
     }
 
@@ -138,10 +140,12 @@ impl HandoffBuffer {
         let mut read_buf = std::mem::take(&mut self.monoio_read_buf);
         read_buf.clear();
         if read_buf.capacity() < reserve {
-            read_buf.reserve(reserve - read_buf.capacity());
+            read_buf.reserve(reserve);
         }
-        let (result, mut read_buf) = reader.read(read_buf).await;
+        let read_slice = read_buf.slice_mut(..reserve);
+        let (result, read_slice) = reader.read(read_slice).await;
         let read = result?;
+        let mut read_buf = read_slice.into_inner();
         if read > reserve {
             return Err(BufferError::LimitExceeded {
                 attempted: self.buf.len().saturating_add(read),
@@ -160,7 +164,10 @@ impl HandoffBuffer {
         if read == 0 {
             read_buf.clear();
             self.monoio_read_buf = read_buf;
-        } else if self.buf.is_empty() && read > SMALL_PREFIX_COPY_MAX {
+        } else if self.buf.is_empty()
+            && read > SMALL_PREFIX_COPY_MAX
+            && should_swap_monoio_read_buffer(read, read_buf.capacity())
+        {
             read_buf.truncate(read);
             std::mem::swap(&mut self.buf, &mut read_buf);
             read_buf.clear();
@@ -240,6 +247,11 @@ impl HandoffBuffer {
 
 fn should_copy_prefix(prefix_len: usize) -> bool {
     prefix_len <= SMALL_PREFIX_COPY_MAX
+}
+
+#[cfg(feature = "monoio")]
+fn should_swap_monoio_read_buffer(read: usize, capacity: usize) -> bool {
+    read.saturating_mul(SPARSE_READ_COPY_DENOMINATOR) >= capacity
 }
 
 #[cfg(test)]
@@ -342,6 +354,14 @@ mod tests {
             assert_eq!(frame, Bytes::from_static(b"hello\n"));
             assert_eq!(buffer.peek(), b"partial");
         });
+    }
+
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn monoio_sparse_reads_copy_instead_of_swapping_large_reserve() {
+        assert!(!should_swap_monoio_read_buffer(1460, 16 * 1024));
+        assert!(should_swap_monoio_read_buffer(16 * 1024, 16 * 1024));
+        assert!(should_swap_monoio_read_buffer(4 * 1024, 16 * 1024));
     }
 
     #[test]

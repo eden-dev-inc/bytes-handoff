@@ -57,6 +57,7 @@ RUN_COLUMNS = [
     "input_fragment",
     "input_model",
     "tcp_mss_bytes",
+    "tcp_shard_mode",
     "read_reserve",
     "handoff_flush_bytes",
     "coalescer_stats_enabled",

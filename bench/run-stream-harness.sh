@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CRATE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 RESULTS_DIR="$SCRIPT_DIR/results"
 
+ulimit -n 1048576 2>/dev/null || true
+
 detect_cpus() {
   nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4
 }
@@ -22,6 +24,7 @@ TUNNEL_BYTES="65536"
 INPUT_FRAGMENT=""
 INPUT_MODEL="fixed"
 TCP_MSS_BYTES="${TCP_MSS_BYTES:-1460}"
+TCP_SHARD_MODE="${TCP_SHARD_MODE:-shared}"
 READ_RESERVE="16384"
 HANDOFF_FLUSH_BYTES=""
 COALESCER_STATS="0"
@@ -49,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --input-fragment) INPUT_FRAGMENT="$2"; shift 2 ;;
     --input-model) INPUT_MODEL="$2"; shift 2 ;;
     --tcp-mss-bytes) TCP_MSS_BYTES="$2"; shift 2 ;;
+    --tcp-shard-mode) TCP_SHARD_MODE="$2"; shift 2 ;;
     --read-reserve) READ_RESERVE="$2"; shift 2 ;;
     --handoff-flush-bytes) HANDOFF_FLUSH_BYTES="$2"; shift 2 ;;
     --coalescer-stats) COALESCER_STATS="1"; shift ;;
@@ -61,12 +65,13 @@ while [[ $# -gt 0 ]]; do
     --idle-timeout-millis) IDLE_TIMEOUT_MILLIS="$2"; shift 2 ;;
     --help)
       echo "Usage: $0 [--transport duplex|cached|tcp] [--implementation handoff|monoio_handoff|bytesmut_handoff|manual_vec|raw_copy] [--scenario fragmented|coalesced|all] [--completion ticket|fire_and_forget] [--worker-threads N] [--connections N] [--runs N]"
-      echo "          [--route-frames N] [--frame-len N] [--tunnel-bytes N] [--input-fragment N] [--input-model fixed|tcp] [--tcp-mss-bytes N]"
+      echo "          [--route-frames N] [--frame-len N] [--tunnel-bytes N] [--input-fragment N] [--input-model fixed|tcp] [--tcp-mss-bytes N] [--tcp-shard-mode shared|direct]"
       echo "          [--read-reserve N] [--handoff-flush-bytes N] [--coalescer-stats] [--write-pending-bytes N] [--duplex-capacity N] [--iterations N] [--duration-seconds N]"
       echo "          [--service-cores CPUSET --driver-cores CPUSET] [--idle-timeout-millis N]"
       echo ""
       echo "Environment:"
       echo "  TASKSET_CORES=CPUSET pins integrated duplex/cached runs with taskset"
+      echo "  monoio_handoff + tcp requires --service-cores and --driver-cores; the service runs one Monoio listener/runtime per worker thread"
       exit 0
       ;;
     *)
@@ -90,8 +95,16 @@ case "$IMPLEMENTATION" in
     exit 1
     ;;
 esac
-if [[ "$IMPLEMENTATION" == "monoio_handoff" && "$TRANSPORT" != "duplex" && "$TRANSPORT" != "cached" ]]; then
-  echo "ERROR: monoio_handoff currently supports --transport duplex|cached only"
+if [[ "$IMPLEMENTATION" == "monoio_handoff" && "$TRANSPORT" != "duplex" && "$TRANSPORT" != "cached" && "$TRANSPORT" != "tcp" ]]; then
+  echo "ERROR: monoio_handoff currently supports --transport duplex|cached|tcp"
+  exit 1
+fi
+if [[ "$IMPLEMENTATION" == "monoio_handoff" && "$TRANSPORT" == "tcp" && ( -z "$SERVICE_CORES" || -z "$DRIVER_CORES" ) ]]; then
+  echo "ERROR: monoio_handoff tcp runs require split mode with --service-cores and --driver-cores"
+  exit 1
+fi
+if [[ "$TCP_SHARD_MODE" == "direct" && ( "$TRANSPORT" != "tcp" || "$IMPLEMENTATION" != "monoio_handoff" ) ]]; then
+  echo "ERROR: --tcp-shard-mode direct currently requires --transport tcp --implementation monoio_handoff"
   exit 1
 fi
 case "$SCENARIO" in
@@ -105,6 +118,13 @@ case "$INPUT_MODEL" in
   fixed|tcp) ;;
   *)
     echo "ERROR: unsupported --input-model '$INPUT_MODEL'"
+    exit 1
+    ;;
+esac
+case "$TCP_SHARD_MODE" in
+  shared|direct) ;;
+  *)
+    echo "ERROR: unsupported --tcp-shard-mode '$TCP_SHARD_MODE'"
     exit 1
     ;;
 esac
@@ -123,7 +143,7 @@ mkdir -p "$RUN_DIR"
 
 echo "=== bytes-handoff stream harness ==="
 echo "transport=$TRANSPORT implementation=$IMPLEMENTATION scenario=$SCENARIO completion=$COMPLETION worker_threads=$WORKER_THREADS connections=$CONNECTIONS runs=$RUNS"
-echo "route_frames=$ROUTE_FRAMES frame_len=$FRAME_LEN tunnel_bytes=$TUNNEL_BYTES input_model=$INPUT_MODEL tcp_mss_bytes=$TCP_MSS_BYTES read_reserve=$READ_RESERVE duplex_capacity=$DUPLEX_CAPACITY"
+echo "route_frames=$ROUTE_FRAMES frame_len=$FRAME_LEN tunnel_bytes=$TUNNEL_BYTES input_model=$INPUT_MODEL tcp_mss_bytes=$TCP_MSS_BYTES tcp_shard_mode=$TCP_SHARD_MODE read_reserve=$READ_RESERVE duplex_capacity=$DUPLEX_CAPACITY"
 if [[ -n "$WRITE_PENDING_BYTES" ]]; then
   echo "write_pending_bytes=$WRITE_PENDING_BYTES"
 fi
@@ -178,6 +198,7 @@ run_one_scenario() {
     --tunnel-bytes "$TUNNEL_BYTES"
     --input-model "$INPUT_MODEL"
     --tcp-mss-bytes "$TCP_MSS_BYTES"
+    --tcp-shard-mode "$TCP_SHARD_MODE"
     --read-reserve "$READ_RESERVE"
     --duplex-capacity "$DUPLEX_CAPACITY"
   )
@@ -232,7 +253,11 @@ run_one_scenario() {
       fi
       local base_port=$((20000 + scenario_offset + (($$ + run) % 1000) * 2))
       local service_addr="127.0.0.1:$base_port"
-      local sink_addr="127.0.0.1:$((base_port + 1))"
+      local sink_port=$((base_port + 1))
+      if [[ "$TCP_SHARD_MODE" == "direct" ]]; then
+        sink_port=$((base_port + WORKER_THREADS + 1))
+      fi
+      local sink_addr="127.0.0.1:$sink_port"
       local ready_file="$out_dir/service-${run}.ready"
       local service_log="$out_dir/service-run-${run}.txt"
       rm -f "$ready_file"

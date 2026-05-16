@@ -6,9 +6,8 @@
 //! tails across mode changes, coalesce tiny fire-and-forget writes, and submit
 //! large owned writes without borrowing memory across an async socket operation.
 //!
-//! Enable the `monoio` feature to use the equivalent
-//! `AsyncReadRent`/`AsyncWriteRent` paths (`HandoffBuffer::read_available_monoio`
-//! and `MonoioWriteHandoff`) for single-threaded `monoio` runtimes.
+//! Enable the `monoio` feature to read into `HandoffBuffer` from
+//! `AsyncReadRent` sources in thread-local `monoio` runtimes.
 
 mod error;
 mod read;
@@ -30,5 +29,3 @@ pub use write::{
     DEFAULT_WRITE_COALESCE_THRESHOLD, WriteCoalescer, WriteCoalescerConfig, WriteCoalescerStats,
     WriteCompletion, WriteHandoff, WriteHandoffConfig, WriteTicket,
 };
-#[cfg(feature = "monoio")]
-pub use write::{MonoioWriteCoalescer, MonoioWriteHandoff};

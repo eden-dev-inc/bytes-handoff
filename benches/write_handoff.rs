@@ -330,69 +330,6 @@ fn write_handoff_discard_tokio(
     })
 }
 
-#[cfg(feature = "monoio")]
-fn write_handoff_discard_monoio(
-    rt: &mut MonoioRuntime,
-    chunk_size: usize,
-    chunks: usize,
-    tasks: usize,
-    completion: CompletionMode,
-) -> usize {
-    rt.block_on(async {
-        let total_bytes = chunk_size * chunks;
-        let counter = DiscardCounter::default();
-        let writer = MonoioDiscardWriter::new(counter.clone());
-        let handoff = WriteHandoff::spawn_monoio(
-            writer,
-            WriteHandoffConfig::new(chunks + tasks + 1, total_bytes + chunk_size),
-        );
-        let chunk = Bytes::from(vec![7_u8; chunk_size]);
-
-        let mut handles = Vec::with_capacity(tasks);
-        for task_id in 0..tasks {
-            let handoff = handoff.clone();
-            let chunk = chunk.clone();
-            let per_task = chunks / tasks;
-            let extra = usize::from(task_id < chunks % tasks);
-            handles.push(monoio::spawn(async move {
-                match completion {
-                    CompletionMode::Ticket => {
-                        let mut tickets = Vec::with_capacity(per_task + extra);
-                        for _ in 0..(per_task + extra) {
-                            tickets.push(handoff.write(chunk.clone()).await.expect("submit write"));
-                        }
-                        for ticket in tickets {
-                            ticket.wait().await.expect("write completes");
-                        }
-                    }
-                    CompletionMode::FireAndForget => {
-                        for _ in 0..(per_task + extra) {
-                            handoff
-                                .try_write_fire_and_forget(chunk.clone())
-                                .expect("submit write");
-                        }
-                    }
-                }
-            }));
-        }
-
-        for handle in handles {
-            handle.await;
-        }
-
-        if matches!(completion, CompletionMode::FireAndForget) {
-            let barrier = handoff
-                .write(Bytes::new())
-                .await
-                .expect("submit fire-and-forget barrier");
-            barrier.wait().await.expect("barrier write completes");
-        }
-        handoff.close();
-
-        black_box(counter.bytes_written())
-    })
-}
-
 fn write_handoff_benches(c: &mut Criterion) {
     let rt = runtime();
 
@@ -515,38 +452,6 @@ fn write_runtime_compare_benches(c: &mut Criterion) {
                 b.iter(|| write_direct_discard_monoio(&mut monoio_rt, *chunk_size, chunks));
             },
         );
-        #[cfg(feature = "monoio")]
-        large.bench_with_input(
-            BenchmarkId::new("monoio_handoff_ticket", chunk_size),
-            &chunk_size,
-            |b, chunk_size| {
-                b.iter(|| {
-                    write_handoff_discard_monoio(
-                        &mut monoio_rt,
-                        *chunk_size,
-                        chunks,
-                        1,
-                        CompletionMode::Ticket,
-                    )
-                });
-            },
-        );
-        #[cfg(feature = "monoio")]
-        large.bench_with_input(
-            BenchmarkId::new("monoio_handoff_fire_and_forget", chunk_size),
-            &chunk_size,
-            |b, chunk_size| {
-                b.iter(|| {
-                    write_handoff_discard_monoio(
-                        &mut monoio_rt,
-                        *chunk_size,
-                        chunks,
-                        1,
-                        CompletionMode::FireAndForget,
-                    )
-                });
-            },
-        );
     }
     large.finish();
 
@@ -577,38 +482,6 @@ fn write_runtime_compare_benches(c: &mut Criterion) {
                 b.iter(|| {
                     write_handoff_discard_tokio(
                         &rt,
-                        chunk_size,
-                        chunks,
-                        *task_count,
-                        CompletionMode::FireAndForget,
-                    )
-                });
-            },
-        );
-        #[cfg(feature = "monoio")]
-        producers.bench_with_input(
-            BenchmarkId::new("monoio_ticket", task_count),
-            &task_count,
-            |b, task_count| {
-                b.iter(|| {
-                    write_handoff_discard_monoio(
-                        &mut monoio_rt,
-                        chunk_size,
-                        chunks,
-                        *task_count,
-                        CompletionMode::Ticket,
-                    )
-                });
-            },
-        );
-        #[cfg(feature = "monoio")]
-        producers.bench_with_input(
-            BenchmarkId::new("monoio_fire_and_forget", task_count),
-            &task_count,
-            |b, task_count| {
-                b.iter(|| {
-                    write_handoff_discard_monoio(
-                        &mut monoio_rt,
                         chunk_size,
                         chunks,
                         *task_count,

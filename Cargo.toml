@@ -1,6 +1,6 @@
 [package]
 name = "bytes-handoff"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Incremental async byte ingestion and bounded owned write handoff."
@@ -9,6 +9,11 @@ repository = "https://github.com/eden-dev-inc/bytes-handoff"
 readme = "README.md"
 keywords = ["async", "bytes", "tokio", "buffer", "handoff"]
 categories = ["asynchronous", "network-programming"]
+exclude = [
+    ".claude/**",
+    "bench/results/**",
+    "target/**",
+]
 
 [workspace]
 resolver = "3"
@@ -30,7 +35,7 @@ bench-tools = [
     "tokio/rt-multi-thread",
     "tokio/time",
 ]
-monoio = ["dep:monoio", "dep:libc"]
+monoio = ["dep:monoio"]
 
 [dev-dependencies]
 criterion = "0.5"
