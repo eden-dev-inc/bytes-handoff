@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CRATE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 RESULTS_DIR="$SCRIPT_DIR/results"
 
+ulimit -n 1048576 2>/dev/null || true
+
 IMPLEMENTATION="handoff"
 SCENARIO="coalesced"
 COMPLETION="fire_and_forget"
@@ -14,6 +16,11 @@ ROUTE_FRAMES="64"
 FRAME_LEN="63"
 TUNNEL_BYTES="1048576"
 READ_RESERVE="16384"
+INPUT_MODEL="fixed"
+TCP_MSS_BYTES="${TCP_MSS_BYTES:-1460}"
+HANDOFF_FLUSH_BYTES=""
+WRITE_PENDING_BYTES=""
+COALESCER_STATS="0"
 DURATION_SECONDS="5"
 SERVICE_CORES="0-7,16-23"
 DRIVER_CORES="8-15,24-31"
@@ -30,12 +37,17 @@ while [[ $# -gt 0 ]]; do
     --frame-len) FRAME_LEN="$2"; shift 2 ;;
     --tunnel-bytes) TUNNEL_BYTES="$2"; shift 2 ;;
     --read-reserve) READ_RESERVE="$2"; shift 2 ;;
+    --input-model) INPUT_MODEL="$2"; shift 2 ;;
+    --tcp-mss-bytes) TCP_MSS_BYTES="$2"; shift 2 ;;
+    --handoff-flush-bytes) HANDOFF_FLUSH_BYTES="$2"; shift 2 ;;
+    --write-pending-bytes) WRITE_PENDING_BYTES="$2"; shift 2 ;;
+    --coalescer-stats) COALESCER_STATS="1"; shift ;;
     --duration-seconds) DURATION_SECONDS="$2"; shift 2 ;;
     --service-cores) SERVICE_CORES="$2"; shift 2 ;;
     --driver-cores) DRIVER_CORES="$2"; shift 2 ;;
     --idle-timeout-millis) IDLE_TIMEOUT_MILLIS="$2"; shift 2 ;;
     --help)
-      echo "Usage: $0 [--implementation handoff|manual_vec|raw_copy] [--scenario fragmented|coalesced]"
+      echo "Usage: $0 [--implementation handoff|monoio_handoff|bytesmut_handoff|manual_vec|raw_copy] [--scenario fragmented|coalesced]"
       echo "          [--service-cores CPUSET] [--driver-cores CPUSET] [--duration-seconds N]"
       exit 0
       ;;
@@ -82,8 +94,19 @@ COMMON_ARGS=(
   --frame-len "$FRAME_LEN"
   --tunnel-bytes "$TUNNEL_BYTES"
   --read-reserve "$READ_RESERVE"
+  --input-model "$INPUT_MODEL"
+  --tcp-mss-bytes "$TCP_MSS_BYTES"
   --duration-seconds "$DURATION_SECONDS"
 )
+if [[ -n "$HANDOFF_FLUSH_BYTES" ]]; then
+  COMMON_ARGS+=(--handoff-flush-bytes "$HANDOFF_FLUSH_BYTES")
+fi
+if [[ -n "$WRITE_PENDING_BYTES" ]]; then
+  COMMON_ARGS+=(--write-pending-bytes "$WRITE_PENDING_BYTES")
+fi
+if [[ "$COALESCER_STATS" == "1" ]]; then
+  COMMON_ARGS+=(--coalescer-stats)
+fi
 
 echo "results=$RUN_DIR"
 echo "implementation=$IMPLEMENTATION scenario=$SCENARIO service_cores=$SERVICE_CORES driver_cores=$DRIVER_CORES"

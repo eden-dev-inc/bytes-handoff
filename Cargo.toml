@@ -1,6 +1,6 @@
 [package]
 name = "bytes-handoff"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Incremental async byte ingestion and bounded owned write handoff."
@@ -9,6 +9,11 @@ repository = "https://github.com/eden-dev-inc/bytes-handoff"
 readme = "README.md"
 keywords = ["async", "bytes", "tokio", "buffer", "handoff"]
 categories = ["asynchronous", "network-programming"]
+exclude = [
+    ".claude/**",
+    "bench/results/**",
+    "target/**",
+]
 
 [workspace]
 resolver = "3"
@@ -17,17 +22,20 @@ resolver = "3"
 bytes = "1.11"
 hdrhistogram = { version = "7", optional = true }
 libc = { version = "0.2", optional = true }
-thiserror = "1"
+monoio = { version = "0.2.4", default-features = false, features = ["bytes", "legacy"], optional = true }
+thiserror = "2"
 tokio = { version = "1", features = ["io-util", "rt", "sync"] }
 
 [features]
 bench-tools = [
     "hdrhistogram",
-    "libc",
+    "dep:libc",
+    "monoio",
     "tokio/net",
     "tokio/rt-multi-thread",
     "tokio/time",
 ]
+monoio = ["dep:monoio"]
 
 [dev-dependencies]
 criterion = "0.5"
@@ -49,3 +57,12 @@ harness = false
 name = "bench_stream_harness"
 path = "src/bin/bench_stream_harness.rs"
 required-features = ["bench-tools"]
+
+[[bin]]
+name = "tune_coalescing"
+path = "src/bin/tune_coalescing.rs"
+
+[[example]]
+name = "monoio_line_protocol"
+path = "examples/monoio_line_protocol.rs"
+required-features = ["monoio"]

@@ -1,4 +1,8 @@
 use bytes::{Buf, Bytes, BytesMut};
+#[cfg(feature = "monoio")]
+use monoio::buf::IoBufMut as _;
+#[cfg(feature = "monoio")]
+use std::cmp::Ordering;
 use std::future::poll_fn;
 use std::pin::Pin;
 use tokio::io::{AsyncRead, ReadBuf};
@@ -6,7 +10,8 @@ use tokio::io::{AsyncRead, ReadBuf};
 use crate::BufferError;
 
 const SMALL_PREFIX_COPY_MAX: usize = 256;
-const SMALL_PREFIX_COPY_REMAINING_MIN: usize = 4 * 1024;
+#[cfg(feature = "monoio")]
+const SPARSE_READ_COPY_DENOMINATOR: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
 pub struct HandoffBufferConfig {
@@ -32,6 +37,8 @@ impl HandoffBufferConfig {
 pub struct HandoffBuffer {
     buf: BytesMut,
     config: HandoffBufferConfig,
+    #[cfg(feature = "monoio")]
+    monoio_read_buf: BytesMut,
 }
 
 impl HandoffBuffer {
@@ -43,6 +50,8 @@ impl HandoffBuffer {
         Self {
             buf: BytesMut::new(),
             config,
+            #[cfg(feature = "monoio")]
+            monoio_read_buf: BytesMut::with_capacity(config.read_reserve),
         }
     }
 
@@ -53,7 +62,12 @@ impl HandoffBuffer {
                 limit: config.max_len,
             });
         }
-        Ok(Self { buf: tail, config })
+        Ok(Self {
+            buf: tail,
+            config,
+            #[cfg(feature = "monoio")]
+            monoio_read_buf: BytesMut::with_capacity(config.read_reserve),
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -82,16 +96,8 @@ impl HandoffBuffer {
     where
         R: AsyncRead + Unpin,
     {
-        let reserve = self.remaining_capacity().min(self.config.read_reserve);
-        if reserve == 0 {
-            return Err(BufferError::LimitExceeded {
-                attempted: self.buf.len() + 1,
-                limit: self.config.max_len,
-            });
-        }
-        if self.buf.capacity() - self.buf.len() < reserve {
-            self.buf.reserve(reserve);
-        }
+        let reserve = self.read_reserve()?;
+        self.reserve_spare_capacity(reserve);
         let len = self.buf.len();
         let read = poll_fn(|cx| {
             let spare = &mut self.buf.spare_capacity_mut()[..reserve];
@@ -113,6 +119,23 @@ impl HandoffBuffer {
         Ok(read)
     }
 
+    #[cfg(feature = "monoio")]
+    pub async fn read_available_monoio<R>(&mut self, reader: &mut R) -> Result<usize, BufferError>
+    where
+        R: monoio::io::AsyncReadRent + ?Sized,
+    {
+        let reserve = self.read_reserve()?;
+        let read_buf = self.take_monoio_read_buffer(reserve);
+        let read_slice = read_buf.slice_mut(..reserve);
+        let (result, read_slice) = reader.read(read_slice).await;
+        let read = result?;
+        let mut read_buf = read_slice.into_inner();
+        self.check_monoio_read_len(read, reserve)?;
+        normalize_monoio_read_buffer(&mut read_buf, read);
+        self.store_monoio_read(read_buf, read);
+        Ok(read)
+    }
+
     pub fn split_prefix(&mut self, n: usize) -> Result<Bytes, BufferError> {
         if n > self.buf.len() {
             return Err(BufferError::SplitOutOfBounds {
@@ -120,7 +143,7 @@ impl HandoffBuffer {
                 available: self.buf.len(),
             });
         }
-        if should_copy_prefix(n, self.buf.len() - n) {
+        if should_copy_prefix(n) {
             let prefix = Bytes::copy_from_slice(&self.buf[..n]);
             self.buf.advance(n);
             return Ok(prefix);
@@ -139,6 +162,11 @@ impl HandoffBuffer {
     }
 
     pub fn freeze_all(&mut self) -> Bytes {
+        if should_copy_prefix(self.buf.len()) {
+            let bytes = Bytes::copy_from_slice(&self.buf);
+            self.buf.clear();
+            return bytes;
+        }
         self.buf.split().freeze()
     }
 
@@ -161,6 +189,23 @@ impl HandoffBuffer {
         self.config.max_len.saturating_sub(self.buf.len())
     }
 
+    fn read_reserve(&self) -> Result<usize, BufferError> {
+        match self.remaining_capacity().min(self.config.read_reserve) {
+            0 => Err(BufferError::LimitExceeded {
+                attempted: self.buf.len().saturating_add(1),
+                limit: self.config.max_len,
+            }),
+            reserve => Ok(reserve),
+        }
+    }
+
+    fn reserve_spare_capacity(&mut self, reserve: usize) {
+        let spare = self.buf.capacity().saturating_sub(self.buf.len());
+        if spare < reserve {
+            self.buf.reserve(reserve);
+        }
+    }
+
     fn check_limit(&self, additional: usize) -> Result<(), BufferError> {
         let attempted = self.buf.len().saturating_add(additional);
         if attempted > self.config.max_len {
@@ -171,10 +216,88 @@ impl HandoffBuffer {
         }
         Ok(())
     }
+
+    #[cfg(feature = "monoio")]
+    fn take_monoio_read_buffer(&mut self, reserve: usize) -> BytesMut {
+        let mut read_buf = std::mem::take(&mut self.monoio_read_buf);
+        read_buf.clear();
+        if read_buf.capacity() < reserve {
+            read_buf.reserve(reserve);
+        }
+        read_buf
+    }
+
+    #[cfg(feature = "monoio")]
+    fn check_monoio_read_len(&self, read: usize, reserve: usize) -> Result<(), BufferError> {
+        match read.cmp(&reserve) {
+            Ordering::Less | Ordering::Equal => Ok(()),
+            Ordering::Greater => Err(BufferError::LimitExceeded {
+                attempted: self.buf.len().saturating_add(read),
+                limit: self.config.max_len,
+            }),
+        }
+    }
+
+    #[cfg(feature = "monoio")]
+    fn store_monoio_read(&mut self, mut read_buf: BytesMut, read: usize) {
+        match self.monoio_read_destination(read, read_buf.capacity()) {
+            MonoioReadDestination::Empty => {}
+            MonoioReadDestination::Swap => {
+                std::mem::swap(&mut self.buf, &mut read_buf);
+            }
+            MonoioReadDestination::Append => {
+                self.buf.extend_from_slice(&read_buf[..read]);
+            }
+        }
+        read_buf.clear();
+        self.monoio_read_buf = read_buf;
+    }
+
+    #[cfg(feature = "monoio")]
+    fn monoio_read_destination(&self, read: usize, capacity: usize) -> MonoioReadDestination {
+        match read {
+            0 => MonoioReadDestination::Empty,
+            _ if self.buf.is_empty()
+                && read > SMALL_PREFIX_COPY_MAX
+                && should_swap_monoio_read_buffer(read, capacity) =>
+            {
+                MonoioReadDestination::Swap
+            }
+            _ => MonoioReadDestination::Append,
+        }
+    }
 }
 
-fn should_copy_prefix(prefix_len: usize, remaining_len: usize) -> bool {
-    prefix_len <= SMALL_PREFIX_COPY_MAX && remaining_len >= SMALL_PREFIX_COPY_REMAINING_MIN
+#[cfg(feature = "monoio")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MonoioReadDestination {
+    Empty,
+    Swap,
+    Append,
+}
+
+fn should_copy_prefix(prefix_len: usize) -> bool {
+    prefix_len <= SMALL_PREFIX_COPY_MAX
+}
+
+#[cfg(feature = "monoio")]
+fn normalize_monoio_read_buffer(read_buf: &mut BytesMut, read: usize) {
+    match read_buf.len().cmp(&read) {
+        Ordering::Greater => read_buf.truncate(read),
+        Ordering::Equal => {}
+        Ordering::Less => {
+            // SAFETY: a successful monoio read of `read` bytes means that the
+            // returned buffer has that many initialized bytes.
+            unsafe {
+                read_buf.set_init(read);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "monoio")]
+fn should_swap_monoio_read_buffer(read: usize, capacity: usize) -> bool {
+    read.saturating_mul(SPARSE_READ_COPY_DENOMINATOR) >= capacity
 }
 
 #[cfg(test)]
@@ -252,6 +375,41 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn reads_from_monoio_reader_and_preserves_tail() {
+        monoio::start::<monoio::LegacyDriver, _>(async {
+            let mut reader: &[u8] = b"hello\npartial";
+            let mut buffer = HandoffBuffer::new(128);
+
+            assert_eq!(
+                buffer
+                    .read_available_monoio(&mut reader)
+                    .await
+                    .expect("read monoio chunk"),
+                13
+            );
+
+            let newline = buffer
+                .peek()
+                .iter()
+                .position(|b| *b == b'\n')
+                .expect("newline present");
+            let frame = buffer.split_prefix(newline + 1).expect("split frame");
+
+            assert_eq!(frame, Bytes::from_static(b"hello\n"));
+            assert_eq!(buffer.peek(), b"partial");
+        });
+    }
+
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn monoio_sparse_reads_copy_instead_of_swapping_large_reserve() {
+        assert!(!should_swap_monoio_read_buffer(1460, 16 * 1024));
+        assert!(should_swap_monoio_read_buffer(16 * 1024, 16 * 1024));
+        assert!(should_swap_monoio_read_buffer(4 * 1024, 16 * 1024));
+    }
+
     #[test]
     fn take_tail_moves_buffered_state() {
         let mut buffer = HandoffBuffer::new(64);
@@ -303,5 +461,33 @@ mod tests {
 
         assert_eq!(prefix, Bytes::from_static(b"route\n"));
         assert_eq!(buffer.len(), 4 * 1024);
+    }
+
+    #[test]
+    fn split_prefix_copies_small_complete_buffer_and_reuses_capacity() {
+        let mut buffer = HandoffBuffer::new(16 * 1024);
+        buffer.reserve_read_capacity(16 * 1024).expect("reserve");
+        let capacity = buffer.capacity();
+        buffer.buf.extend_from_slice(b"route\n");
+
+        let prefix = buffer.split_prefix(6).expect("split small prefix");
+
+        assert_eq!(prefix, Bytes::from_static(b"route\n"));
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.capacity(), capacity - 6);
+    }
+
+    #[test]
+    fn freeze_all_copies_small_buffer_and_reuses_capacity() {
+        let mut buffer = HandoffBuffer::new(16 * 1024);
+        buffer.reserve_read_capacity(16 * 1024).expect("reserve");
+        let capacity = buffer.capacity();
+        buffer.buf.extend_from_slice(b"tiny tunnel chunk");
+
+        let bytes = buffer.freeze_all();
+
+        assert_eq!(bytes, Bytes::from_static(b"tiny tunnel chunk"));
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.capacity(), capacity);
     }
 }

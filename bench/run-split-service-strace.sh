@@ -34,7 +34,7 @@ while [[ $# -gt 0 ]]; do
     --driver-cores) DRIVER_CORES="$2"; shift 2 ;;
     --idle-timeout-millis) IDLE_TIMEOUT_MILLIS="$2"; shift 2 ;;
     --help)
-      echo "Usage: $0 [--implementation handoff|manual_vec|raw_copy] [--scenario fragmented|coalesced]"
+      echo "Usage: $0 [--implementation handoff|bytesmut_handoff|manual_vec|raw_copy] [--scenario fragmented|coalesced]"
       exit 0
       ;;
     *)

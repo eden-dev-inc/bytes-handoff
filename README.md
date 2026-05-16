@@ -24,11 +24,56 @@ each with bytes arriving in arbitrary fragments, where routing decisions depend
 on the stream content. In that setting the read buffer is protocol state, not
 temporary scratch memory.
 
-Use plain `read(&mut [u8])` when bytes are consumed immediately in the same
-function and then discarded. Use `bytes-handoff` when the read buffer itself is
-part of the protocol state: partial frames must survive, complete prefixes need
-owned handoff, or a parser may switch into a raw tunnel without losing already
-read bytes.
+`bytes-handoff` is for protocols where the read buffer itself is part of the
+protocol state: partial frames must survive, complete prefixes need owned
+handoff, or a parser may switch into a raw tunnel without losing already-read
+bytes.
+
+The performance goal is not to beat raw copying. The goal is to make byte-zero
+introspection, tail preservation, owned prefix handoff, and bounded queued
+writes cheap enough for hot content-routed streams. The meaningful comparison
+is therefore against code that preserves the same behavior. The benchmark suite
+also includes `manual_vec` and `raw_copy` controls, but those are lower bounds:
+they deliberately skip owned handoff, bounded queued writes, or parsing work
+that this crate keeps.
+
+## Feature Flags
+
+The default crate API targets Tokio `AsyncRead` and `AsyncWrite`.
+
+Enable `monoio` when the application runs thread-local Monoio shards and wants
+to read from `monoio::io::AsyncReadRent` sources without changing the
+`HandoffBuffer` parsing model:
+
+```toml
+bytes-handoff = { version = "1.1", features = ["monoio"] }
+```
+
+The `bench-tools` feature is for this repository's harness binaries and should
+not be needed by library users.
+
+## What This Optimizes
+
+The crate keeps the following behavior in the hot path:
+
+- incomplete frame tails must survive future reads
+- complete prefixes need to become owned `Bytes`
+- already-read tails must survive parser mode changes, such as routed prefix to
+  raw tunnel
+- many small prefixes should not retain large read-buffer allocations
+- queued writes need item and byte limits
+- producers may need optional completion tickets from the writer task
+
+In the cached harness, `handoff` stays close to the direct `BytesMut`
+behavior-preserving baseline while keeping the crate API guarantees. The
+16 KiB default coalescer recovers much of the fragmented-path throughput by
+batching MSS-sized tunnel arrivals; direct-parser controls remain faster
+because they skip owned cross-task handoff, bounded queued writes, or both. The
+flush threshold is a caller policy; the crate's write coalescer uses a
+TCP/MSS-tuned 16 KiB default and can model immediate flushing with
+`WriteCoalescerConfig::immediate()`. Use the harness tuner on your workload to
+pick a throughput-efficient point within your downstream visibility-latency
+budget.
 
 ## Examples
 
@@ -40,11 +85,20 @@ The repository includes small runnable examples:
 - `content_routing`: inspect buffered bytes, route complete safe prefixes, then
   switch to a raw tunnel while preserving already-read tail bytes.
 - `write_handoff`: submit owned bytes to an async writer and await completion.
+- `write_coalescer`: batch tiny fire-and-forget writes and flush at a message
+  boundary.
+- `coalescing_tuner`: choose a write coalescing threshold from measured
+  throughput and flush-delay points.
+- `monoio_line_protocol`: read newline-delimited frames from a Monoio
+  `AsyncReadRent` source. Requires the `monoio` feature.
 
 Run one with:
 
 ```bash
 cargo run --example content_routing
+cargo run --example write_coalescer
+cargo run --example coalescing_tuner
+cargo run --features monoio --example monoio_line_protocol
 ```
 
 ## Read Handoff
@@ -54,6 +108,10 @@ use bytes::Bytes;
 use bytes_handoff::HandoffBuffer;
 
 /// Reads available bytes, splits one complete line, and hands it off.
+///
+/// `if let` drains at most one frame per read for illustration; real protocol
+/// loops typically use `while let` to drain every complete frame before the
+/// next `read_available` call. See `examples/line_protocol.rs`.
 async fn read_one_line<R>(reader: &mut R) -> Result<(), Box<dyn std::error::Error>>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -78,22 +136,177 @@ fn send_to_worker(_: Bytes) {}
 
 ```rust
 use bytes::Bytes;
-use bytes_handoff::{WriteHandoff, WriteHandoffConfig};
+use bytes_handoff::{WriteCoalescer, WriteHandoff, WriteHandoffConfig};
 
 /// Submits owned bytes to an async writer without blocking the producer.
-fn submit_owned_write<W>(writer: W) -> Result<(), Box<dyn std::error::Error>>
+async fn submit_owned_write<W>(writer: W) -> Result<(), Box<dyn std::error::Error>>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let handoff = WriteHandoff::spawn(writer, WriteHandoffConfig::new(1024, 8 * 1024 * 1024));
+    let mut coalescer = WriteCoalescer::new(handoff.clone());
 
-    handoff.try_write_fire_and_forget(Bytes::from_static(b"owned bytes"))?;
+    coalescer
+        .write_fire_and_forget(Bytes::from_static(b"owned bytes"))
+        .await?;
+    coalescer.flush().await?;
 
     // Use `try_write` or `write` instead when the producer needs a completion
     // ticket for this chunk.
     Ok(())
 }
 ```
+
+`WriteCoalescer` is an optional fire-and-forget helper around `WriteHandoff`.
+It collects small adjacent writes up to a byte threshold before submitting one
+owned `Bytes` chunk to the writer task. The default threshold is 16 KiB
+(`DEFAULT_WRITE_COALESCE_THRESHOLD`). Configure it with
+`WriteCoalescer::with_threshold`, or use `WriteCoalescerConfig::immediate()` for
+flush-every-write behavior. Always call `flush()` at message boundaries, before
+switching modes when downstream latency matters, and before closing. Keep the
+`WriteHandoffConfig` pending-byte budget at least as large as the coalescing
+threshold.
+
+The tradeoff is direct: a larger threshold reduces queueing, notification, and
+writer-task overhead under tiny fragmented input; a smaller threshold makes
+bytes visible to the downstream writer sooner. The benchmark harness includes a
+tuner that maps measured oldest-byte flush delay against throughput and chooses
+the knee of that curve.
+Completion-ticket writes are not coalesced by this helper, because their
+completion boundary is part of the observable behavior.
+
+## Coalescing Tuning
+
+The tuner is intentionally not "pick the fastest number." It uses flush delay as
+one axis and throughput as the other. With coalescer stats enabled, flush delay
+is the measured oldest-byte wait from the first buffered byte until the batch is
+flushed. Without stats, the tuner falls back to estimated
+`input_chunks_per_flush` as a portable visibility-delay proxy.
+
+The scorer builds the Pareto frontier of the measured curve, normalizes both
+axes, and chooses the point with the largest distance above the straight line
+from the lowest-delay point to the highest-throughput point. That is a discrete
+knee/inflection estimate: the point where the throughput gained by waiting
+longer starts to flatten. Optional budgets such as `max_reads_per_flush`,
+`max_avg_flush_wait_micros`, `max_max_flush_wait_micros`, or
+`max_connection_p99_micros` are hard constraints applied before the knee is
+chosen.
+
+For discovery runs, use `WriteCoalescingSearch` or
+`cargo run --release --bin tune_coalescing -- --next`. The adaptive search starts
+with the minimum threshold, maximum threshold, and log-space midpoint; fills the
+largest unknown gaps until it has enough curve shape; then probes the immediate
+neighbors around the current recommendation and the current throughput peak. It
+stops when those local neighbors are measured, or when `max_threshold_points` is
+reached. This gives a binary-search-style hardware tuning loop without requiring
+a full sweep. For cached or duplex Linux harness runs, set `TASKSET_CORES`
+alongside `WORKER_THREADS` so the tuner measures the CPU shape you plan to run.
+Use `./bench/run-tcp-model-tuner.sh` or pass `--input-model tcp` to model a
+TCP stream as MSS-sized source chunks. The default `--tcp-mss-bytes 1460`
+matches the usual TCP payload carried by a 1500-byte Ethernet MTU with IPv4/TCP
+headers. That standard Ethernet MSS is the packet-size shape used for testing;
+it is not the same thing as a userspace `read()` size, which can be larger when
+the kernel has already coalesced multiple segments.
+
+When coalescer stats are enabled, the CLI reports the measured
+`input_chunks_per_flush` from the harness. Without stats, it falls back to
+`ceil(threshold_bytes / input_fragment_bytes)`. For example, with 64 byte source
+chunks and a 16 KiB threshold, bytes can wait for up to 256 source chunks before
+the tunnel chunk is flushed. With `--input-model tcp`, that fallback uses
+`tcp_mss_bytes` instead of userspace `read()` size.
+
+The release validation numbers below include both immediate TCP/MSS flushing and
+the 16 KiB default. On that cached shape, the default raises `handoff`
+throughput from 27002.68 MiB/s to 33523.05 MiB/s while keeping p99 connection
+latency in the same low-millisecond range. Read-side parsing still sees byte 0
+as soon as it is read; the threshold only controls when already accepted tunnel
+bytes are batched into the downstream writer. With standard 1460-byte TCP/MSS
+source chunks, 16 KiB is roughly twelve source chunks, or less at end-of-stream.
+That makes it a useful default, not a universal optimum. Run the tuner on the
+hardware and workload you plan to ship when visibility latency is part of the
+contract.
+
+```rust
+use bytes_handoff::{
+    WriteCoalescingMeasurement, WriteCoalescingTuner, WriteCoalescingTunerConfig,
+};
+
+let tuner = WriteCoalescingTuner::new(WriteCoalescingTunerConfig {
+    ..WriteCoalescingTunerConfig::default()
+})?;
+
+let recommendation = tuner.recommend([
+    WriteCoalescingMeasurement {
+        threshold_bytes: 64,
+        input_fragment_bytes: 64,
+        observed_input_chunks_per_flush: None,
+        throughput_mib_per_sec: 100.0,
+        cpu_ns_per_byte: 0.0,
+        connection_p99_micros: None,
+        avg_flush_wait_micros: Some(1.0),
+        max_flush_wait_micros: None,
+    },
+    WriteCoalescingMeasurement {
+        threshold_bytes: 1024,
+        input_fragment_bytes: 64,
+        observed_input_chunks_per_flush: None,
+        throughput_mib_per_sec: 900.0,
+        cpu_ns_per_byte: 0.0,
+        connection_p99_micros: None,
+        avg_flush_wait_micros: Some(10.0),
+        max_flush_wait_micros: None,
+    },
+    WriteCoalescingMeasurement {
+        threshold_bytes: 8192,
+        input_fragment_bytes: 64,
+        observed_input_chunks_per_flush: None,
+        throughput_mib_per_sec: 980.0,
+        cpu_ns_per_byte: 0.0,
+        connection_p99_micros: None,
+        avg_flush_wait_micros: Some(50.0),
+        max_flush_wait_micros: None,
+    },
+    WriteCoalescingMeasurement {
+        threshold_bytes: 16384,
+        input_fragment_bytes: 64,
+        observed_input_chunks_per_flush: None,
+        throughput_mib_per_sec: 1000.0,
+        cpu_ns_per_byte: 0.0,
+        connection_p99_micros: None,
+        avg_flush_wait_micros: Some(100.0),
+        max_flush_wait_micros: None,
+    },
+])?;
+
+assert_eq!(recommendation.threshold_bytes(), 1024);
+assert_eq!(recommendation.reads_per_flush(), 16);
+```
+
+The same ranking is available as an adaptive planner:
+
+```rust
+use bytes_handoff::{WriteCoalescingSearch, WriteCoalescingSearchConfig};
+
+let search = WriteCoalescingSearch::new(WriteCoalescingSearchConfig::default())?;
+let first_step = search.step(std::iter::empty())?;
+assert_eq!(first_step.thresholds(), &[1]);
+```
+
+## Monoio Feature
+
+Enable `monoio` to use Monoio's ownership-based I/O traits directly:
+
+```toml
+bytes-handoff = { version = "1.1", features = ["monoio"] }
+```
+
+With the feature enabled, `HandoffBuffer::read_available_monoio` accepts
+`monoio::io::AsyncReadRent`. The intended Monoio shape is a true thread-local
+shard: one runtime per shard, local parser state, and direct
+`AsyncWriteRent` writes from the same shard task. The Tokio API remains
+available unchanged for cross-task owned write handoff. See
+[`examples/monoio_line_protocol.rs`](examples/monoio_line_protocol.rs) for a
+minimal feature-gated read example.
 
 ## Benchmarks
 
@@ -130,7 +343,9 @@ For an end-to-end stream harness rather than a Criterion microbenchmark:
 ```bash
 ./bench/run-stream-harness.sh --scenario fragmented --runs 5
 ./bench/run-stream-harness.sh --scenario coalesced --runs 5
+./bench/run-stream-harness.sh --transport cached --scenario fragmented --runs 5
 ./bench/run-stream-harness.sh --transport tcp --scenario fragmented --runs 5
+./bench/run-stream-harness.sh --transport cached --implementation monoio_handoff --scenario fragmented --runs 5
 ./bench/run-stream-matrix.sh
 ./bench/run-stream-harness.sh --scenario fragmented --completion fire_and_forget --runs 5
 ```
@@ -139,75 +354,206 @@ The harness drives complete client/proxy/sink streams through fragmented input,
 content-routed prefixes, tunnel handoff, and `WriteHandoff` output. It writes
 machine-readable run artifacts under `bench/results/`, including throughput,
 latency percentiles, context switches, CPU cost, and peak RSS. Use
-`--transport tcp` for a localhost TCP service/sink harness; see
-[`bench/README.md`](bench/README.md).
+`--transport cached`, now the default, to feed proxies from prebuilt payloads
+and write into a counting sink, which removes parallel client/sink CPU from the
+measurement. Use `--transport tcp` for a localhost TCP service/sink harness. Use
+`--implementation monoio_handoff` with `--transport cached` to compare the
+thread-local Monoio shard path against the Tokio cached path. On Linux,
+`monoio_handoff` also supports split TCP service runs with one Monoio
+runtime/listener per worker thread:
 
-### Latest TCP Harness Results
+```bash
+./bench/run-stream-harness.sh \
+  --transport tcp \
+  --implementation monoio_handoff \
+  --scenario fragmented \
+  --completion fire_and_forget \
+  --worker-threads 16 \
+  --connections 128 \
+  --input-model tcp \
+  --service-cores 0-15 \
+  --driver-cores 16-31
+```
 
-These are end-to-end localhost TCP harness results from an Ubuntu 24.04 server
-(`adam`), not Criterion microbenchmarks. The driver/client and sink processes
-were pinned to a different CPU set than the proxy service so the service-side
-CPU cost can be read separately from load generation.
+See [`bench/README.md`](bench/README.md).
+
+### Cached Implementation Comparison
+
+These are cached end-to-end harness results from the v1.1.0 release validation
+run on a 16 physical core Linux host, not Criterion microbenchmarks. The cached
+transport feeds each proxy from prebuilt payload bytes and writes into a
+counting sink, so client, sink, live TCP, and kernel scheduling costs are not
+part of the headline number. Treat these rows as runtime and handoff-path
+comparisons for an explicit cached workload shape, not as socket throughput.
+
+The fragmented TCP rows use the harness TCP/MSS input model: payload is
+delivered to the reader in 1460-byte source chunks, then protocol route frames
+inside that stream are 64 bytes each. This models packet-sized arrivals without
+measuring the operating system's socket path.
 
 Run shape:
 
-- transport: localhost TCP
-- worker threads: 16
+- transport: cached payload reader plus counting sink
+- worker threads: 16, one per physical core
+- CPU affinity: benchmark process pinned to 16 cores with `taskset`
 - concurrent connections: 128
 - route frames per connection: 64
 - route frame payload: 63 bytes
 - tunnel payload per connection: 1 MiB
 - read reserve: 16 KiB
-- handoff write pending budget: 32 KiB default (`2 * read_reserve`)
+- tunnel handoff flush threshold: immediate or the 16 KiB default, as shown
+- fragmented TCP/MSS rows: 512 KiB handoff write pending budget, so the
+  threshold comparison is not primarily a backpressure measurement
+- coalesced table: 32 KiB default handoff write pending budget
+  (`2 * read_reserve`)
 - completion mode: fire-and-forget
-- runs: 2 per point, 10 second target duration
+- runs: 2 per point
+- target duration: 5 seconds per run
 
 The implementations are:
 
 - `handoff`: `HandoffBuffer` plus `WriteHandoff`; this is the crate path.
-- `manual_vec`: a hand-written persistent `Vec<u8>` parser with direct writes;
-  this is the practical `read(&mut [u8])` comparison.
+- `monoio_handoff`: Monoio `AsyncReadRent`/`AsyncWriteRent` through
+  `HandoffBuffer`, with direct thread-local writes from the shard task. This is
+  the Monoio shape that avoids cross-thread and cross-task write handoff
+  coordination; the Linux TCP service path runs one thread-local Monoio
+  runtime/listener per worker.
+- `bytesmut_handoff`: direct `BytesMut::read_buf` plus
+  `split_to(...).freeze()`, with the same `WriteHandoff` output path as
+  `handoff`; this is the closest harness-level `read_mut`/`BytesMut`
+  behavior-preserving `BytesMut` baseline.
+- `manual_vec`: a persistent `Vec<u8>` parser with direct writes; this is a
+  direct-parser control that omits owned cross-task handoff and bounded queued
+  writes.
 - `raw_copy`: unparsed async copy; this is a lower bound and does less protocol
   work than `handoff`.
 
-Coalesced input, where client writes arrive in 16 KiB chunks:
+Immediate fragmented input with the TCP/MSS source model, where `handoff`
+submits every tunnel read as soon as it is observed:
 
-| implementation | service throughput | service CPU | service cost | driver p99 latency |
+| implementation | throughput | avg CPU used | cost | p99 latency |
 |---|---:|---:|---:|---:|
-| `handoff` | 2860 MiB/s | 6.27 cores | 2.09 ns/B | 59.8 ms |
-| `manual_vec` | 3098 MiB/s | 5.09 cores | 1.57 ns/B | 48.9 ms |
-| `raw_copy` | 3072 MiB/s | 4.57 cores | 1.42 ns/B | 56.2 ms |
+| `handoff` | 27002.68 MiB/s | 13.11 cores | 0.46 ns/B | 3.616 ms |
+| `bytesmut_handoff` | 26983.04 MiB/s | 13.16 cores | 0.46 ns/B | 3.631 ms |
+| `manual_vec` | 41722.74 MiB/s | 13.99 cores | 0.32 ns/B | 0.399 ms |
+| `raw_copy` | 42399.21 MiB/s | 14.23 cores | 0.32 ns/B | 0.395 ms |
+| `monoio_handoff` | 44693.40 MiB/s | 16.06 cores | 0.34 ns/B | 0.385 ms |
 
-Fragmented input, where client writes arrive in 64 byte chunks:
+16 KiB default fragmented input with the TCP/MSS source model, where the default
+threshold batches tunnel bytes until 16 KiB or end-of-stream:
 
-| implementation | service throughput | service CPU | service cost | driver p99 latency |
+| implementation | throughput | avg CPU used | cost | p99 latency |
 |---|---:|---:|---:|---:|
-| `handoff` | 103.1 MiB/s | 7.58 cores | 70.14 ns/B | 1195 ms |
-| `manual_vec` | 103.7 MiB/s | 6.69 cores | 61.64 ns/B | 1138 ms |
-| `raw_copy` | 104.5 MiB/s | 6.64 cores | 60.72 ns/B | 1138 ms |
+| `handoff` | 33523.05 MiB/s | 13.84 cores | 0.39 ns/B | 3.239 ms |
+| `bytesmut_handoff` | 35117.47 MiB/s | 13.70 cores | 0.37 ns/B | 3.039 ms |
+| `manual_vec` | 41800.76 MiB/s | 14.05 cores | 0.32 ns/B | 0.399 ms |
+| `raw_copy` | 42404.23 MiB/s | 14.18 cores | 0.32 ns/B | 0.395 ms |
+| `monoio_handoff` | 44695.10 MiB/s | 16.06 cores | 0.34 ns/B | 0.374 ms |
+
+Coalesced input, where the cached reader yields 16 KiB chunks and the default
+16 KiB threshold writes each tunnel chunk directly:
+
+| implementation | throughput | avg CPU used | cost | p99 latency |
+|---|---:|---:|---:|---:|
+| `handoff` | 35748.92 MiB/s | 14.03 cores | 0.38 ns/B | 3.250 ms |
+| `bytesmut_handoff` | 37484.27 MiB/s | 13.91 cores | 0.35 ns/B | 3.095 ms |
+| `manual_vec` | 42487.96 MiB/s | 13.99 cores | 0.32 ns/B | 0.407 ms |
+| `raw_copy` | 42463.62 MiB/s | 14.07 cores | 0.32 ns/B | 0.393 ms |
+| `monoio_handoff` | 45232.18 MiB/s | 16.06 cores | 0.34 ns/B | 0.396 ms |
 
 Interpretation:
 
-- In the coalesced TCP workload, `handoff` is about 8% behind the practical
-  manual `Vec<u8>` baseline on throughput and uses about 23% more proxy-service
-  CPU. That is the current cost of the safer buffer lifecycle, owned prefix
-  handoff, bounded write queue, and mode-switch tail preservation.
-- In the fragmented 64 byte workload, throughput is dominated by tiny socket
-  operations. All implementations cluster around 104 MiB/s; the difference is
-  mostly service CPU cost.
-- `raw_copy` is useful as a lower bound, but it is not a semantic replacement:
-  it does not parse route frames, preserve parser state, or hand off owned
-  prefixes.
+- Immediate fragmented input is the latency-floor policy: tunnel bytes become
+  visible downstream as soon as each read completes. It minimizes batching delay
+  but submits many more handoff writes than the default threshold.
+- The 16 KiB default threshold batches roughly MSS-sized arrivals before
+  submitting the tunnel write. In this TCP/MSS model, that recovers most of the
+  coalesced-path throughput for `handoff` and `bytesmut_handoff` while still
+  bounding downstream visibility latency by the configured threshold.
+- Coalesced cached input shows the steady-state cost when reads already arrive
+  at the default threshold size. `handoff` remains close to the direct
+  `BytesMut`/`read_buf` handoff baseline while preserving the crate behavior:
+  byte-zero inspection, owned prefix handoff, bounded queued writes, and
+  mode-switch tail preservation.
+- The direct-parser controls, `manual_vec` and `raw_copy`, are useful upper and
+  lower bounds, but they are not semantic replacements: they omit the owned
+  cross-task handoff and bounded write-queue behavior this crate provides.
+- `monoio_handoff` is the fully thread-local Monoio path. Because it writes
+  directly from the shard task, the old local writer-queue overhead is gone;
+  immediate, 16 KiB fragmented, and coalesced cached input all land in the same
+  throughput class in this run.
+
+### Linux Split TCP Service Comparison
+
+These rows use the live localhost TCP split harness rather than the cached
+reader. The service process accepts client TCP streams, proxies them to a TCP
+sink, and the driver process supplies both clients and sink reads. The split
+timing excludes the configured idle-drain timeout, so CPU utilization reflects
+the active load window. CPU is shown separately for the driver/sink process and
+the service process because they are pinned independently.
+
+Run shape:
+
+- transport: live localhost TCP service plus TCP sink
+- input model: TCP/MSS source chunks, `--tcp-mss-bytes 1460`
+- worker threads: 16 service workers and 16 driver/sink workers
+- concurrent connections: 128
+- route frames per connection: 64
+- route frame payload: 63 bytes
+- tunnel payload per connection: 1 MiB
+- read reserve: 16 KiB
+- tunnel handoff flush threshold: 16 KiB default
+- handoff write pending budget: 512 KiB
+- completion mode: fire-and-forget
+- runs: 2 per point
+- target duration: 5 seconds per run
+
+Fragmented TCP/MSS input, 128 concurrent connections:
+
+| implementation | driver throughput | driver CPU | service CPU | total CPU | driver cost | service cost | p99 latency |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `handoff` | 2559 MiB/s | 14.93 cores | 9.85 cores | 24.78 cores | 5.56 ns/B | 3.63 ns/B | 55.0 ms |
+| `monoio_handoff` | 2557 MiB/s | 14.97 cores | 7.29 cores | 22.26 cores | 5.58 ns/B | 3.77 ns/B | 48.8 ms |
+
+The Monoio service path used all 16 thread-local listener shards. In one run,
+the accepted stream distribution was:
+
+```text
+762,798,826,837,782,848,792,777,812,845,782,774,775,748,812,830
+```
+
+So the split TCP result is not suffering from a single hot listener shard. A
+direct-shard run, where each worker binds a dedicated port and clients connect
+to `connection_id % worker_threads`, produced 2465 MiB/s with 51.1 ms p99
+latency. That confirms listener distribution is not the limiting factor. The
+driver/sink process is effectively saturated at about 15 cores; the service
+process uses fewer cores because the single-host TCP driver/kernel path does
+not feed it enough work to saturate all service workers.
+
+A 512-connection Monoio saturation probe raised throughput and service CPU, but
+with much higher queueing latency:
+
+| implementation | connections | driver throughput | driver CPU | service CPU | p99 latency |
+|---|---:|---:|---:|---:|---:|
+| `monoio_handoff` | 512 | 3202 MiB/s | 15.39 cores | 9.98 cores | 1878 ms |
+
+That probe is useful for understanding load generation, but the latency profile
+is not a good default operating point.
+
+The two runtime shapes now have different jobs: Tokio `handoff` preserves
+cross-task owned write handoff, bounded queued writes, and completion semantics;
+Monoio `monoio_handoff` is the thread-local shard path for users who can keep
+parsing and writing on the same runtime thread.
 
 ### What The Read Benchmarks Measure
 
 The read benchmarks are split by workload so the output does not imply one
 single headline throughput number.
 
-| benchmark family | what it measures | when it should win |
+| benchmark family | what it measures | how to read it |
 |---|---|---|
-| `read_raw_discard_lower_bound` | Raw `read(&mut [u8])` into temporary scratch, then count and discard bytes. No parsing, persistent state, tail preservation, or owned handoff. | Immediate local consumption where bytes do not outlive the read call. Treat this as a lower bound, not a peer comparison. |
-| `read_owned_lines/manual_vec_copy` | Manual `read(&mut [u8])` loop that appends to persistent state, preserves partial lines, finds complete frames, and copies each frame into a new `Vec<u8>`. | Code that needs owned frames but does not use `BytesMut`/`Bytes` splitting. |
+| `read_raw_discard_lower_bound` | Raw `read(&mut [u8])` into temporary scratch, then count and discard bytes. No parsing, persistent state, tail preservation, or owned handoff. | Lower-bound control for bytes that do not outlive the read call; not a peer comparison. |
+| `read_owned_lines/manual_vec_copy` | Direct `read(&mut [u8])` loop that appends to persistent state, preserves partial lines, finds complete frames, and copies each frame into a new `Vec<u8>`. | Owned-frame control without `BytesMut`/`Bytes` splitting. |
 | `read_owned_lines/bytesmut_split` | Direct `BytesMut` implementation: read into persistent mutable state and split complete frames into owned `Bytes`. | The closest baseline for wrapper overhead. |
 | `read_owned_lines/handoff_buffer` | `HandoffBuffer`: same owned-frame workload, with max-length enforcement and the crate API around the buffer lifecycle. | Content-routed streams where buffering rules should live behind a small API. |
 | `read_handoff_fragmentation_sweep` | The same `HandoffBuffer` line workload at different read reserve sizes. | Understanding sensitivity to tiny, fragmented reads versus coalesced reads. |
