@@ -9,9 +9,8 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::BufferError;
 
-const SMALL_PREFIX_COPY_MAX: usize = 256;
-#[cfg(feature = "monoio")]
-const SPARSE_READ_COPY_DENOMINATOR: usize = 4;
+pub const DEFAULT_SMALL_PREFIX_COPY_MAX: usize = 256;
+pub const DEFAULT_MONOIO_SPARSE_READ_COPY_DENOMINATOR: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
 pub struct HandoffBufferConfig {
@@ -33,10 +32,51 @@ impl HandoffBufferConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HandoffBufferPolicy {
+    pub small_prefix_copy_max: usize,
+    pub monoio_sparse_read_copy_denominator: usize,
+}
+
+impl HandoffBufferPolicy {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_small_prefix_copy_max(mut self, max: usize) -> Self {
+        self.small_prefix_copy_max = max;
+        self
+    }
+
+    pub fn with_monoio_sparse_read_copy_denominator(mut self, denominator: usize) -> Self {
+        self.monoio_sparse_read_copy_denominator = denominator.max(1);
+        self
+    }
+
+    fn should_copy_prefix(self, prefix_len: usize) -> bool {
+        prefix_len <= self.small_prefix_copy_max
+    }
+
+    #[cfg(feature = "monoio")]
+    fn should_swap_monoio_read_buffer(self, read: usize, capacity: usize) -> bool {
+        read.saturating_mul(self.monoio_sparse_read_copy_denominator) >= capacity
+    }
+}
+
+impl Default for HandoffBufferPolicy {
+    fn default() -> Self {
+        Self {
+            small_prefix_copy_max: DEFAULT_SMALL_PREFIX_COPY_MAX,
+            monoio_sparse_read_copy_denominator: DEFAULT_MONOIO_SPARSE_READ_COPY_DENOMINATOR,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct HandoffBuffer {
     buf: BytesMut,
     config: HandoffBufferConfig,
+    policy: HandoffBufferPolicy,
     #[cfg(feature = "monoio")]
     monoio_read_buf: BytesMut,
 }
@@ -83,15 +123,31 @@ impl HandoffBuffer {
     }
 
     pub fn with_config(config: HandoffBufferConfig) -> Self {
+        Self::with_config_and_policy(config, HandoffBufferPolicy::default())
+    }
+
+    pub fn with_config_and_policy(
+        config: HandoffBufferConfig,
+        policy: HandoffBufferPolicy,
+    ) -> Self {
         Self {
             buf: BytesMut::new(),
             config,
+            policy,
             #[cfg(feature = "monoio")]
             monoio_read_buf: BytesMut::with_capacity(config.read_reserve),
         }
     }
 
     pub fn from_tail(tail: BytesMut, config: HandoffBufferConfig) -> Result<Self, BufferError> {
+        Self::from_tail_with_policy(tail, config, HandoffBufferPolicy::default())
+    }
+
+    pub fn from_tail_with_policy(
+        tail: BytesMut,
+        config: HandoffBufferConfig,
+        policy: HandoffBufferPolicy,
+    ) -> Result<Self, BufferError> {
         if tail.len() > config.max_len {
             return Err(BufferError::LimitExceeded {
                 attempted: tail.len(),
@@ -101,9 +157,18 @@ impl HandoffBuffer {
         Ok(Self {
             buf: tail,
             config,
+            policy,
             #[cfg(feature = "monoio")]
             monoio_read_buf: BytesMut::with_capacity(config.read_reserve),
         })
+    }
+
+    pub fn policy(&self) -> HandoffBufferPolicy {
+        self.policy
+    }
+
+    pub fn set_policy(&mut self, policy: HandoffBufferPolicy) {
+        self.policy = policy;
     }
 
     pub fn len(&self) -> usize {
@@ -227,7 +292,7 @@ impl HandoffBuffer {
                 available: self.buf.len(),
             });
         }
-        if should_copy_prefix(n) {
+        if self.policy.should_copy_prefix(n) {
             let prefix = Bytes::copy_from_slice(&self.buf[..n]);
             self.buf.advance(n);
             return Ok(prefix);
@@ -246,7 +311,7 @@ impl HandoffBuffer {
     }
 
     pub fn freeze_all(&mut self) -> Bytes {
-        if should_copy_prefix(self.buf.len()) {
+        if self.policy.should_copy_prefix(self.buf.len()) {
             let bytes = Bytes::copy_from_slice(&self.buf);
             self.buf.clear();
             return bytes;
@@ -342,8 +407,8 @@ impl HandoffBuffer {
         match read {
             0 => MonoioReadDestination::Empty,
             _ if self.buf.is_empty()
-                && read > SMALL_PREFIX_COPY_MAX
-                && should_swap_monoio_read_buffer(read, capacity) =>
+                && read > self.policy.small_prefix_copy_max
+                && self.policy.should_swap_monoio_read_buffer(read, capacity) =>
             {
                 MonoioReadDestination::Swap
             }
@@ -360,10 +425,6 @@ enum MonoioReadDestination {
     Append,
 }
 
-fn should_copy_prefix(prefix_len: usize) -> bool {
-    prefix_len <= SMALL_PREFIX_COPY_MAX
-}
-
 #[cfg(feature = "monoio")]
 fn normalize_monoio_read_buffer(read_buf: &mut BytesMut, read: usize) {
     match read_buf.len().cmp(&read) {
@@ -377,11 +438,6 @@ fn normalize_monoio_read_buffer(read_buf: &mut BytesMut, read: usize) {
             }
         }
     }
-}
-
-#[cfg(feature = "monoio")]
-fn should_swap_monoio_read_buffer(read: usize, capacity: usize) -> bool {
-    read.saturating_mul(SPARSE_READ_COPY_DENOMINATOR) >= capacity
 }
 
 #[cfg(test)]
@@ -489,9 +545,14 @@ mod tests {
     #[cfg(feature = "monoio")]
     #[test]
     fn monoio_sparse_reads_copy_instead_of_swapping_large_reserve() {
-        assert!(!should_swap_monoio_read_buffer(1460, 16 * 1024));
-        assert!(should_swap_monoio_read_buffer(16 * 1024, 16 * 1024));
-        assert!(should_swap_monoio_read_buffer(4 * 1024, 16 * 1024));
+        let policy = HandoffBufferPolicy::default();
+        assert!(!policy.should_swap_monoio_read_buffer(1460, 16 * 1024));
+        assert!(policy.should_swap_monoio_read_buffer(16 * 1024, 16 * 1024));
+        assert!(policy.should_swap_monoio_read_buffer(4 * 1024, 16 * 1024));
+
+        let more_conservative = policy.with_monoio_sparse_read_copy_denominator(2);
+        assert!(!more_conservative.should_swap_monoio_read_buffer(4 * 1024, 16 * 1024));
+        assert!(more_conservative.should_swap_monoio_read_buffer(8 * 1024, 16 * 1024));
     }
 
     #[test]
@@ -635,6 +696,20 @@ mod tests {
 
         assert_eq!(prefix, Bytes::from_static(b"route\n"));
         assert_eq!(buffer.len(), 4 * 1024);
+    }
+
+    #[test]
+    fn split_prefix_policy_can_disable_small_prefix_copy() {
+        let policy = HandoffBufferPolicy::new().with_small_prefix_copy_max(0);
+        let mut buffer =
+            HandoffBuffer::with_config_and_policy(HandoffBufferConfig::new(64), policy);
+        buffer.buf.extend_from_slice(b"route\n");
+
+        let prefix = buffer.split_prefix(6).expect("split prefix");
+
+        assert_eq!(prefix, Bytes::from_static(b"route\n"));
+        assert_eq!(buffer.policy(), policy);
+        assert!(buffer.is_empty());
     }
 
     #[test]
