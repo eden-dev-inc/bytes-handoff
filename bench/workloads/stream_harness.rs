@@ -342,6 +342,12 @@ struct BufferedTunnelRecorder {
     stats: WriteCoalescerStats,
 }
 
+enum TunnelBufferDecision {
+    Empty,
+    WaitForThreshold,
+    Submit { record_flush: bool },
+}
+
 impl BufferedTunnelRecorder {
     fn new(enabled: bool) -> Self {
         Self {
@@ -396,6 +402,39 @@ impl BufferedTunnelRecorder {
 
     fn stats(self) -> WriteCoalescerStats {
         self.stats
+    }
+}
+
+fn observe_tunnel_buffer(
+    recorder: &mut BufferedTunnelRecorder,
+    pending_bytes: usize,
+    read_buffer_coalescing: bool,
+    config: Config,
+) -> TunnelBufferDecision {
+    match (pending_bytes, read_buffer_coalescing) {
+        (0, _) => TunnelBufferDecision::Empty,
+        (bytes, true) => {
+            recorder.note_input(bytes);
+            if should_submit_tunnel_buffer(bytes, config) {
+                TunnelBufferDecision::Submit { record_flush: true }
+            } else {
+                TunnelBufferDecision::WaitForThreshold
+            }
+        }
+        (_, false) => TunnelBufferDecision::Submit {
+            record_flush: false,
+        },
+    }
+}
+
+fn record_tunnel_flush(
+    recorder: &mut BufferedTunnelRecorder,
+    bytes: usize,
+    record_flush: bool,
+    config: Config,
+) {
+    if record_flush {
+        recorder.record_flush(bytes, config.handoff_flush_bytes);
     }
 }
 
@@ -1922,25 +1961,31 @@ where
             tunnel = route_complete_prefixes(&mut buffer, &handoff, config.completion).await;
         }
 
-        if tunnel && !buffer.is_empty() {
-            if read_buffer_coalescing {
-                tunnel_recorder.note_input(buffer.len());
-            }
-            if !read_buffer_coalescing || should_submit_tunnel_buffer(buffer.len(), config) {
-                let bytes = buffer.freeze_all();
-                if read_buffer_coalescing {
-                    tunnel_recorder.record_flush(bytes.len(), config.handoff_flush_bytes);
+        if tunnel {
+            match observe_tunnel_buffer(
+                &mut tunnel_recorder,
+                buffer.len(),
+                read_buffer_coalescing,
+                config,
+            ) {
+                TunnelBufferDecision::Empty | TunnelBufferDecision::WaitForThreshold => {}
+                TunnelBufferDecision::Submit { record_flush } => {
+                    let bytes = buffer.freeze_all();
+                    record_tunnel_flush(&mut tunnel_recorder, bytes.len(), record_flush, config);
+                    submit_tunnel(&handoff, &mut tunnel_coalescer, config.completion, bytes).await;
                 }
-                submit_tunnel(&handoff, &mut tunnel_coalescer, config.completion, bytes).await;
             }
         }
     }
 
     if !buffer.is_empty() {
         let bytes = buffer.freeze_all();
-        if read_buffer_coalescing {
-            tunnel_recorder.record_flush(bytes.len(), config.handoff_flush_bytes);
-        }
+        record_tunnel_flush(
+            &mut tunnel_recorder,
+            bytes.len(),
+            read_buffer_coalescing,
+            config,
+        );
         submit_tunnel(
             &handoff,
             &mut tunnel_coalescer,
@@ -1999,25 +2044,31 @@ where
             tunnel = route_complete_prefixes_monoio(&mut buffer, &mut writer).await;
         }
 
-        if tunnel && !buffer.is_empty() {
-            if read_buffer_coalescing {
-                tunnel_recorder.note_input(buffer.len());
-            }
-            if !read_buffer_coalescing || should_submit_tunnel_buffer(buffer.len(), config) {
-                let bytes = buffer.freeze_all();
-                if read_buffer_coalescing {
-                    tunnel_recorder.record_flush(bytes.len(), config.handoff_flush_bytes);
+        if tunnel {
+            match observe_tunnel_buffer(
+                &mut tunnel_recorder,
+                buffer.len(),
+                read_buffer_coalescing,
+                config,
+            ) {
+                TunnelBufferDecision::Empty | TunnelBufferDecision::WaitForThreshold => {}
+                TunnelBufferDecision::Submit { record_flush } => {
+                    let bytes = buffer.freeze_all();
+                    record_tunnel_flush(&mut tunnel_recorder, bytes.len(), record_flush, config);
+                    write_monoio_direct(&mut writer, bytes).await;
                 }
-                write_monoio_direct(&mut writer, bytes).await;
             }
         }
     }
 
     if !buffer.is_empty() {
         let bytes = buffer.freeze_all();
-        if read_buffer_coalescing {
-            tunnel_recorder.record_flush(bytes.len(), config.handoff_flush_bytes);
-        }
+        record_tunnel_flush(
+            &mut tunnel_recorder,
+            bytes.len(),
+            read_buffer_coalescing,
+            config,
+        );
         write_monoio_direct(&mut writer, bytes).await;
     }
 
@@ -2077,25 +2128,31 @@ where
                 route_complete_prefixes_bytesmut(&mut buffer, &handoff, config.completion).await;
         }
 
-        if tunnel && !buffer.is_empty() {
-            if read_buffer_coalescing {
-                tunnel_recorder.note_input(buffer.len());
-            }
-            if !read_buffer_coalescing || should_submit_tunnel_buffer(buffer.len(), config) {
-                let bytes = buffer.split().freeze();
-                if read_buffer_coalescing {
-                    tunnel_recorder.record_flush(bytes.len(), config.handoff_flush_bytes);
+        if tunnel {
+            match observe_tunnel_buffer(
+                &mut tunnel_recorder,
+                buffer.len(),
+                read_buffer_coalescing,
+                config,
+            ) {
+                TunnelBufferDecision::Empty | TunnelBufferDecision::WaitForThreshold => {}
+                TunnelBufferDecision::Submit { record_flush } => {
+                    let bytes = buffer.split().freeze();
+                    record_tunnel_flush(&mut tunnel_recorder, bytes.len(), record_flush, config);
+                    submit_tunnel(&handoff, &mut tunnel_coalescer, config.completion, bytes).await;
                 }
-                submit_tunnel(&handoff, &mut tunnel_coalescer, config.completion, bytes).await;
             }
         }
     }
 
     if !buffer.is_empty() {
         let bytes = buffer.split().freeze();
-        if read_buffer_coalescing {
-            tunnel_recorder.record_flush(bytes.len(), config.handoff_flush_bytes);
-        }
+        record_tunnel_flush(
+            &mut tunnel_recorder,
+            bytes.len(),
+            read_buffer_coalescing,
+            config,
+        );
         submit_tunnel(
             &handoff,
             &mut tunnel_coalescer,

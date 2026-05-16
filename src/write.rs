@@ -157,6 +157,13 @@ enum WriteMessage {
     Shutdown,
 }
 
+enum CoalescerWriteAction {
+    Flush,
+    Direct,
+    FlushThenDirect,
+    Buffer,
+}
+
 struct Budget {
     pending: AtomicUsize,
     waiters: AtomicUsize,
@@ -422,37 +429,20 @@ impl WriteCoalescer {
     }
 
     pub async fn write_fire_and_forget(&mut self, bytes: Bytes) -> Result<(), WriteError> {
-        if bytes.is_empty() {
-            return self.flush().await;
-        }
-        self.record_input(bytes.len());
-        if self.threshold_bytes == 1 {
-            self.flush().await?;
-            return self.write_direct(bytes).await;
-        }
-        if self.pending.is_empty() && bytes.len() >= self.threshold_bytes {
-            return self.write_direct(bytes).await;
-        }
-        if !self.pending.is_empty()
-            && bytes.len() >= self.threshold_bytes
-            && self.pending.len() < self.threshold_bytes
-        {
-            self.flush().await?;
-            return self.write_direct(bytes).await;
+        let action = self.write_action(bytes.len());
+        if !bytes.is_empty() {
+            self.record_input(bytes.len());
         }
 
-        if self.pending.is_empty() && self.stats.is_some() {
-            self.pending_started_at = Some(Instant::now());
+        match action {
+            CoalescerWriteAction::Flush => self.flush().await,
+            CoalescerWriteAction::Direct => self.write_direct(bytes).await,
+            CoalescerWriteAction::FlushThenDirect => {
+                self.flush().await?;
+                self.write_direct(bytes).await
+            }
+            CoalescerWriteAction::Buffer => self.buffer_write(bytes).await,
         }
-        self.pending.extend_from_slice(&bytes);
-        if let Some(stats) = &mut self.stats {
-            self.pending_chunks = self.pending_chunks.saturating_add(1);
-            stats.max_pending_bytes = stats.max_pending_bytes.max(self.pending.len());
-        }
-        if self.pending.len() >= self.threshold_bytes {
-            self.flush().await?;
-        }
-        Ok(())
     }
 
     pub async fn flush(&mut self) -> Result<(), WriteError> {
@@ -480,11 +470,41 @@ impl WriteCoalescer {
         Ok(())
     }
 
+    async fn buffer_write(&mut self, bytes: Bytes) -> Result<(), WriteError> {
+        self.start_buffered_flush_timer();
+        self.pending.extend_from_slice(&bytes);
+        self.record_pending_chunk();
+
+        if self.pending.len() >= self.threshold_bytes {
+            self.flush().await
+        } else {
+            Ok(())
+        }
+    }
+
+    fn write_action(&self, len: usize) -> CoalescerWriteAction {
+        match (len, self.threshold_bytes, self.pending.is_empty()) {
+            (0, _, _) => CoalescerWriteAction::Flush,
+            (_, 1, _) => CoalescerWriteAction::FlushThenDirect,
+            (len, threshold, true) if len >= threshold => CoalescerWriteAction::Direct,
+            (len, threshold, false) if len >= threshold && self.pending.len() < threshold => {
+                CoalescerWriteAction::FlushThenDirect
+            }
+            _ => CoalescerWriteAction::Buffer,
+        }
+    }
+
     async fn enqueue_fire_and_forget(&self, bytes: Bytes) -> Result<(), WriteError> {
         if let Err(err) = self.handoff.try_write_fire_and_forget(bytes) {
             self.handoff.write_fire_and_forget(err.into_bytes()).await?;
         }
         Ok(())
+    }
+
+    fn start_buffered_flush_timer(&mut self) {
+        if self.pending.is_empty() && self.stats.is_some() {
+            self.pending_started_at = Some(Instant::now());
+        }
     }
 
     fn record_input(&mut self, bytes: usize) {
@@ -493,6 +513,14 @@ impl WriteCoalescer {
         };
         stats.input_chunks = stats.input_chunks.saturating_add(1);
         stats.input_bytes = stats.input_bytes.saturating_add(bytes);
+    }
+
+    fn record_pending_chunk(&mut self) {
+        let Some(stats) = &mut self.stats else {
+            return;
+        };
+        self.pending_chunks = self.pending_chunks.saturating_add(1);
+        stats.max_pending_bytes = stats.max_pending_bytes.max(self.pending.len());
     }
 
     fn record_direct_flush(&mut self, bytes: usize) {
