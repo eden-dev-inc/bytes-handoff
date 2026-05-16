@@ -41,6 +41,42 @@ pub struct HandoffBuffer {
     monoio_read_buf: BytesMut,
 }
 
+#[derive(Debug)]
+pub struct HandoffDrainCursor<'a> {
+    bytes: &'a [u8],
+    consumed: usize,
+}
+
+impl HandoffDrainCursor<'_> {
+    pub fn remaining(&self) -> &[u8] {
+        &self.bytes[self.consumed..]
+    }
+
+    pub fn consumed(&self) -> usize {
+        self.consumed
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.remaining().is_empty()
+    }
+
+    pub fn consume(&mut self, cnt: usize) -> Result<(), BufferError> {
+        let remaining = self.remaining().len();
+        if cnt > remaining {
+            return Err(BufferError::SplitOutOfBounds {
+                requested: cnt,
+                available: remaining,
+            });
+        }
+        self.consumed += cnt;
+        Ok(())
+    }
+
+    pub fn consume_all(&mut self) {
+        self.consumed = self.bytes.len();
+    }
+}
+
 impl HandoffBuffer {
     pub fn new(max_len: usize) -> Self {
         Self::with_config(HandoffBufferConfig::new(max_len))
@@ -90,6 +126,23 @@ impl HandoffBuffer {
         self.check_limit(additional)?;
         self.buf.reserve(additional);
         Ok(())
+    }
+
+    pub fn drain<F, T, E>(&mut self, f: F) -> Result<T, E>
+    where
+        F: FnOnce(&mut HandoffDrainCursor<'_>) -> Result<T, E>,
+        E: From<BufferError>,
+    {
+        let (consumed, output) = {
+            let mut cursor = HandoffDrainCursor {
+                bytes: &self.buf,
+                consumed: 0,
+            };
+            let output = f(&mut cursor)?;
+            (cursor.consumed(), output)
+        };
+        self.advance(consumed).map_err(E::from)?;
+        Ok(output)
     }
 
     pub async fn read_available<R>(&mut self, reader: &mut R) -> Result<usize, BufferError>
@@ -449,6 +502,45 @@ mod tests {
 
         assert_eq!(&prefix[..], b"Xbc");
         assert_eq!(buffer.peek(), b"def");
+    }
+
+    #[test]
+    fn drain_cursor_commits_consumed_bytes_once() {
+        let mut buffer = HandoffBuffer::new(64);
+        buffer.buf.extend_from_slice(b"one\ntwo\npartial");
+
+        let frames = buffer
+            .drain(|cursor| {
+                let mut frames = 0;
+                while let Some(newline) = cursor.remaining().iter().position(|b| *b == b'\n') {
+                    cursor.consume(newline + 1)?;
+                    frames += 1;
+                }
+                Ok::<_, BufferError>(frames)
+            })
+            .expect("drain complete frames");
+
+        assert_eq!(frames, 2);
+        assert_eq!(buffer.peek(), b"partial");
+    }
+
+    #[test]
+    fn drain_cursor_does_not_commit_on_error() {
+        let mut buffer = HandoffBuffer::new(64);
+        buffer.buf.extend_from_slice(b"one\npartial");
+
+        let err = buffer
+            .drain(|cursor| {
+                cursor.consume(4)?;
+                Err::<(), _>(BufferError::SplitOutOfBounds {
+                    requested: 100,
+                    available: cursor.remaining().len(),
+                })
+            })
+            .expect_err("drain should fail");
+
+        assert!(matches!(err, BufferError::SplitOutOfBounds { .. }));
+        assert_eq!(buffer.peek(), b"one\npartial");
     }
 
     #[test]

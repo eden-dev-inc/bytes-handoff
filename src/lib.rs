@@ -15,7 +15,7 @@ mod tune;
 mod write;
 
 pub use error::{BackpressureReason, BufferError, WriteBackpressure, WriteError};
-pub use read::{HandoffBuffer, HandoffBufferConfig};
+pub use read::{HandoffBuffer, HandoffBufferConfig, HandoffDrainCursor};
 pub use tune::{
     DEFAULT_TUNING_BATCH_SIZE, DEFAULT_TUNING_MAX_READS_PER_FLUSH,
     DEFAULT_TUNING_MAX_THRESHOLD_BYTES, DEFAULT_TUNING_MAX_THRESHOLD_POINTS,
