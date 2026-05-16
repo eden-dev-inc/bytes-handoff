@@ -145,6 +145,21 @@ impl HandoffBuffer {
         Ok(output)
     }
 
+    pub async fn read_and_drain<R, F, T, E>(
+        &mut self,
+        reader: &mut R,
+        f: F,
+    ) -> Result<(usize, T), E>
+    where
+        R: AsyncRead + Unpin,
+        F: FnOnce(&mut HandoffDrainCursor<'_>) -> Result<T, E>,
+        E: From<BufferError>,
+    {
+        let read = self.read_available(reader).await.map_err(E::from)?;
+        let output = self.drain(f)?;
+        Ok((read, output))
+    }
+
     pub async fn read_available<R>(&mut self, reader: &mut R) -> Result<usize, BufferError>
     where
         R: AsyncRead + Unpin,
@@ -187,6 +202,22 @@ impl HandoffBuffer {
         normalize_monoio_read_buffer(&mut read_buf, read);
         self.store_monoio_read(read_buf, read);
         Ok(read)
+    }
+
+    #[cfg(feature = "monoio")]
+    pub async fn read_and_drain_monoio<R, F, T, E>(
+        &mut self,
+        reader: &mut R,
+        f: F,
+    ) -> Result<(usize, T), E>
+    where
+        R: monoio::io::AsyncReadRent + ?Sized,
+        F: FnOnce(&mut HandoffDrainCursor<'_>) -> Result<T, E>,
+        E: From<BufferError>,
+    {
+        let read = self.read_available_monoio(reader).await.map_err(E::from)?;
+        let output = self.drain(f)?;
+        Ok((read, output))
     }
 
     pub fn split_prefix(&mut self, n: usize) -> Result<Bytes, BufferError> {
@@ -541,6 +572,57 @@ mod tests {
 
         assert!(matches!(err, BufferError::SplitOutOfBounds { .. }));
         assert_eq!(buffer.peek(), b"one\npartial");
+    }
+
+    #[tokio::test]
+    async fn read_and_drain_reads_once_and_preserves_tail() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let mut buffer = HandoffBuffer::new(128);
+
+        client
+            .write_all(b"one\ntwo\npartial")
+            .await
+            .expect("write frames");
+        let (read, frames) = buffer
+            .read_and_drain(&mut server, |cursor| {
+                let mut frames = 0;
+                while let Some(newline) = cursor.remaining().iter().position(|b| *b == b'\n') {
+                    cursor.consume(newline + 1)?;
+                    frames += 1;
+                }
+                Ok::<_, BufferError>(frames)
+            })
+            .await
+            .expect("read and drain");
+
+        assert_eq!(read, 15);
+        assert_eq!(frames, 2);
+        assert_eq!(buffer.peek(), b"partial");
+    }
+
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn read_and_drain_monoio_reads_once_and_preserves_tail() {
+        monoio::start::<monoio::LegacyDriver, _>(async {
+            let mut reader: &[u8] = b"one\ntwo\npartial";
+            let mut buffer = HandoffBuffer::new(128);
+
+            let (read, frames) = buffer
+                .read_and_drain_monoio(&mut reader, |cursor| {
+                    let mut frames = 0;
+                    while let Some(newline) = cursor.remaining().iter().position(|b| *b == b'\n') {
+                        cursor.consume(newline + 1)?;
+                        frames += 1;
+                    }
+                    Ok::<_, BufferError>(frames)
+                })
+                .await
+                .expect("read and drain monoio");
+
+            assert_eq!(read, 15);
+            assert_eq!(frames, 2);
+            assert_eq!(buffer.peek(), b"partial");
+        });
     }
 
     #[test]
