@@ -152,6 +152,11 @@ struct WriteRequest {
     budget_bytes: usize,
 }
 
+struct BudgetPermit<'a> {
+    budget: &'a Budget,
+    bytes: usize,
+}
+
 enum WriteMessage {
     Write(WriteRequest),
     Shutdown,
@@ -186,6 +191,65 @@ enum BudgetAcquireError {
     LimitExceeded { attempted: usize, limit: usize },
 }
 
+impl WriteRequest {
+    fn new(
+        bytes: Bytes,
+        completion: Option<oneshot::Sender<WriteCompletion>>,
+        budget_bytes: usize,
+    ) -> Self {
+        Self {
+            bytes,
+            completion,
+            budget_bytes,
+        }
+    }
+
+    fn release_budget(&mut self, budget: &Budget) {
+        budget.release(std::mem::take(&mut self.budget_bytes));
+    }
+
+    fn release_into_bytes(mut self, budget: &Budget) -> Bytes {
+        self.release_budget(budget);
+        self.bytes
+    }
+}
+
+impl<'a> BudgetPermit<'a> {
+    fn new(budget: &'a Budget, bytes: usize) -> Self {
+        Self { budget, bytes }
+    }
+
+    fn commit(mut self) -> usize {
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+impl Drop for BudgetPermit<'_> {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
+impl BudgetAcquireError {
+    fn into_backpressure(self, bytes: Bytes) -> WriteBackpressure {
+        match self {
+            Self::Closed => WriteBackpressure::closed(bytes),
+            Self::LimitExceeded { attempted, limit } => {
+                WriteBackpressure::byte_budget_exceeded(bytes, attempted, limit)
+            }
+        }
+    }
+
+    fn into_write_error(self) -> WriteError {
+        match self {
+            Self::Closed => WriteError::Closed,
+            Self::LimitExceeded { attempted, limit } => {
+                WriteError::ByteBudgetExceeded { attempted, limit }
+            }
+        }
+    }
+}
+
 impl WriteHandoff {
     pub fn spawn<W>(writer: W, config: WriteHandoffConfig) -> Self
     where
@@ -200,157 +264,23 @@ impl WriteHandoff {
     }
 
     pub fn try_write(&self, bytes: Bytes) -> Result<WriteTicket, WriteBackpressure> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(WriteBackpressure::closed(bytes));
-        }
-        let permit = match self.budget.try_acquire(bytes.len()) {
-            Ok(permit) => permit,
-            Err(BudgetAcquireError::Closed) => return Err(WriteBackpressure::closed(bytes)),
-            Err(BudgetAcquireError::LimitExceeded { attempted, limit }) => {
-                return Err(WriteBackpressure::byte_budget_exceeded(
-                    bytes, attempted, limit,
-                ));
-            }
-        };
-        if self.closed.load(Ordering::Acquire) {
-            self.budget.release(permit);
-            return Err(WriteBackpressure::closed(bytes));
-        }
-
         let (completion, rx) = oneshot::channel();
-        let request = WriteRequest {
-            bytes,
-            completion: Some(completion),
-            budget_bytes: permit,
-        };
-        match self.tx.try_send(WriteMessage::Write(request)) {
-            Ok(()) => Ok(WriteTicket { rx }),
-            Err(mpsc::error::TrySendError::Full(WriteMessage::Write(mut request))) => {
-                self.budget.release(request.budget_bytes);
-                request.budget_bytes = 0;
-                Err(WriteBackpressure::queue_full(request.bytes))
-            }
-            Err(mpsc::error::TrySendError::Closed(WriteMessage::Write(mut request))) => {
-                self.budget.release(request.budget_bytes);
-                request.budget_bytes = 0;
-                self.closed.store(true, Ordering::Release);
-                self.budget.close();
-                Err(WriteBackpressure::closed(request.bytes))
-            }
-            Err(mpsc::error::TrySendError::Full(WriteMessage::Shutdown))
-            | Err(mpsc::error::TrySendError::Closed(WriteMessage::Shutdown)) => unreachable!(),
-        }
+        self.try_enqueue(bytes, Some(completion))?;
+        Ok(WriteTicket { rx })
     }
 
     pub fn try_write_fire_and_forget(&self, bytes: Bytes) -> Result<(), WriteBackpressure> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(WriteBackpressure::closed(bytes));
-        }
-        let permit = match self.budget.try_acquire(bytes.len()) {
-            Ok(permit) => permit,
-            Err(BudgetAcquireError::Closed) => return Err(WriteBackpressure::closed(bytes)),
-            Err(BudgetAcquireError::LimitExceeded { attempted, limit }) => {
-                return Err(WriteBackpressure::byte_budget_exceeded(
-                    bytes, attempted, limit,
-                ));
-            }
-        };
-        if self.closed.load(Ordering::Acquire) {
-            self.budget.release(permit);
-            return Err(WriteBackpressure::closed(bytes));
-        }
-
-        let request = WriteRequest {
-            bytes,
-            completion: None,
-            budget_bytes: permit,
-        };
-        match self.tx.try_send(WriteMessage::Write(request)) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(WriteMessage::Write(mut request))) => {
-                self.budget.release(request.budget_bytes);
-                request.budget_bytes = 0;
-                Err(WriteBackpressure::queue_full(request.bytes))
-            }
-            Err(mpsc::error::TrySendError::Closed(WriteMessage::Write(mut request))) => {
-                self.budget.release(request.budget_bytes);
-                request.budget_bytes = 0;
-                self.closed.store(true, Ordering::Release);
-                self.budget.close();
-                Err(WriteBackpressure::closed(request.bytes))
-            }
-            Err(mpsc::error::TrySendError::Full(WriteMessage::Shutdown))
-            | Err(mpsc::error::TrySendError::Closed(WriteMessage::Shutdown)) => unreachable!(),
-        }
+        self.try_enqueue(bytes, None)
     }
 
     pub async fn write(&self, bytes: Bytes) -> Result<WriteTicket, WriteError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(WriteError::Closed);
-        }
-        let permit = match self.budget.acquire(bytes.len()).await {
-            Ok(permit) => permit,
-            Err(BudgetAcquireError::Closed) => return Err(WriteError::Closed),
-            Err(BudgetAcquireError::LimitExceeded { attempted, limit }) => {
-                return Err(WriteError::ByteBudgetExceeded { attempted, limit });
-            }
-        };
-        if self.closed.load(Ordering::Acquire) {
-            self.budget.release(permit);
-            return Err(WriteError::Closed);
-        }
-
         let (completion, rx) = oneshot::channel();
-        let request = WriteRequest {
-            bytes,
-            completion: Some(completion),
-            budget_bytes: permit,
-        };
-        if let Err(err) = self.tx.send(WriteMessage::Write(request)).await {
-            let WriteMessage::Write(mut request) = err.0 else {
-                unreachable!();
-            };
-            self.budget.release(request.budget_bytes);
-            request.budget_bytes = 0;
-            self.closed.store(true, Ordering::Release);
-            self.budget.close();
-            return Err(WriteError::Closed);
-        }
+        self.enqueue(bytes, Some(completion)).await?;
         Ok(WriteTicket { rx })
     }
 
     pub async fn write_fire_and_forget(&self, bytes: Bytes) -> Result<(), WriteError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(WriteError::Closed);
-        }
-        let permit = match self.budget.acquire(bytes.len()).await {
-            Ok(permit) => permit,
-            Err(BudgetAcquireError::Closed) => return Err(WriteError::Closed),
-            Err(BudgetAcquireError::LimitExceeded { attempted, limit }) => {
-                return Err(WriteError::ByteBudgetExceeded { attempted, limit });
-            }
-        };
-        if self.closed.load(Ordering::Acquire) {
-            self.budget.release(permit);
-            return Err(WriteError::Closed);
-        }
-
-        let request = WriteRequest {
-            bytes,
-            completion: None,
-            budget_bytes: permit,
-        };
-        if let Err(err) = self.tx.send(WriteMessage::Write(request)).await {
-            let WriteMessage::Write(mut request) = err.0 else {
-                unreachable!();
-            };
-            self.budget.release(request.budget_bytes);
-            request.budget_bytes = 0;
-            self.closed.store(true, Ordering::Release);
-            self.budget.close();
-            return Err(WriteError::Closed);
-        }
-        Ok(())
+        self.enqueue(bytes, None).await
     }
 
     pub fn pending_bytes(&self) -> usize {
@@ -361,6 +291,127 @@ impl WriteHandoff {
         self.closed.store(true, Ordering::Release);
         self.budget.close();
         let _ = self.tx.try_send(WriteMessage::Shutdown);
+    }
+
+    fn try_enqueue(
+        &self,
+        bytes: Bytes,
+        completion: Option<oneshot::Sender<WriteCompletion>>,
+    ) -> Result<(), WriteBackpressure> {
+        let request = self.try_request(bytes, completion)?;
+        self.try_send_request(request)
+    }
+
+    async fn enqueue(
+        &self,
+        bytes: Bytes,
+        completion: Option<oneshot::Sender<WriteCompletion>>,
+    ) -> Result<(), WriteError> {
+        let request = self.request(bytes, completion).await?;
+        self.send_request(request).await
+    }
+
+    fn try_request(
+        &self,
+        bytes: Bytes,
+        completion: Option<oneshot::Sender<WriteCompletion>>,
+    ) -> Result<WriteRequest, WriteBackpressure> {
+        match self.try_budget_permit(bytes.len()) {
+            Ok(permit) => self.request_from_permit(bytes, completion, permit),
+            Err(err) => Err(err.into_backpressure(bytes)),
+        }
+    }
+
+    async fn request(
+        &self,
+        bytes: Bytes,
+        completion: Option<oneshot::Sender<WriteCompletion>>,
+    ) -> Result<WriteRequest, WriteError> {
+        match self.budget_permit(bytes.len()).await {
+            Ok(permit) => self.request_from_permit_or_closed(bytes, completion, permit),
+            Err(err) => Err(err.into_write_error()),
+        }
+    }
+
+    fn request_from_permit(
+        &self,
+        bytes: Bytes,
+        completion: Option<oneshot::Sender<WriteCompletion>>,
+        permit: BudgetPermit<'_>,
+    ) -> Result<WriteRequest, WriteBackpressure> {
+        match self.closed.load(Ordering::Acquire) {
+            false => Ok(WriteRequest::new(bytes, completion, permit.commit())),
+            true => Err(WriteBackpressure::closed(bytes)),
+        }
+    }
+
+    fn request_from_permit_or_closed(
+        &self,
+        bytes: Bytes,
+        completion: Option<oneshot::Sender<WriteCompletion>>,
+        permit: BudgetPermit<'_>,
+    ) -> Result<WriteRequest, WriteError> {
+        match self.closed.load(Ordering::Acquire) {
+            false => Ok(WriteRequest::new(bytes, completion, permit.commit())),
+            true => Err(WriteError::Closed),
+        }
+    }
+
+    fn try_budget_permit(&self, bytes: usize) -> Result<BudgetPermit<'_>, BudgetAcquireError> {
+        match self.closed.load(Ordering::Acquire) {
+            false => self
+                .budget
+                .try_acquire(bytes)
+                .map(|permit| BudgetPermit::new(self.budget.as_ref(), permit)),
+            true => Err(BudgetAcquireError::Closed),
+        }
+    }
+
+    async fn budget_permit(&self, bytes: usize) -> Result<BudgetPermit<'_>, BudgetAcquireError> {
+        match self.closed.load(Ordering::Acquire) {
+            false => self
+                .budget
+                .acquire(bytes)
+                .await
+                .map(|permit| BudgetPermit::new(self.budget.as_ref(), permit)),
+            true => Err(BudgetAcquireError::Closed),
+        }
+    }
+
+    fn try_send_request(&self, request: WriteRequest) -> Result<(), WriteBackpressure> {
+        match self.tx.try_send(WriteMessage::Write(request)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(WriteMessage::Write(request))) => Err(
+                WriteBackpressure::queue_full(request.release_into_bytes(&self.budget)),
+            ),
+            Err(mpsc::error::TrySendError::Closed(WriteMessage::Write(request))) => {
+                self.mark_closed();
+                Err(WriteBackpressure::closed(
+                    request.release_into_bytes(&self.budget),
+                ))
+            }
+            Err(mpsc::error::TrySendError::Full(WriteMessage::Shutdown))
+            | Err(mpsc::error::TrySendError::Closed(WriteMessage::Shutdown)) => unreachable!(),
+        }
+    }
+
+    async fn send_request(&self, request: WriteRequest) -> Result<(), WriteError> {
+        match self.tx.send(WriteMessage::Write(request)).await {
+            Ok(()) => Ok(()),
+            Err(err) => match err.0 {
+                WriteMessage::Write(mut request) => {
+                    request.release_budget(&self.budget);
+                    self.mark_closed();
+                    Err(WriteError::Closed)
+                }
+                WriteMessage::Shutdown => unreachable!(),
+            },
+        }
+    }
+
+    fn mark_closed(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.budget.close();
     }
 }
 
