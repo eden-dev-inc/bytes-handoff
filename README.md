@@ -46,7 +46,7 @@ to read from `monoio::io::AsyncReadRent` sources without changing the
 `HandoffBuffer` parsing model:
 
 ```toml
-bytes-handoff = { version = "1", features = ["monoio"] }
+bytes-handoff = { version = "1.1", features = ["monoio"] }
 ```
 
 The `bench-tools` feature is for this repository's harness binaries and should
@@ -297,7 +297,7 @@ assert_eq!(first_step.thresholds(), &[1]);
 Enable `monoio` to use Monoio's ownership-based I/O traits directly:
 
 ```toml
-bytes-handoff = { version = "1", features = ["monoio"] }
+bytes-handoff = { version = "1.1", features = ["monoio"] }
 ```
 
 With the feature enabled, `HandoffBuffer::read_available_monoio` accepts
