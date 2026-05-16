@@ -8,6 +8,8 @@ use std::pin::Pin;
 use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::BufferError;
+#[cfg(feature = "telemetry")]
+use crate::read_telemetry::HandoffReadTelemetryHandle;
 
 pub const DEFAULT_SMALL_PREFIX_COPY_MAX: usize = 256;
 pub const DEFAULT_MONOIO_SPARSE_READ_COPY_DENOMINATOR: usize = 4;
@@ -77,6 +79,8 @@ pub struct HandoffBuffer {
     buf: BytesMut,
     config: HandoffBufferConfig,
     policy: HandoffBufferPolicy,
+    #[cfg(feature = "telemetry")]
+    telemetry: Option<HandoffReadTelemetryHandle>,
     #[cfg(feature = "monoio")]
     monoio_read_buf: BytesMut,
 }
@@ -134,6 +138,8 @@ impl HandoffBuffer {
             buf: BytesMut::new(),
             config,
             policy,
+            #[cfg(feature = "telemetry")]
+            telemetry: None,
             #[cfg(feature = "monoio")]
             monoio_read_buf: BytesMut::with_capacity(config.read_reserve),
         }
@@ -158,6 +164,8 @@ impl HandoffBuffer {
             buf: tail,
             config,
             policy,
+            #[cfg(feature = "telemetry")]
+            telemetry: None,
             #[cfg(feature = "monoio")]
             monoio_read_buf: BytesMut::with_capacity(config.read_reserve),
         })
@@ -169,6 +177,23 @@ impl HandoffBuffer {
 
     pub fn set_policy(&mut self, policy: HandoffBufferPolicy) {
         self.policy = policy;
+    }
+
+    #[cfg(feature = "telemetry")]
+    pub fn with_telemetry(mut self, telemetry: HandoffReadTelemetryHandle) -> Self {
+        self.attach_telemetry(telemetry);
+        self
+    }
+
+    #[cfg(feature = "telemetry")]
+    pub fn attach_telemetry(&mut self, telemetry: HandoffReadTelemetryHandle) {
+        telemetry.record_buffered(self.buf.len());
+        self.telemetry = Some(telemetry);
+    }
+
+    #[cfg(feature = "telemetry")]
+    pub fn clear_telemetry(&mut self) -> Option<HandoffReadTelemetryHandle> {
+        self.telemetry.take()
     }
 
     pub fn len(&self) -> usize {
@@ -189,7 +214,11 @@ impl HandoffBuffer {
 
     pub fn reserve_read_capacity(&mut self, additional: usize) -> Result<(), BufferError> {
         self.check_limit(additional)?;
+        #[cfg(feature = "telemetry")]
+        let capacity = self.buf.capacity();
         self.buf.reserve(additional);
+        #[cfg(feature = "telemetry")]
+        self.record_buffer_growth(self.buf.capacity().saturating_sub(capacity));
         Ok(())
     }
 
@@ -230,6 +259,12 @@ impl HandoffBuffer {
         R: AsyncRead + Unpin,
     {
         let reserve = self.read_reserve()?;
+        #[cfg(feature = "telemetry")]
+        {
+            let growth = self.reserve_spare_capacity(reserve);
+            self.record_buffer_growth(growth);
+        }
+        #[cfg(not(feature = "telemetry"))]
         self.reserve_spare_capacity(reserve);
         let len = self.buf.len();
         let read = poll_fn(|cx| {
@@ -249,6 +284,8 @@ impl HandoffBuffer {
         unsafe {
             self.buf.set_len(len + read);
         }
+        #[cfg(feature = "telemetry")]
+        self.record_read(read);
         Ok(read)
     }
 
@@ -266,6 +303,8 @@ impl HandoffBuffer {
         self.check_monoio_read_len(read, reserve)?;
         normalize_monoio_read_buffer(&mut read_buf, read);
         self.store_monoio_read(read_buf, read);
+        #[cfg(feature = "telemetry")]
+        self.record_read(read);
         Ok(read)
     }
 
@@ -295,9 +334,14 @@ impl HandoffBuffer {
         if self.policy.should_copy_prefix(n) {
             let prefix = Bytes::copy_from_slice(&self.buf[..n]);
             self.buf.advance(n);
+            #[cfg(feature = "telemetry")]
+            self.record_split_prefix(n, true);
             return Ok(prefix);
         }
-        Ok(self.buf.split_to(n).freeze())
+        let prefix = self.buf.split_to(n).freeze();
+        #[cfg(feature = "telemetry")]
+        self.record_split_prefix(n, false);
+        Ok(prefix)
     }
 
     pub fn split_prefix_mut(&mut self, n: usize) -> Result<BytesMut, BufferError> {
@@ -307,20 +351,35 @@ impl HandoffBuffer {
                 available: self.buf.len(),
             });
         }
-        Ok(self.buf.split_to(n))
+        let prefix = self.buf.split_to(n);
+        #[cfg(feature = "telemetry")]
+        self.record_mutable_prefix(n);
+        Ok(prefix)
     }
 
     pub fn freeze_all(&mut self) -> Bytes {
+        #[cfg(feature = "telemetry")]
+        let len = self.buf.len();
         if self.policy.should_copy_prefix(self.buf.len()) {
             let bytes = Bytes::copy_from_slice(&self.buf);
             self.buf.clear();
+            #[cfg(feature = "telemetry")]
+            self.record_freeze_all(len);
             return bytes;
         }
-        self.buf.split().freeze()
+        let bytes = self.buf.split().freeze();
+        #[cfg(feature = "telemetry")]
+        self.record_freeze_all(len);
+        bytes
     }
 
     pub fn take_tail(&mut self) -> BytesMut {
-        self.buf.split()
+        #[cfg(feature = "telemetry")]
+        let len = self.buf.len();
+        let tail = self.buf.split();
+        #[cfg(feature = "telemetry")]
+        self.record_tail(len);
+        tail
     }
 
     pub fn advance(&mut self, cnt: usize) -> Result<(), BufferError> {
@@ -331,6 +390,8 @@ impl HandoffBuffer {
             });
         }
         self.buf.advance(cnt);
+        #[cfg(feature = "telemetry")]
+        self.record_advance(cnt);
         Ok(())
     }
 
@@ -348,11 +409,23 @@ impl HandoffBuffer {
         }
     }
 
+    #[cfg(not(feature = "telemetry"))]
     fn reserve_spare_capacity(&mut self, reserve: usize) {
         let spare = self.buf.capacity().saturating_sub(self.buf.len());
         if spare < reserve {
             self.buf.reserve(reserve);
         }
+    }
+
+    #[cfg(feature = "telemetry")]
+    fn reserve_spare_capacity(&mut self, reserve: usize) -> usize {
+        let spare = self.buf.capacity().saturating_sub(self.buf.len());
+        if spare < reserve {
+            let capacity = self.buf.capacity();
+            self.buf.reserve(reserve);
+            return self.buf.capacity().saturating_sub(capacity);
+        }
+        0
     }
 
     fn check_limit(&self, additional: usize) -> Result<(), BufferError> {
@@ -389,6 +462,8 @@ impl HandoffBuffer {
 
     #[cfg(feature = "monoio")]
     fn store_monoio_read(&mut self, mut read_buf: BytesMut, read: usize) {
+        #[cfg(feature = "telemetry")]
+        let capacity = self.buf.capacity();
         match self.monoio_read_destination(read, read_buf.capacity()) {
             MonoioReadDestination::Empty => {}
             MonoioReadDestination::Swap => {
@@ -398,6 +473,8 @@ impl HandoffBuffer {
                 self.buf.extend_from_slice(&read_buf[..read]);
             }
         }
+        #[cfg(feature = "telemetry")]
+        self.record_buffer_growth(self.buf.capacity().saturating_sub(capacity));
         read_buf.clear();
         self.monoio_read_buf = read_buf;
     }
@@ -413,6 +490,64 @@ impl HandoffBuffer {
                 MonoioReadDestination::Swap
             }
             _ => MonoioReadDestination::Append,
+        }
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[inline(always)]
+    fn record_read(&self, read: usize) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.record_read(read, self.buf.len());
+        }
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[inline(always)]
+    fn record_buffer_growth(&self, bytes: usize) {
+        if bytes > 0 {
+            if let Some(telemetry) = &self.telemetry {
+                telemetry.record_buffer_growth(bytes);
+            }
+        }
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[inline(always)]
+    fn record_split_prefix(&self, bytes: usize, copied: bool) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.record_split_prefix(bytes, copied, self.buf.len());
+        }
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[inline(always)]
+    fn record_mutable_prefix(&self, bytes: usize) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.record_mutable_prefix(bytes, self.buf.len());
+        }
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[inline(always)]
+    fn record_freeze_all(&self, bytes: usize) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.record_freeze_all(bytes);
+        }
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[inline(always)]
+    fn record_advance(&self, bytes: usize) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.record_advance(bytes, self.buf.len());
+        }
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[inline(always)]
+    fn record_tail(&self, bytes: usize) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.record_tail(bytes);
         }
     }
 }
@@ -738,5 +873,48 @@ mod tests {
         assert_eq!(bytes, Bytes::from_static(b"tiny tunnel chunk"));
         assert!(buffer.is_empty());
         assert_eq!(buffer.capacity(), capacity);
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[tokio::test]
+    async fn telemetry_records_read_and_consume_activity() {
+        let telemetry = crate::read_telemetry::HandoffReadTelemetry::new(1);
+        let handle = crate::read_telemetry::HandoffReadTelemetryHandle::from_arc(&telemetry);
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let mut buffer = HandoffBuffer::new(128).with_telemetry(handle);
+
+        client
+            .write_all(b"route\npayload")
+            .await
+            .expect("write to duplex");
+        assert_eq!(
+            buffer
+                .read_available(&mut server)
+                .await
+                .expect("read bytes"),
+            13
+        );
+        let prefix = buffer.split_prefix(6).expect("split route");
+        assert_eq!(prefix, Bytes::from_static(b"route\n"));
+        buffer.advance(2).expect("advance payload prefix");
+        let tail = buffer.take_tail();
+        assert_eq!(&tail[..], b"yload");
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.read_calls, 1);
+        assert_eq!(snapshot.read_bytes, 13);
+        assert_eq!(snapshot.split_prefixes, 1);
+        assert_eq!(snapshot.copied_prefixes, 1);
+        assert_eq!(snapshot.advances, 1);
+        assert_eq!(snapshot.advanced_bytes, 2);
+        assert_eq!(snapshot.tails_taken, 1);
+        assert_eq!(snapshot.tail_bytes, 5);
+        assert!(snapshot.buffer_growths >= 1);
+        assert!(snapshot.buffered_bytes.count >= 4);
+        assert!(
+            telemetry
+                .export_prometheus()
+                .contains("bytes_handoff_read_read_calls")
+        );
     }
 }

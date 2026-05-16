@@ -8,9 +8,15 @@
 //!
 //! Enable the `monoio` feature to read into `HandoffBuffer` from
 //! `AsyncReadRent` sources in thread-local `monoio` runtimes.
+//!
+//! Enable the `telemetry` feature to attach `fast-telemetry` read counters and
+//! histograms to `HandoffBuffer`; the dependency and instrumentation are
+//! compiled out when the feature is disabled.
 
 mod error;
 mod read;
+#[cfg(feature = "telemetry")]
+mod read_telemetry;
 mod tune;
 mod write;
 
@@ -18,6 +24,11 @@ pub use error::{BackpressureReason, BufferError, WriteBackpressure, WriteError};
 pub use read::{
     DEFAULT_MONOIO_SPARSE_READ_COPY_DENOMINATOR, DEFAULT_SMALL_PREFIX_COPY_MAX, HandoffBuffer,
     HandoffBufferConfig, HandoffBufferPolicy, HandoffDrainCursor,
+};
+#[cfg(feature = "telemetry")]
+pub use read_telemetry::{
+    HandoffReadHistogramSummary, HandoffReadMetrics, HandoffReadMetricsSnapshot,
+    HandoffReadTelemetry, HandoffReadTelemetryHandle,
 };
 pub use tune::{
     DEFAULT_TUNING_BATCH_SIZE, DEFAULT_TUNING_MAX_READS_PER_FLUSH,
