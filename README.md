@@ -49,15 +49,23 @@ to read from `monoio::io::AsyncReadRent` sources without changing the
 bytes-handoff = { version = "1.2", features = ["monoio"] }
 ```
 
-Enable `telemetry` to attach `fast-telemetry` counters and histograms to
-`HandoffBuffer` read paths:
+Enable `telemetry` to attach `fast-telemetry` counters, histograms, and gauges to
+`HandoffBuffer` read paths. The base telemetry feature can snapshot metrics and
+serialize Prometheus or DogStatsD text:
 
 ```toml
 bytes-handoff = { version = "1.2", features = ["telemetry"] }
 ```
 
-Enable `telemetry-monoio` when your application also wants
-`fast-telemetry-export`'s Monoio-native exporter and local flushing helpers:
+Enable `telemetry-otlp` or `telemetry-clickhouse` when the parent application
+wants to serialize the read metrics into those `fast-telemetry` formats. Enable
+`telemetry-export`, `telemetry-export-dogstatsd`, `telemetry-export-otlp`, or
+`telemetry-export-clickhouse` when the parent also wants this crate to re-export
+`fast_telemetry_export` exporter loops for convenient wiring.
+
+Enable `telemetry-monoio` when the parent application wants the crate's Monoio
+read API plus `fast-telemetry-export`'s Monoio-native exporter and local
+flushing helpers:
 
 ```toml
 bytes-handoff = { version = "1.2", features = ["telemetry-monoio"] }
@@ -66,8 +74,9 @@ bytes-handoff = { version = "1.2", features = ["telemetry-monoio"] }
 The telemetry feature is disabled by default. When it is off, the optional
 `fast-telemetry` dependency, the buffer telemetry field, and the instrumentation
 calls are not compiled into the crate. The plain `telemetry` feature keeps
-metric recording runtime-neutral; `telemetry-monoio` only forwards the Monoio
-feature into `fast-telemetry-export`.
+metric recording runtime-neutral. Export loops are caller-owned and only become
+available through the explicit `telemetry-export*` features. The
+`telemetry-monoio` feature also enables the crate's `monoio` feature.
 
 The `bench-tools` feature is for this repository's harness binaries and should
 not be needed by library users.
@@ -358,8 +367,8 @@ assert_eq!(first_step.thresholds(), &[1]);
 
 The `telemetry` feature exposes `HandoffReadTelemetry` and
 `HandoffReadTelemetryHandle`, backed by `fast-telemetry 0.4`. Attach a handle to
-a buffer when you want read-path counters, size histograms, snapshots, or
-Prometheus export:
+a buffer when you want read-path counters, size histograms, peak gauges,
+snapshots, or text serialization:
 
 ```rust
 use bytes_handoff::{HandoffBuffer, HandoffReadTelemetry, HandoffReadTelemetryHandle};
@@ -371,14 +380,48 @@ let mut buffer = HandoffBuffer::new(64 * 1024).with_telemetry(handle);
 // Read, split, advance, freeze, and tail handoff operations update metrics.
 let snapshot = telemetry.snapshot();
 let prometheus = telemetry.export_prometheus();
+let mut dogstatsd = String::new();
+telemetry.export_dogstatsd(&mut dogstatsd, &[("component", "bytes_handoff")]);
 println!("{snapshot:?}");
 println!("{prometheus}");
 ```
 
+The read metric set covers successful reads, read errors, buffer-limit read
+errors, read-size and buffered-size distributions, peak buffered bytes, buffer
+growth, prefix split strategy, tail handoff, advance/freeze activity, and
+Monoio read-buffer copy versus swap decisions.
+
+For exporter loops, the parent application owns the task and destination. The
+crate exposes the metric schema and generated export methods:
+
+```rust
+use bytes_handoff::{HandoffReadMetricsDogStatsDState, HandoffReadTelemetry};
+
+let telemetry = HandoffReadTelemetry::with_available_parallelism();
+let mut state = HandoffReadMetricsDogStatsDState::new();
+let tags = [("service", "gateway")];
+
+tokio::spawn(bytes_handoff::telemetry_export::dogstatsd::run(
+    config,
+    cancel,
+    move |out| telemetry.export_dogstatsd_delta(out, &tags, &mut state),
+));
+```
+
+With `telemetry-otlp`, call `telemetry.export_otlp(out, timestamp)` from an
+OTLP exporter closure. With `telemetry-clickhouse`, call
+`telemetry.export_clickhouse(batch, timestamp)` from a ClickHouse exporter
+closure. Monoio applications can enable `telemetry-monoio` and use
+`bytes_handoff::telemetry_export::dogstatsd::run_monoio` or
+`bytes_handoff::telemetry_export::otlp::run_monoio`; ClickHouse export should
+usually stay on a private Tokio exporter because the ClickHouse transport is
+Tokio-based.
+
 The feature is intentionally opt-in. Without `features = ["telemetry"]`, the
 dependency and all read-buffer instrumentation are absent from the compiled
-crate. Use `telemetry-monoio` instead of `telemetry` when the owning application
-also wants `fast-telemetry-export`'s Monoio exporter/flusher support.
+crate. Use the narrow `telemetry-export*` features when the owning application
+wants exporter-loop re-exports, and use `telemetry-monoio` when those exporters
+should run inside Monoio workers.
 
 ## Monoio Feature
 

@@ -27,6 +27,7 @@ TCP_MSS_BYTES="${TCP_MSS_BYTES:-1460}"
 TCP_SHARD_MODE="${TCP_SHARD_MODE:-shared}"
 READ_RESERVE="16384"
 HANDOFF_FLUSH_BYTES=""
+READ_TELEMETRY="0"
 COALESCER_STATS="0"
 WRITE_PENDING_BYTES=""
 DUPLEX_CAPACITY="262144"
@@ -55,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --tcp-shard-mode) TCP_SHARD_MODE="$2"; shift 2 ;;
     --read-reserve) READ_RESERVE="$2"; shift 2 ;;
     --handoff-flush-bytes) HANDOFF_FLUSH_BYTES="$2"; shift 2 ;;
+    --read-telemetry) READ_TELEMETRY="1"; shift ;;
     --coalescer-stats) COALESCER_STATS="1"; shift ;;
     --write-pending-bytes) WRITE_PENDING_BYTES="$2"; shift 2 ;;
     --duplex-capacity) DUPLEX_CAPACITY="$2"; shift 2 ;;
@@ -66,7 +68,7 @@ while [[ $# -gt 0 ]]; do
     --help)
       echo "Usage: $0 [--transport duplex|cached|tcp] [--implementation handoff|monoio_handoff|bytesmut_handoff|manual_vec|raw_copy] [--scenario fragmented|coalesced|all] [--completion ticket|fire_and_forget] [--worker-threads N] [--connections N] [--runs N]"
       echo "          [--route-frames N] [--frame-len N] [--tunnel-bytes N] [--input-fragment N] [--input-model fixed|tcp] [--tcp-mss-bytes N] [--tcp-shard-mode shared|direct]"
-      echo "          [--read-reserve N] [--handoff-flush-bytes N] [--coalescer-stats] [--write-pending-bytes N] [--duplex-capacity N] [--iterations N] [--duration-seconds N]"
+      echo "          [--read-reserve N] [--handoff-flush-bytes N] [--read-telemetry] [--coalescer-stats] [--write-pending-bytes N] [--duplex-capacity N] [--iterations N] [--duration-seconds N]"
       echo "          [--service-cores CPUSET --driver-cores CPUSET] [--idle-timeout-millis N]"
       echo ""
       echo "Environment:"
@@ -135,6 +137,22 @@ case "$COMPLETION" in
     exit 1
     ;;
 esac
+case "$READ_TELEMETRY" in
+  0|1) ;;
+  *)
+    echo "ERROR: unsupported read telemetry flag '$READ_TELEMETRY'"
+    exit 1
+    ;;
+esac
+
+CARGO_FEATURES="${CARGO_FEATURES:-bench-tools}"
+if [[ "$READ_TELEMETRY" == "1" ]]; then
+  if [[ "$IMPLEMENTATION" == "monoio_handoff" ]]; then
+    CARGO_FEATURES="$CARGO_FEATURES,telemetry-monoio"
+  else
+    CARGO_FEATURES="$CARGO_FEATURES,telemetry"
+  fi
+fi
 
 mkdir -p "$RESULTS_DIR"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
@@ -153,6 +171,8 @@ else
   echo "handoff_flush_bytes=default_16384"
 fi
 echo "coalescer_stats_enabled=$COALESCER_STATS"
+echo "read_telemetry_enabled=$READ_TELEMETRY"
+echo "cargo_features=$CARGO_FEATURES"
 if [[ -n "$SERVICE_CORES" || -n "$DRIVER_CORES" ]]; then
   echo "split_tcp_service_cores=${SERVICE_CORES:-none} split_tcp_driver_cores=${DRIVER_CORES:-none} idle_timeout_millis=$IDLE_TIMEOUT_MILLIS"
 fi
@@ -172,7 +192,7 @@ else
 fi
 echo "results=$RUN_DIR"
 
-cargo build --release --bin bench_stream_harness --features bench-tools --manifest-path "$CRATE_DIR/Cargo.toml"
+cargo build --release --bin bench_stream_harness --features "$CARGO_FEATURES" --manifest-path "$CRATE_DIR/Cargo.toml"
 
 BIN="$CRATE_DIR/target/release/bench_stream_harness"
 if [[ ! -x "$BIN" ]]; then
@@ -210,6 +230,9 @@ run_one_scenario() {
   fi
   if [[ "$COALESCER_STATS" == "1" ]]; then
     cmd+=(--coalescer-stats)
+  fi
+  if [[ "$READ_TELEMETRY" == "1" ]]; then
+    cmd+=(--read-telemetry)
   fi
   if [[ -n "${ITERATIONS:-}" ]]; then
     cmd+=(--iterations "$ITERATIONS")

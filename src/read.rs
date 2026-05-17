@@ -267,7 +267,7 @@ impl HandoffBuffer {
         #[cfg(not(feature = "telemetry"))]
         self.reserve_spare_capacity(reserve);
         let len = self.buf.len();
-        let read = poll_fn(|cx| {
+        let read = match poll_fn(|cx| {
             let spare = &mut self.buf.spare_capacity_mut()[..reserve];
             let mut read_buf = ReadBuf::uninit(spare);
             match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
@@ -278,7 +278,15 @@ impl HandoffBuffer {
                 std::task::Poll::Pending => std::task::Poll::Pending,
             }
         })
-        .await?;
+        .await
+        {
+            Ok(read) => read,
+            Err(err) => {
+                #[cfg(feature = "telemetry")]
+                self.record_read_error(false);
+                return Err(BufferError::Io(err));
+            }
+        };
         // SAFETY: `poll_read` initialized exactly `read` bytes in the spare
         // capacity exposed through `ReadBuf`.
         unsafe {
@@ -298,7 +306,14 @@ impl HandoffBuffer {
         let read_buf = self.take_monoio_read_buffer(reserve);
         let read_slice = read_buf.slice_mut(..reserve);
         let (result, read_slice) = reader.read(read_slice).await;
-        let read = result?;
+        let read = match result {
+            Ok(read) => read,
+            Err(err) => {
+                #[cfg(feature = "telemetry")]
+                self.record_read_error(false);
+                return Err(BufferError::Io(err));
+            }
+        };
         let mut read_buf = read_slice.into_inner();
         self.check_monoio_read_len(read, reserve)?;
         normalize_monoio_read_buffer(&mut read_buf, read);
@@ -401,10 +416,14 @@ impl HandoffBuffer {
 
     fn read_reserve(&self) -> Result<usize, BufferError> {
         match self.remaining_capacity().min(self.config.read_reserve) {
-            0 => Err(BufferError::LimitExceeded {
-                attempted: self.buf.len().saturating_add(1),
-                limit: self.config.max_len,
-            }),
+            0 => {
+                #[cfg(feature = "telemetry")]
+                self.record_read_error(true);
+                Err(BufferError::LimitExceeded {
+                    attempted: self.buf.len().saturating_add(1),
+                    limit: self.config.max_len,
+                })
+            }
             reserve => Ok(reserve),
         }
     }
@@ -453,10 +472,14 @@ impl HandoffBuffer {
     fn check_monoio_read_len(&self, read: usize, reserve: usize) -> Result<(), BufferError> {
         match read.cmp(&reserve) {
             Ordering::Less | Ordering::Equal => Ok(()),
-            Ordering::Greater => Err(BufferError::LimitExceeded {
-                attempted: self.buf.len().saturating_add(read),
-                limit: self.config.max_len,
-            }),
+            Ordering::Greater => {
+                #[cfg(feature = "telemetry")]
+                self.record_read_error(true);
+                Err(BufferError::LimitExceeded {
+                    attempted: self.buf.len().saturating_add(read),
+                    limit: self.config.max_len,
+                })
+            }
         }
     }
 
@@ -464,7 +487,10 @@ impl HandoffBuffer {
     fn store_monoio_read(&mut self, mut read_buf: BytesMut, read: usize) {
         #[cfg(feature = "telemetry")]
         let capacity = self.buf.capacity();
-        match self.monoio_read_destination(read, read_buf.capacity()) {
+        let destination = self.monoio_read_destination(read, read_buf.capacity());
+        #[cfg(feature = "telemetry")]
+        self.record_monoio_read_destination(destination);
+        match destination {
             MonoioReadDestination::Empty => {}
             MonoioReadDestination::Swap => {
                 std::mem::swap(&mut self.buf, &mut read_buf);
@@ -498,6 +524,14 @@ impl HandoffBuffer {
     fn record_read(&self, read: usize) {
         if let Some(telemetry) = &self.telemetry {
             telemetry.record_read(read, self.buf.len());
+        }
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[inline(always)]
+    fn record_read_error(&self, limit_exceeded: bool) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.record_read_error(limit_exceeded);
         }
     }
 
@@ -550,6 +584,20 @@ impl HandoffBuffer {
             telemetry.record_tail(bytes);
         }
     }
+
+    #[cfg(all(feature = "telemetry", feature = "monoio"))]
+    #[inline(always)]
+    fn record_monoio_read_destination(&self, destination: MonoioReadDestination) {
+        match (&self.telemetry, destination) {
+            (Some(telemetry), MonoioReadDestination::Swap) => {
+                telemetry.record_monoio_read_buffer_swap();
+            }
+            (Some(telemetry), MonoioReadDestination::Append) => {
+                telemetry.record_monoio_read_buffer_copy();
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(feature = "monoio")]
@@ -578,6 +626,8 @@ fn normalize_monoio_read_buffer(read_buf: &mut BytesMut, read: usize) {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    #[cfg(feature = "monoio")]
+    use bytes::BytesMut;
     use tokio::io::AsyncWriteExt;
 
     use super::*;
@@ -903,6 +953,9 @@ mod tests {
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot.read_calls, 1);
         assert_eq!(snapshot.read_bytes, 13);
+        assert_eq!(snapshot.read_errors, 0);
+        assert_eq!(snapshot.read_error_limit_exceeded, 0);
+        assert_eq!(snapshot.max_buffered_bytes, 13);
         assert_eq!(snapshot.split_prefixes, 1);
         assert_eq!(snapshot.copied_prefixes, 1);
         assert_eq!(snapshot.advances, 1);
@@ -916,5 +969,55 @@ mod tests {
                 .export_prometheus()
                 .contains("bytes_handoff_read_read_calls")
         );
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[tokio::test]
+    async fn telemetry_records_read_limit_errors() {
+        let telemetry = crate::read_telemetry::HandoffReadTelemetry::new(1);
+        let handle = crate::read_telemetry::HandoffReadTelemetryHandle::from_arc(&telemetry);
+        let (_client, mut server) = tokio::io::duplex(64);
+        let mut buffer = HandoffBuffer::new(0).with_telemetry(handle);
+
+        let err = buffer
+            .read_available(&mut server)
+            .await
+            .expect_err("zero-sized buffer rejects reads");
+        assert!(matches!(
+            err,
+            BufferError::LimitExceeded {
+                attempted: 1,
+                limit: 0
+            }
+        ));
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.read_calls, 0);
+        assert_eq!(snapshot.read_errors, 1);
+        assert_eq!(snapshot.read_error_limit_exceeded, 1);
+    }
+
+    #[cfg(all(feature = "telemetry", feature = "monoio"))]
+    #[test]
+    fn telemetry_records_monoio_read_storage_decisions() {
+        let telemetry = crate::read_telemetry::HandoffReadTelemetry::new(1);
+        let handle = crate::read_telemetry::HandoffReadTelemetryHandle::from_arc(&telemetry);
+        let mut buffer = HandoffBuffer::new(16 * 1024).with_telemetry(handle);
+
+        let mut sparse = BytesMut::with_capacity(16 * 1024);
+        sparse.extend_from_slice(&vec![b'x'; 1460]);
+        buffer.store_monoio_read(sparse, 1460);
+        buffer.record_read(1460);
+        assert_eq!(buffer.freeze_all().len(), 1460);
+
+        let mut dense = BytesMut::with_capacity(16 * 1024);
+        dense.extend_from_slice(&vec![b'y'; 16 * 1024]);
+        buffer.store_monoio_read(dense, 16 * 1024);
+        buffer.record_read(16 * 1024);
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.monoio_read_buffer_copies, 1);
+        assert_eq!(snapshot.monoio_read_buffer_swaps, 1);
+        assert_eq!(snapshot.max_buffered_bytes, 16 * 1024);
     }
 }

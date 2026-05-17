@@ -21,7 +21,7 @@ resolver = "3"
 [dependencies]
 bytes = "1.11"
 fast-telemetry = { version = "0.4", optional = true }
-fast-telemetry-export = { version = "0.4", optional = true }
+fast-telemetry-export = { version = "0.4", optional = true, default-features = false }
 hdrhistogram = { version = "7", optional = true }
 libc = { version = "0.2", optional = true }
 monoio = { version = "0.2.4", default-features = false, features = ["bytes", "legacy"], optional = true }
@@ -39,7 +39,17 @@ bench-tools = [
 ]
 monoio = ["dep:monoio"]
 telemetry = ["dep:fast-telemetry"]
-telemetry-monoio = ["telemetry", "dep:fast-telemetry-export", "fast-telemetry-export/monoio"]
+telemetry-otlp = ["telemetry", "fast-telemetry/otlp"]
+telemetry-clickhouse = ["telemetry", "fast-telemetry/clickhouse"]
+telemetry-export-dogstatsd = ["telemetry", "dep:fast-telemetry-export", "fast-telemetry-export/dogstatsd"]
+telemetry-export-otlp = ["telemetry-otlp", "dep:fast-telemetry-export", "fast-telemetry-export/otlp"]
+telemetry-export-clickhouse = [
+    "telemetry-clickhouse",
+    "dep:fast-telemetry-export",
+    "fast-telemetry-export/clickhouse",
+]
+telemetry-export = ["telemetry-export-dogstatsd", "telemetry-export-otlp"]
+telemetry-monoio = ["monoio", "telemetry-export", "fast-telemetry-export/monoio"]
 
 [dev-dependencies]
 criterion = "0.5"
