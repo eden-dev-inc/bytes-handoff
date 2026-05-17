@@ -46,8 +46,37 @@ to read from `monoio::io::AsyncReadRent` sources without changing the
 `HandoffBuffer` parsing model:
 
 ```toml
-bytes-handoff = { version = "1.1", features = ["monoio"] }
+bytes-handoff = { version = "1.2", features = ["monoio"] }
 ```
+
+Enable `telemetry` to attach `fast-telemetry` counters, histograms, and gauges to
+`HandoffBuffer` read paths. The base telemetry feature can snapshot metrics and
+serialize Prometheus or DogStatsD text:
+
+```toml
+bytes-handoff = { version = "1.2", features = ["telemetry"] }
+```
+
+Enable `telemetry-otlp` or `telemetry-clickhouse` when the parent application
+wants to serialize the read metrics into those `fast-telemetry` formats. Enable
+`telemetry-export`, `telemetry-export-dogstatsd`, `telemetry-export-otlp`, or
+`telemetry-export-clickhouse` when the parent also wants this crate to re-export
+`fast_telemetry_export` exporter loops for convenient wiring.
+
+Enable `telemetry-monoio` when the parent application wants the crate's Monoio
+read API plus `fast-telemetry-export`'s Monoio-native exporter and local
+flushing helpers:
+
+```toml
+bytes-handoff = { version = "1.2", features = ["telemetry-monoio"] }
+```
+
+The telemetry feature is disabled by default. When it is off, the optional
+`fast-telemetry` dependency, the buffer telemetry field, and the instrumentation
+calls are not compiled into the crate. The plain `telemetry` feature keeps
+metric recording runtime-neutral. Export loops are caller-owned and only become
+available through the explicit `telemetry-export*` features. The
+`telemetry-monoio` feature also enables the crate's `monoio` feature.
 
 The `bench-tools` feature is for this repository's harness binaries and should
 not be needed by library users.
@@ -84,6 +113,9 @@ The repository includes small runnable examples:
   full payload.
 - `content_routing`: inspect buffered bytes, route complete safe prefixes, then
   switch to a raw tunnel while preserving already-read tail bytes.
+- `read_and_drain`: inspect buffered bytes with a cursor and commit only the
+  bytes accepted by the parser.
+- `read_policy`: configure prefix-copy and Monoio sparse-read handoff policy.
 - `write_handoff`: submit owned bytes to an async writer and await completion.
 - `write_coalescer`: batch tiny fire-and-forget writes and flush at a message
   boundary.
@@ -91,14 +123,19 @@ The repository includes small runnable examples:
   throughput and flush-delay points.
 - `monoio_line_protocol`: read newline-delimited frames from a Monoio
   `AsyncReadRent` source. Requires the `monoio` feature.
+- `read_telemetry`: attach `fast-telemetry` read metrics. Requires the
+  `telemetry` feature.
 
 Run one with:
 
 ```bash
 cargo run --example content_routing
+cargo run --example read_and_drain
+cargo run --example read_policy
 cargo run --example write_coalescer
 cargo run --example coalescing_tuner
 cargo run --features monoio --example monoio_line_protocol
+cargo run --features telemetry --example read_telemetry
 ```
 
 ## Read Handoff
@@ -131,6 +168,40 @@ where
 /// Sends an owned byte slice to sync or async protocol work.
 fn send_to_worker(_: Bytes) {}
 ```
+
+## Read Drain And Policy
+
+`HandoffBuffer::drain` gives parsers a cursor over buffered bytes and commits
+the consumed prefix only if the parser closure succeeds. `read_and_drain`
+combines one read with that cursor pattern:
+
+```rust
+use bytes_handoff::{BufferError, HandoffBuffer};
+
+async fn drain_lines<R>(reader: &mut R) -> Result<Vec<String>, Box<dyn std::error::Error>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buffer = HandoffBuffer::new(64 * 1024);
+    let (_, frames) = buffer
+        .read_and_drain(reader, |cursor| {
+            let mut frames = Vec::new();
+            while let Some(newline) = cursor.remaining().iter().position(|b| *b == b'\n') {
+                let frame = &cursor.remaining()[..newline + 1];
+                frames.push(String::from_utf8_lossy(frame).trim_end().to_owned());
+                cursor.consume(newline + 1)?;
+            }
+            Ok::<_, BufferError>(frames)
+        })
+        .await?;
+    Ok(frames)
+}
+```
+
+`HandoffBufferPolicy` controls small immutable prefix copies and the Monoio
+sparse-read buffer swap heuristic. The default keeps tiny prefixes from holding
+large read allocations while still allowing larger prefixes to use
+`BytesMut::split_to(...).freeze()`.
 
 ## Write Handoff
 
@@ -292,12 +363,72 @@ let first_step = search.step(std::iter::empty())?;
 assert_eq!(first_step.thresholds(), &[1]);
 ```
 
+## Telemetry Feature
+
+The `telemetry` feature exposes `HandoffReadTelemetry` and
+`HandoffReadTelemetryHandle`, backed by `fast-telemetry 0.4`. Attach a handle to
+a buffer when you want read-path counters, size histograms, peak gauges,
+snapshots, or text serialization:
+
+```rust
+use bytes_handoff::{HandoffBuffer, HandoffReadTelemetry, HandoffReadTelemetryHandle};
+
+let telemetry = HandoffReadTelemetry::with_available_parallelism();
+let handle = HandoffReadTelemetryHandle::from_arc(&telemetry);
+let mut buffer = HandoffBuffer::new(64 * 1024).with_telemetry(handle);
+
+// Read, split, advance, freeze, and tail handoff operations update metrics.
+let snapshot = telemetry.snapshot();
+let prometheus = telemetry.export_prometheus();
+let mut dogstatsd = String::new();
+telemetry.export_dogstatsd(&mut dogstatsd, &[("component", "bytes_handoff")]);
+println!("{snapshot:?}");
+println!("{prometheus}");
+```
+
+The read metric set covers successful reads, read errors, buffer-limit read
+errors, read-size and buffered-size distributions, peak buffered bytes, buffer
+growth, prefix split strategy, tail handoff, advance/freeze activity, and
+Monoio read-buffer copy versus swap decisions.
+
+For exporter loops, the parent application owns the task and destination. The
+crate exposes the metric schema and generated export methods:
+
+```rust
+use bytes_handoff::{HandoffReadMetricsDogStatsDState, HandoffReadTelemetry};
+
+let telemetry = HandoffReadTelemetry::with_available_parallelism();
+let mut state = HandoffReadMetricsDogStatsDState::new();
+let tags = [("service", "gateway")];
+
+tokio::spawn(bytes_handoff::telemetry_export::dogstatsd::run(
+    config,
+    cancel,
+    move |out| telemetry.export_dogstatsd_delta(out, &tags, &mut state),
+));
+```
+
+With `telemetry-otlp`, call `telemetry.export_otlp(out, timestamp)` from an
+OTLP exporter closure. With `telemetry-clickhouse`, call
+`telemetry.export_clickhouse(batch, timestamp)` from a ClickHouse exporter
+closure. Monoio applications can enable `telemetry-monoio` and use
+`bytes_handoff::telemetry_export::dogstatsd::run_monoio` or
+`bytes_handoff::telemetry_export::otlp::run_monoio`; ClickHouse export should
+usually stay on a private Tokio exporter because the ClickHouse transport is
+Tokio-based.
+
+The feature is intentionally opt-in. Without `features = ["telemetry"]`, the
+dependency and all read-buffer instrumentation are absent from the compiled
+crate. Use the narrow `telemetry-export*` features when the owning application
+wants exporter-loop re-exports, and use `telemetry-monoio` when those exporters
+should run inside Monoio workers.
+
 ## Monoio Feature
 
 Enable `monoio` to use Monoio's ownership-based I/O traits directly:
 
 ```toml
-bytes-handoff = { version = "1.1", features = ["monoio"] }
+bytes-handoff = { version = "1.2", features = ["monoio"] }
 ```
 
 With the feature enabled, `HandoffBuffer::read_available_monoio` accepts
@@ -379,8 +510,8 @@ See [`bench/README.md`](bench/README.md).
 
 ### Cached Implementation Comparison
 
-These are cached end-to-end harness results from the v1.1.0 release validation
-run on a 16 physical core Linux host, not Criterion microbenchmarks. The cached
+These are cached end-to-end harness results from a release validation run on a
+16 physical core Linux host, not Criterion microbenchmarks. The cached
 transport feeds each proxy from prebuilt payload bytes and writes into a
 counting sink, so client, sink, live TCP, and kernel scheduling costs are not
 part of the headline number. Treat these rows as runtime and handoff-path
@@ -556,6 +687,7 @@ single headline throughput number.
 | `read_owned_lines/manual_vec_copy` | Direct `read(&mut [u8])` loop that appends to persistent state, preserves partial lines, finds complete frames, and copies each frame into a new `Vec<u8>`. | Owned-frame control without `BytesMut`/`Bytes` splitting. |
 | `read_owned_lines/bytesmut_split` | Direct `BytesMut` implementation: read into persistent mutable state and split complete frames into owned `Bytes`. | The closest baseline for wrapper overhead. |
 | `read_owned_lines/handoff_buffer` | `HandoffBuffer`: same owned-frame workload, with max-length enforcement and the crate API around the buffer lifecycle. | Content-routed streams where buffering rules should live behind a small API. |
+| `read_telemetry_cost` | `HandoffBuffer` line parsing with telemetry compiled out, compiled in but unattached, and attached to a real `HandoffReadTelemetry` handle. | Estimating read-path telemetry recording overhead before enabling it in a hot deployment. |
 | `read_handoff_fragmentation_sweep` | The same `HandoffBuffer` line workload at different read reserve sizes. | Understanding sensitivity to tiny, fragmented reads versus coalesced reads. |
 | `split_freeze_prefixes` | Cost of repeatedly splitting owned `Bytes` prefixes out of buffered state. | Many complete frames already buffered. |
 | `split_prefix_mut` | Cost of splitting `BytesMut` prefixes without freezing them into `Bytes`. | Hot paths that keep mutable owned frames. |

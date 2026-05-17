@@ -3,12 +3,16 @@ use bytes_handoff::{
     DEFAULT_WRITE_COALESCE_THRESHOLD, HandoffBuffer, HandoffBufferConfig, WriteCoalescer,
     WriteCoalescerStats, WriteHandoff, WriteHandoffConfig,
 };
+#[cfg(feature = "telemetry")]
+use bytes_handoff::{HandoffReadTelemetry, HandoffReadTelemetryHandle};
 use hdrhistogram::Histogram;
 use monoio::buf::IoBufMut as _;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
+#[cfg(feature = "telemetry")]
+use std::sync::OnceLock;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
 #[cfg(target_os = "linux")]
@@ -228,6 +232,7 @@ struct Config {
     tcp_shard_mode: TcpShardMode,
     read_reserve: usize,
     handoff_flush_bytes: usize,
+    read_telemetry: bool,
     coalescer_stats: bool,
     write_pending_bytes: usize,
     duplex_capacity: usize,
@@ -283,6 +288,123 @@ impl Config {
         } else {
             self.write_pending_bytes
         }
+    }
+}
+
+#[cfg(feature = "telemetry")]
+static READ_TELEMETRY: OnceLock<Arc<HandoffReadTelemetry>> = OnceLock::new();
+
+fn new_handoff_buffer(config: Config, expected_len: usize) -> HandoffBuffer {
+    let buffer = HandoffBuffer::with_config(
+        HandoffBufferConfig::new(expected_len + config.read_reserve)
+            .with_read_reserve(config.read_reserve),
+    );
+    attach_read_telemetry(buffer, config.read_telemetry)
+}
+
+#[cfg(feature = "telemetry")]
+fn attach_read_telemetry(buffer: HandoffBuffer, enabled: bool) -> HandoffBuffer {
+    match enabled {
+        true => {
+            let telemetry =
+                READ_TELEMETRY.get_or_init(HandoffReadTelemetry::with_available_parallelism);
+            buffer.with_telemetry(HandoffReadTelemetryHandle::from_arc(telemetry))
+        }
+        false => buffer,
+    }
+}
+
+#[cfg(not(feature = "telemetry"))]
+fn attach_read_telemetry(buffer: HandoffBuffer, enabled: bool) -> HandoffBuffer {
+    debug_assert!(!enabled);
+    let _ = enabled;
+    buffer
+}
+
+fn print_read_telemetry(config: Config) {
+    if !config.read_telemetry {
+        return;
+    }
+
+    #[cfg(feature = "telemetry")]
+    {
+        let snapshot = READ_TELEMETRY
+            .get()
+            .expect("read telemetry enabled but no telemetry handle was created")
+            .snapshot();
+        println!("read_telemetry_read_calls={}", snapshot.read_calls);
+        println!("read_telemetry_read_bytes={}", snapshot.read_bytes);
+        println!("read_telemetry_read_errors={}", snapshot.read_errors);
+        println!(
+            "read_telemetry_read_error_limit_exceeded={}",
+            snapshot.read_error_limit_exceeded
+        );
+        println!("read_telemetry_zero_reads={}", snapshot.zero_reads);
+        println!("read_telemetry_buffer_growths={}", snapshot.buffer_growths);
+        println!(
+            "read_telemetry_buffer_growth_bytes={}",
+            snapshot.buffer_growth_bytes
+        );
+        println!(
+            "read_telemetry_max_buffered_bytes={}",
+            snapshot.max_buffered_bytes
+        );
+        println!("read_telemetry_split_prefixes={}", snapshot.split_prefixes);
+        println!(
+            "read_telemetry_split_prefix_bytes={}",
+            snapshot.split_prefix_bytes
+        );
+        println!("read_telemetry_copied_prefixes={}", snapshot.copied_prefixes);
+        println!(
+            "read_telemetry_copied_prefix_bytes={}",
+            snapshot.copied_prefix_bytes
+        );
+        println!("read_telemetry_frozen_prefixes={}", snapshot.frozen_prefixes);
+        println!(
+            "read_telemetry_frozen_prefix_bytes={}",
+            snapshot.frozen_prefix_bytes
+        );
+        println!("read_telemetry_mutable_prefixes={}", snapshot.mutable_prefixes);
+        println!(
+            "read_telemetry_mutable_prefix_bytes={}",
+            snapshot.mutable_prefix_bytes
+        );
+        println!(
+            "read_telemetry_freeze_all_calls={}",
+            snapshot.freeze_all_calls
+        );
+        println!(
+            "read_telemetry_freeze_all_bytes={}",
+            snapshot.freeze_all_bytes
+        );
+        println!("read_telemetry_advances={}", snapshot.advances);
+        println!("read_telemetry_advanced_bytes={}", snapshot.advanced_bytes);
+        println!("read_telemetry_tails_taken={}", snapshot.tails_taken);
+        println!("read_telemetry_tail_bytes={}", snapshot.tail_bytes);
+        println!(
+            "read_telemetry_monoio_read_buffer_swaps={}",
+            snapshot.monoio_read_buffer_swaps
+        );
+        println!(
+            "read_telemetry_monoio_read_buffer_copies={}",
+            snapshot.monoio_read_buffer_copies
+        );
+        println!(
+            "read_telemetry_read_size_count={}",
+            snapshot.read_size_bytes.count
+        );
+        println!(
+            "read_telemetry_read_size_sum={}",
+            snapshot.read_size_bytes.sum
+        );
+        println!(
+            "read_telemetry_buffered_bytes_count={}",
+            snapshot.buffered_bytes.count
+        );
+        println!(
+            "read_telemetry_buffered_bytes_sum={}",
+            snapshot.buffered_bytes.sum
+        );
     }
 }
 
@@ -481,6 +603,7 @@ fn parse_args() -> Cli {
     let mut tcp_shard_mode = TcpShardMode::Shared;
     let mut read_reserve = 16 * 1024usize;
     let mut handoff_flush_bytes = 0usize;
+    let mut read_telemetry = false;
     let mut coalescer_stats = false;
     let mut write_pending_bytes = 0usize;
     let mut duplex_capacity = 256 * 1024usize;
@@ -572,6 +695,10 @@ fn parse_args() -> Cli {
                     .expect("--handoff-flush-bytes must be an integer");
                 i += 2;
             }
+            "--read-telemetry" => {
+                read_telemetry = true;
+                i += 1;
+            }
             "--coalescer-stats" => {
                 coalescer_stats = true;
                 i += 1;
@@ -620,7 +747,7 @@ fn parse_args() -> Cli {
             }
             "--help" => {
                 println!(
-                    "Usage: bench_stream_harness [--transport duplex|cached|tcp] [--role integrated|tcp-service|tcp-driver] [--implementation handoff|monoio_handoff|bytesmut_handoff|manual_vec|raw_copy] [--scenario fragmented|coalesced] [--completion ticket|fire_and_forget] [--worker-threads N] [--connections N] [--route-frames N] [--frame-len N] [--tunnel-bytes N] [--input-fragment N] [--input-model fixed|tcp] [--tcp-mss-bytes N] [--tcp-shard-mode shared|direct] [--read-reserve N] [--handoff-flush-bytes N] [--coalescer-stats] [--write-pending-bytes N] [--duplex-capacity N] [--iterations N] [--duration-seconds N] [--service-addr HOST:PORT] [--sink-addr HOST:PORT] [--ready-file PATH] [--idle-timeout-millis N]"
+                    "Usage: bench_stream_harness [--transport duplex|cached|tcp] [--role integrated|tcp-service|tcp-driver] [--implementation handoff|monoio_handoff|bytesmut_handoff|manual_vec|raw_copy] [--scenario fragmented|coalesced] [--completion ticket|fire_and_forget] [--worker-threads N] [--connections N] [--route-frames N] [--frame-len N] [--tunnel-bytes N] [--input-fragment N] [--input-model fixed|tcp] [--tcp-mss-bytes N] [--tcp-shard-mode shared|direct] [--read-reserve N] [--handoff-flush-bytes N] [--read-telemetry] [--coalescer-stats] [--write-pending-bytes N] [--duplex-capacity N] [--iterations N] [--duration-seconds N] [--service-addr HOST:PORT] [--sink-addr HOST:PORT] [--ready-file PATH] [--idle-timeout-millis N]"
                 );
                 println!("  duplex: in-memory client/proxy/sink transport");
                 println!("  cached: prebuilt payload reader plus counting sink, without driver/sink tasks");
@@ -645,6 +772,9 @@ fn parse_args() -> Cli {
                 );
                 println!(
                     "  tcp-shard-mode=direct: monoio split TCP workers bind base_port + worker_id and clients connect by shard"
+                );
+                println!(
+                    "  read-telemetry: attach fast-telemetry read metrics to HandoffBuffer"
                 );
                 std::process::exit(0);
             }
@@ -672,6 +802,10 @@ fn parse_args() -> Cli {
     assert!(
         duration_seconds >= 0.0,
         "--duration-seconds must be zero or positive"
+    );
+    assert!(
+        cfg!(feature = "telemetry") || !read_telemetry,
+        "--read-telemetry requires building the harness with the telemetry feature"
     );
 
     if !input_fragment_set && matches!(scenario, Scenario::Coalesced) {
@@ -728,6 +862,7 @@ fn parse_args() -> Cli {
         tcp_shard_mode,
         read_reserve,
         handoff_flush_bytes,
+        read_telemetry,
         coalescer_stats,
         write_pending_bytes,
         duplex_capacity,
@@ -1942,10 +2077,7 @@ where
     } else {
         WriteCoalescer::with_threshold(handoff.clone(), config.handoff_flush_bytes)
     };
-    let mut buffer = HandoffBuffer::with_config(
-        HandoffBufferConfig::new(expected_len + config.read_reserve)
-            .with_read_reserve(config.read_reserve),
-    );
+    let mut buffer = new_handoff_buffer(config, expected_len);
     let mut tunnel = false;
 
     loop {
@@ -2025,10 +2157,7 @@ where
     let read_buffer_coalescing = should_coalesce_in_read_buffer(config);
     let mut tunnel_recorder =
         BufferedTunnelRecorder::new(config.coalescer_stats && read_buffer_coalescing);
-    let mut buffer = HandoffBuffer::with_config(
-        HandoffBufferConfig::new(expected_len + config.read_reserve)
-            .with_read_reserve(config.read_reserve),
-    );
+    let mut buffer = new_handoff_buffer(config, expected_len);
     let mut tunnel = false;
 
     loop {
@@ -2466,6 +2595,7 @@ fn main() {
     println!("tcp_shard_mode={}", config.tcp_shard_mode.as_str());
     println!("read_reserve={}", config.read_reserve);
     println!("handoff_flush_bytes={}", config.handoff_flush_bytes);
+    println!("read_telemetry_enabled={}", config.read_telemetry);
     println!("coalescer_stats_enabled={}", config.coalescer_stats);
     println!("write_pending_bytes={}", config.write_pending_bytes());
     println!("duplex_capacity={}", config.duplex_capacity);
@@ -2548,6 +2678,7 @@ fn main() {
         "coalescer_max_flush_wait_nanos={}",
         result.coalescer.max_flush_wait_nanos
     );
+    print_read_telemetry(config);
 }
 
 #[cfg(test)]
@@ -2571,6 +2702,7 @@ mod tests {
             tcp_shard_mode: TcpShardMode::Shared,
             read_reserve: 16 * 1024,
             handoff_flush_bytes: DEFAULT_WRITE_COALESCE_THRESHOLD,
+            read_telemetry: false,
             coalescer_stats: false,
             write_pending_bytes: 0,
             duplex_capacity: 256 * 1024,

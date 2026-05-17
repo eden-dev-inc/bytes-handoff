@@ -1,5 +1,7 @@
 use bytes::BytesMut;
 use bytes_handoff::{HandoffBuffer, HandoffBufferConfig};
+#[cfg(feature = "telemetry")]
+use bytes_handoff::{HandoffReadTelemetry, HandoffReadTelemetryHandle};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use memchr::memchr;
 use tokio::io::AsyncReadExt;
@@ -77,6 +79,37 @@ fn read_handoff_lines(rt: &Runtime, input: &[u8], read_reserve: usize) -> usize 
     })
 }
 
+#[cfg(feature = "telemetry")]
+fn read_handoff_lines_with_telemetry(
+    rt: &Runtime,
+    input: &[u8],
+    read_reserve: usize,
+    telemetry: &HandoffReadTelemetryHandle,
+) -> usize {
+    rt.block_on(async {
+        let mut reader = input;
+        let mut buffer = HandoffBuffer::with_config(
+            HandoffBufferConfig::new(input.len() + read_reserve).with_read_reserve(read_reserve),
+        )
+        .with_telemetry(telemetry.clone());
+        let mut frames = 0;
+
+        while !reader.is_empty() {
+            let read = buffer
+                .read_available(&mut reader)
+                .await
+                .expect("read from slice");
+            if read == 0 {
+                break;
+            }
+            frames += drain_lines(&mut buffer);
+        }
+
+        frames += drain_lines(&mut buffer);
+        black_box(frames)
+    })
+}
+
 #[cfg(feature = "monoio")]
 fn read_handoff_lines_monoio(rt: &mut MonoioRuntime, input: &[u8], read_reserve: usize) -> usize {
     rt.block_on(async {
@@ -84,6 +117,37 @@ fn read_handoff_lines_monoio(rt: &mut MonoioRuntime, input: &[u8], read_reserve:
         let mut buffer = HandoffBuffer::with_config(
             HandoffBufferConfig::new(input.len() + read_reserve).with_read_reserve(read_reserve),
         );
+        let mut frames = 0;
+
+        while !reader.is_empty() {
+            let read = buffer
+                .read_available_monoio(&mut reader)
+                .await
+                .expect("read from monoio slice");
+            if read == 0 {
+                break;
+            }
+            frames += drain_lines(&mut buffer);
+        }
+
+        frames += drain_lines(&mut buffer);
+        black_box(frames)
+    })
+}
+
+#[cfg(all(feature = "monoio", feature = "telemetry"))]
+fn read_handoff_lines_monoio_with_telemetry(
+    rt: &mut MonoioRuntime,
+    input: &[u8],
+    read_reserve: usize,
+    telemetry: &HandoffReadTelemetryHandle,
+) -> usize {
+    rt.block_on(async {
+        let mut reader = input;
+        let mut buffer = HandoffBuffer::with_config(
+            HandoffBufferConfig::new(input.len() + read_reserve).with_read_reserve(read_reserve),
+        )
+        .with_telemetry(telemetry.clone());
         let mut frames = 0;
 
         while !reader.is_empty() {
@@ -285,6 +349,63 @@ fn read_owned_line_benches(c: &mut Criterion) {
     group.finish();
 }
 
+fn read_telemetry_cost(c: &mut Criterion) {
+    let rt = runtime();
+    #[cfg(feature = "monoio")]
+    let mut monoio_rt = monoio_runtime();
+    let lines = line_payload(16 * 1024, 32);
+    #[cfg(feature = "telemetry")]
+    let telemetry = HandoffReadTelemetry::new(1);
+    #[cfg(feature = "telemetry")]
+    let handle = HandoffReadTelemetryHandle::from_arc(&telemetry);
+
+    let mut group = c.benchmark_group("read_telemetry_cost");
+    group.throughput(Throughput::Bytes(lines.len() as u64));
+    for read_size in [64, 16 * 1024] {
+        group.bench_with_input(
+            BenchmarkId::new("handoff_buffer", read_size),
+            &read_size,
+            |b, read_size| {
+                b.iter(|| read_handoff_lines(&rt, black_box(&lines), *read_size));
+            },
+        );
+        #[cfg(feature = "monoio")]
+        group.bench_with_input(
+            BenchmarkId::new("monoio_handoff_buffer", read_size),
+            &read_size,
+            |b, read_size| {
+                b.iter(|| read_handoff_lines_monoio(&mut monoio_rt, black_box(&lines), *read_size));
+            },
+        );
+        #[cfg(feature = "telemetry")]
+        group.bench_with_input(
+            BenchmarkId::new("handoff_buffer_attached", read_size),
+            &read_size,
+            |b, read_size| {
+                b.iter(|| {
+                    read_handoff_lines_with_telemetry(&rt, black_box(&lines), *read_size, &handle)
+                });
+            },
+        );
+        #[cfg(all(feature = "monoio", feature = "telemetry"))]
+        group.bench_with_input(
+            BenchmarkId::new("monoio_handoff_buffer_attached", read_size),
+            &read_size,
+            |b, read_size| {
+                b.iter(|| {
+                    read_handoff_lines_monoio_with_telemetry(
+                        &mut monoio_rt,
+                        black_box(&lines),
+                        *read_size,
+                        &handle,
+                    )
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 fn read_handoff_fragmentation_sweep(c: &mut Criterion) {
     let rt = runtime();
     #[cfg(feature = "monoio")]
@@ -387,6 +508,7 @@ criterion_group!(
     benches,
     read_raw_lower_bound,
     read_owned_line_benches,
+    read_telemetry_cost,
     read_handoff_fragmentation_sweep,
     split_and_tail_benches
 );
