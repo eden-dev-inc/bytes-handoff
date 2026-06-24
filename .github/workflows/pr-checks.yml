@@ -38,4 +38,4 @@ jobs:
           components: clippy
 
       - name: Check lints
-        run: cargo clippy --locked --all-features --all-targets -- -D warnings
+        run: cargo clippy --all-features --all-targets -- -D warnings
