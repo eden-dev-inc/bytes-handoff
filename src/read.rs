@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::BufferError;
 #[cfg(feature = "telemetry")]
-use crate::read_telemetry::HandoffReadTelemetryHandle;
+use crate::read_telemetry::{HandoffReadTelemetryHandle, HandoffReadTelemetryRuntime};
 
 pub const DEFAULT_SMALL_PREFIX_COPY_MAX: usize = 256;
 pub const DEFAULT_MONOIO_SPARSE_READ_COPY_DENOMINATOR: usize = 4;
@@ -186,9 +186,35 @@ impl HandoffBuffer {
     }
 
     #[cfg(feature = "telemetry")]
+    /// Attach read telemetry backed by a parent fast-telemetry runtime, or a
+    /// local runtime when `telemetry` is `None`.
+    ///
+    /// This creates a telemetry handle for this buffer. For many buffers sharing
+    /// one metric group, create one `HandoffReadTelemetry` and attach cloned
+    /// `HandoffReadTelemetryHandle`s with [`with_telemetry`](Self::with_telemetry).
+    pub fn with_optional_telemetry(
+        mut self,
+        telemetry: Option<HandoffReadTelemetryRuntime>,
+    ) -> Self {
+        self.attach_optional_telemetry(telemetry);
+        self
+    }
+
+    #[cfg(feature = "telemetry")]
     pub fn attach_telemetry(&mut self, telemetry: HandoffReadTelemetryHandle) {
         telemetry.record_buffered(self.buf.len());
         self.telemetry = Some(telemetry);
+    }
+
+    #[cfg(feature = "telemetry")]
+    /// Attach read telemetry backed by a parent fast-telemetry runtime, or a
+    /// local runtime when `telemetry` is `None`.
+    ///
+    /// This creates a telemetry handle for this buffer. For many buffers sharing
+    /// one metric group, create one `HandoffReadTelemetry` and attach cloned
+    /// `HandoffReadTelemetryHandle`s with [`attach_telemetry`](Self::attach_telemetry).
+    pub fn attach_optional_telemetry(&mut self, telemetry: Option<HandoffReadTelemetryRuntime>) {
+        self.attach_telemetry(HandoffReadTelemetryHandle::from_optional_runtime(telemetry));
     }
 
     #[cfg(feature = "telemetry")]
@@ -969,6 +995,33 @@ mod tests {
                 .export_prometheus()
                 .contains("bytes_handoff_read_read_calls")
         );
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn optional_telemetry_uses_parent_or_local_runtime() {
+        let parent_runtime = fast_telemetry::Runtime::new(fast_telemetry::RuntimeConfig::default());
+        let mut parent_buffer = HandoffBuffer::new(128)
+            .with_optional_telemetry(Some(std::sync::Arc::clone(&parent_runtime)));
+
+        parent_buffer.buf.extend_from_slice(b"parent");
+        parent_buffer.record_read(6);
+
+        assert_eq!(parent_runtime.registered_metrics_len(), 1);
+        let parent_handle = parent_buffer
+            .clear_telemetry()
+            .expect("parent telemetry handle");
+        assert_eq!(parent_handle.telemetry().snapshot().read_bytes, 6);
+
+        let mut local_buffer = HandoffBuffer::new(128).with_optional_telemetry(None);
+        local_buffer.buf.extend_from_slice(b"local");
+        local_buffer.record_read(5);
+        let local_handle = local_buffer
+            .clear_telemetry()
+            .expect("local telemetry handle");
+
+        assert_eq!(local_handle.telemetry().snapshot().read_bytes, 5);
+        assert_eq!(parent_handle.telemetry().snapshot().read_bytes, 6);
     }
 
     #[cfg(feature = "telemetry")]

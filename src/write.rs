@@ -10,19 +10,59 @@ use crate::{WriteBackpressure, WriteError};
 
 const MAX_BATCH_ITEMS: usize = 64;
 const MAX_BATCH_BYTES: usize = 1024 * 1024;
+/// Default bounded channel item budget for `WriteHandoff`.
+pub const DEFAULT_WRITE_MAX_ITEMS: usize = 1024;
+/// Default coalescer flush threshold for tiny fire-and-forget writes.
 pub const DEFAULT_WRITE_COALESCE_THRESHOLD: usize = 16 * 1024;
+/// Default number of coalescer-sized chunks allowed in the pending write budget.
+pub const DEFAULT_WRITE_PENDING_CHUNKS: usize = 8;
+/// Default pending byte budget for `WriteHandoff`.
+pub const DEFAULT_WRITE_MAX_PENDING_BYTES: usize =
+    DEFAULT_WRITE_COALESCE_THRESHOLD * DEFAULT_WRITE_PENDING_CHUNKS;
 
+/// Bounded queue and byte-budget settings for `WriteHandoff`.
+///
+/// The item budget limits accepted write messages waiting in the writer task's
+/// channel. The pending byte budget limits owned bytes accepted into the
+/// handoff but not yet released by the writer task.
 #[derive(Clone, Copy, Debug)]
 pub struct WriteHandoffConfig {
+    /// Maximum number of queued write messages.
     pub max_items: usize,
+    /// Maximum owned bytes pending in the handoff.
     pub max_pending_bytes: usize,
 }
 
 impl WriteHandoffConfig {
+    /// Creates an explicit write handoff configuration.
     pub fn new(max_items: usize, max_pending_bytes: usize) -> Self {
         Self {
             max_items,
             max_pending_bytes,
+        }
+    }
+
+    /// Returns this config with a different queued-item budget.
+    #[must_use]
+    pub fn with_max_items(mut self, max_items: usize) -> Self {
+        self.max_items = max_items;
+        self
+    }
+
+    /// Returns this config with a different pending-byte budget.
+    #[must_use]
+    pub fn with_max_pending_bytes(mut self, max_pending_bytes: usize) -> Self {
+        self.max_pending_bytes = max_pending_bytes;
+        self
+    }
+}
+
+impl Default for WriteHandoffConfig {
+    /// Uses the measured default write budgets.
+    fn default() -> Self {
+        Self {
+            max_items: DEFAULT_WRITE_MAX_ITEMS,
+            max_pending_bytes: DEFAULT_WRITE_MAX_PENDING_BYTES,
         }
     }
 }
@@ -101,6 +141,12 @@ fn nanos_u64(duration: std::time::Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
+fn nanos_between(start: Instant, end: Instant) -> u64 {
+    end.checked_duration_since(start)
+        .map(nanos_u64)
+        .unwrap_or(0)
+}
+
 impl WriteCoalescerConfig {
     pub fn new(threshold_bytes: usize) -> Self {
         Self {
@@ -138,18 +184,63 @@ pub struct WriteCoalescer {
 
 #[derive(Debug)]
 pub struct WriteTicket {
-    rx: oneshot::Receiver<WriteCompletion>,
+    rx: WriteTicketReceiver,
 }
 
 #[derive(Debug)]
 pub struct WriteCompletion {
     result: Result<(), WriteError>,
+    stats: WriteCompletionStats,
+}
+
+/// Handoff-local completion timing for an accepted write request.
+///
+/// `queue_nanos` is measured from handoff acceptance until the writer task
+/// starts the batch containing this request. `write_nanos` is the elapsed
+/// writer call for that batch. `e2e_nanos` is measured from handoff acceptance
+/// until completion is delivered.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WriteCompletionStats {
+    pub bytes: usize,
+    pub queue_nanos: u64,
+    pub write_nanos: u64,
+    pub e2e_nanos: u64,
 }
 
 struct WriteRequest {
     bytes: Bytes,
-    completion: Option<oneshot::Sender<WriteCompletion>>,
+    completion: Option<oneshot::Sender<Result<(), WriteError>>>,
     budget_bytes: usize,
+}
+
+struct ObservedWriteRequest {
+    bytes: Bytes,
+    completion: Option<Box<ObservedWriteCompletion>>,
+    budget_bytes: usize,
+}
+
+type WriteCompletionCallback = Box<dyn FnOnce(WriteCompletion) + Send + 'static>;
+
+enum WriteCompletionTarget {
+    StatsTicket(oneshot::Sender<WriteCompletion>),
+    Callback(WriteCompletionCallback),
+}
+
+#[derive(Debug)]
+enum WriteTicketReceiver {
+    Result(oneshot::Receiver<Result<(), WriteError>>),
+    Completion(oneshot::Receiver<WriteCompletion>),
+}
+
+struct ObservedWriteCompletion {
+    target: ObservedWriteCompletionTarget,
+    bytes_len: usize,
+    accepted_at: Instant,
+}
+
+enum ObservedWriteCompletionTarget {
+    Ticket(oneshot::Sender<WriteCompletion>),
+    Callback(WriteCompletionCallback),
 }
 
 struct BudgetPermit<'a> {
@@ -159,6 +250,10 @@ struct BudgetPermit<'a> {
 
 enum WriteMessage {
     Write(WriteRequest),
+    FireAndForget(WriteRequest),
+    ObservedWrite(Box<ObservedWriteRequest>),
+    Drain(oneshot::Sender<Result<(), WriteError>>),
+    Flush(oneshot::Sender<Result<(), WriteError>>),
     Shutdown,
 }
 
@@ -194,7 +289,7 @@ enum BudgetAcquireError {
 impl WriteRequest {
     fn new(
         bytes: Bytes,
-        completion: Option<oneshot::Sender<WriteCompletion>>,
+        completion: Option<oneshot::Sender<Result<(), WriteError>>>,
         budget_bytes: usize,
     ) -> Self {
         Self {
@@ -211,6 +306,115 @@ impl WriteRequest {
     fn release_into_bytes(mut self, budget: &Budget) -> Bytes {
         self.release_budget(budget);
         self.bytes
+    }
+}
+
+impl ObservedWriteRequest {
+    fn new(bytes: Bytes, completion: Box<ObservedWriteCompletion>, budget_bytes: usize) -> Self {
+        Self {
+            bytes,
+            completion: Some(completion),
+            budget_bytes,
+        }
+    }
+
+    fn release_budget(&mut self, budget: &Budget) {
+        budget.release(std::mem::take(&mut self.budget_bytes));
+    }
+
+    fn release_into_bytes(mut self, budget: &Budget) -> Bytes {
+        self.release_budget(budget);
+        self.bytes
+    }
+}
+
+impl WriteMessage {
+    fn from_parts(
+        bytes: Bytes,
+        completion: Option<WriteCompletionTarget>,
+        budget_bytes: usize,
+    ) -> Self {
+        match completion {
+            Some(WriteCompletionTarget::StatsTicket(tx)) => {
+                let completion = Box::new(ObservedWriteCompletion::ticket(tx, bytes.len()));
+                Self::ObservedWrite(Box::new(ObservedWriteRequest::new(
+                    bytes,
+                    completion,
+                    budget_bytes,
+                )))
+            }
+            Some(WriteCompletionTarget::Callback(callback)) => {
+                let completion = Box::new(ObservedWriteCompletion::callback(callback, bytes.len()));
+                Self::ObservedWrite(Box::new(ObservedWriteRequest::new(
+                    bytes,
+                    completion,
+                    budget_bytes,
+                )))
+            }
+            None => Self::FireAndForget(WriteRequest::new(bytes, None, budget_bytes)),
+        }
+    }
+
+    fn release_into_bytes(self, budget: &Budget) -> Bytes {
+        match self {
+            Self::Write(request) => request.release_into_bytes(budget),
+            Self::FireAndForget(request) => request.release_into_bytes(budget),
+            Self::ObservedWrite(request) => request.release_into_bytes(budget),
+            Self::Drain(_) => unreachable!(),
+            Self::Flush(_) => unreachable!(),
+            Self::Shutdown => unreachable!(),
+        }
+    }
+}
+
+impl WriteCompletionTarget {
+    fn stats_ticket(tx: oneshot::Sender<WriteCompletion>) -> Self {
+        Self::StatsTicket(tx)
+    }
+
+    fn callback(completion: WriteCompletionCallback) -> Self {
+        Self::Callback(completion)
+    }
+}
+
+impl ObservedWriteCompletion {
+    fn ticket(tx: oneshot::Sender<WriteCompletion>, bytes_len: usize) -> Self {
+        Self {
+            target: ObservedWriteCompletionTarget::Ticket(tx),
+            bytes_len,
+            accepted_at: Instant::now(),
+        }
+    }
+
+    fn callback(callback: WriteCompletionCallback, bytes_len: usize) -> Self {
+        Self {
+            target: ObservedWriteCompletionTarget::Callback(callback),
+            bytes_len,
+            accepted_at: Instant::now(),
+        }
+    }
+
+    fn stats(
+        &self,
+        write_started_at: Option<Instant>,
+        completed_at: Instant,
+    ) -> WriteCompletionStats {
+        let write_started_at = write_started_at.unwrap_or(completed_at);
+        WriteCompletionStats {
+            bytes: self.bytes_len,
+            queue_nanos: nanos_between(self.accepted_at, write_started_at),
+            write_nanos: nanos_between(write_started_at, completed_at),
+            e2e_nanos: nanos_between(self.accepted_at, completed_at),
+        }
+    }
+
+    fn complete(self, completion: WriteCompletion) {
+        match self.target {
+            ObservedWriteCompletionTarget::Ticket(tx) => {
+                let _ = tx.send(completion);
+            }
+            ObservedWriteCompletionTarget::Callback(callback) => callback(completion),
+        }
     }
 }
 
@@ -265,22 +469,119 @@ impl WriteHandoff {
 
     pub fn try_write(&self, bytes: Bytes) -> Result<WriteTicket, WriteBackpressure> {
         let (completion, rx) = oneshot::channel();
-        self.try_enqueue(bytes, Some(completion))?;
-        Ok(WriteTicket { rx })
+        self.try_enqueue_standard(bytes, Some(completion))?;
+        Ok(WriteTicket {
+            rx: WriteTicketReceiver::Result(rx),
+        })
+    }
+
+    pub fn try_write_with_completion_stats(
+        &self,
+        bytes: Bytes,
+    ) -> Result<WriteTicket, WriteBackpressure> {
+        let (completion, rx) = oneshot::channel();
+        self.try_enqueue(bytes, Some(WriteCompletionTarget::stats_ticket(completion)))?;
+        Ok(WriteTicket {
+            rx: WriteTicketReceiver::Completion(rx),
+        })
+    }
+
+    /// Attempts to enqueue a write and invoke `completion` from the writer task
+    /// when the accepted write succeeds, fails, or is closed before writing.
+    ///
+    /// The callback runs on the writer task, so it should do lightweight work
+    /// such as recording metrics or sending to another channel.
+    pub fn try_write_with_completion_callback<F>(
+        &self,
+        bytes: Bytes,
+        completion: F,
+    ) -> Result<(), WriteBackpressure>
+    where
+        F: FnOnce(WriteCompletion) + Send + 'static,
+    {
+        self.try_enqueue(
+            bytes,
+            Some(WriteCompletionTarget::callback(Box::new(completion))),
+        )
     }
 
     pub fn try_write_fire_and_forget(&self, bytes: Bytes) -> Result<(), WriteBackpressure> {
-        self.try_enqueue(bytes, None)
+        let request = self.try_standard_request(bytes, None)?;
+        self.try_send_request(WriteMessage::FireAndForget(request))
     }
 
     pub async fn write(&self, bytes: Bytes) -> Result<WriteTicket, WriteError> {
         let (completion, rx) = oneshot::channel();
-        self.enqueue(bytes, Some(completion)).await?;
-        Ok(WriteTicket { rx })
+        self.enqueue_standard(bytes, Some(completion)).await?;
+        Ok(WriteTicket {
+            rx: WriteTicketReceiver::Result(rx),
+        })
+    }
+
+    pub async fn write_with_completion_stats(
+        &self,
+        bytes: Bytes,
+    ) -> Result<WriteTicket, WriteError> {
+        let (completion, rx) = oneshot::channel();
+        self.enqueue(bytes, Some(WriteCompletionTarget::stats_ticket(completion)))
+            .await?;
+        Ok(WriteTicket {
+            rx: WriteTicketReceiver::Completion(rx),
+        })
+    }
+
+    /// Enqueues a write and invokes `completion` from the writer task when the
+    /// accepted write succeeds, fails, or is closed before writing.
+    ///
+    /// The callback runs on the writer task, so it should do lightweight work
+    /// such as recording metrics or sending to another channel.
+    pub async fn write_with_completion_callback<F>(
+        &self,
+        bytes: Bytes,
+        completion: F,
+    ) -> Result<(), WriteError>
+    where
+        F: FnOnce(WriteCompletion) + Send + 'static,
+    {
+        self.enqueue(
+            bytes,
+            Some(WriteCompletionTarget::callback(Box::new(completion))),
+        )
+        .await
     }
 
     pub async fn write_fire_and_forget(&self, bytes: Bytes) -> Result<(), WriteError> {
-        self.enqueue(bytes, None).await
+        match self.try_write_fire_and_forget(bytes) {
+            Ok(()) => Ok(()),
+            Err(err) => self.enqueue_standard(err.into_bytes(), None).await,
+        }
+    }
+
+    /// Waits for all previously accepted writes to reach the underlying writer.
+    ///
+    /// Unlike `flush`, this does not call `AsyncWrite::flush` on the writer.
+    pub async fn drain(&self) -> Result<(), WriteError> {
+        let (completion, rx) = oneshot::channel();
+        match self.tx.send(WriteMessage::Drain(completion)).await {
+            Ok(()) => rx.await.map_err(|_| WriteError::Closed)?,
+            Err(_) => {
+                self.mark_closed();
+                Err(WriteError::Closed)
+            }
+        }
+    }
+
+    /// Waits for all previously accepted writes to reach the underlying writer
+    /// and then flushes that writer.
+    pub async fn flush(&self) -> Result<(), WriteError> {
+        let (completion, rx) = oneshot::channel();
+        match self.tx.send(WriteMessage::Flush(completion)).await {
+            Ok(()) => rx.await.map_err(|_| WriteError::Closed)?,
+            Err(_) => {
+                self.mark_closed();
+                Err(WriteError::Closed)
+            }
+        }
     }
 
     pub fn pending_bytes(&self) -> usize {
@@ -296,28 +597,78 @@ impl WriteHandoff {
     fn try_enqueue(
         &self,
         bytes: Bytes,
-        completion: Option<oneshot::Sender<WriteCompletion>>,
+        completion: Option<WriteCompletionTarget>,
     ) -> Result<(), WriteBackpressure> {
         let request = self.try_request(bytes, completion)?;
         self.try_send_request(request)
     }
 
+    fn try_enqueue_standard(
+        &self,
+        bytes: Bytes,
+        completion: Option<oneshot::Sender<Result<(), WriteError>>>,
+    ) -> Result<(), WriteBackpressure> {
+        let request = self.try_standard_request(bytes, completion)?;
+        self.try_send_request(WriteMessage::Write(request))
+    }
+
     async fn enqueue(
         &self,
         bytes: Bytes,
-        completion: Option<oneshot::Sender<WriteCompletion>>,
+        completion: Option<WriteCompletionTarget>,
     ) -> Result<(), WriteError> {
         let request = self.request(bytes, completion).await?;
         self.send_request(request).await
     }
 
+    async fn enqueue_standard(
+        &self,
+        bytes: Bytes,
+        completion: Option<oneshot::Sender<Result<(), WriteError>>>,
+    ) -> Result<(), WriteError> {
+        let request = self.standard_request(bytes, completion).await?;
+        self.send_request(WriteMessage::Write(request)).await
+    }
+
+    async fn enqueue_fire_and_forget_reclaim(
+        &self,
+        bytes: Bytes,
+    ) -> Result<(), (WriteError, Bytes)> {
+        match self.try_write_fire_and_forget(bytes) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let bytes = err.into_bytes();
+                let permit = match self.budget_permit(bytes.len()).await {
+                    Ok(permit) => permit,
+                    Err(err) => return Err((err.into_write_error(), bytes)),
+                };
+                if self.closed.load(Ordering::Acquire) {
+                    return Err((WriteError::Closed, bytes));
+                }
+                let request = WriteRequest::new(bytes, None, permit.commit());
+                self.send_fire_and_forget_request_reclaim(request).await
+            }
+        }
+    }
+
     fn try_request(
         &self,
         bytes: Bytes,
-        completion: Option<oneshot::Sender<WriteCompletion>>,
-    ) -> Result<WriteRequest, WriteBackpressure> {
+        completion: Option<WriteCompletionTarget>,
+    ) -> Result<WriteMessage, WriteBackpressure> {
         match self.try_budget_permit(bytes.len()) {
             Ok(permit) => self.request_from_permit(bytes, completion, permit),
+            Err(err) => Err(err.into_backpressure(bytes)),
+        }
+    }
+
+    fn try_standard_request(
+        &self,
+        bytes: Bytes,
+        completion: Option<oneshot::Sender<Result<(), WriteError>>>,
+    ) -> Result<WriteRequest, WriteBackpressure> {
+        match self.try_budget_permit(bytes.len()) {
+            Ok(permit) => self.standard_request_from_permit(bytes, completion, permit),
             Err(err) => Err(err.into_backpressure(bytes)),
         }
     }
@@ -325,10 +676,21 @@ impl WriteHandoff {
     async fn request(
         &self,
         bytes: Bytes,
-        completion: Option<oneshot::Sender<WriteCompletion>>,
-    ) -> Result<WriteRequest, WriteError> {
+        completion: Option<WriteCompletionTarget>,
+    ) -> Result<WriteMessage, WriteError> {
         match self.budget_permit(bytes.len()).await {
             Ok(permit) => self.request_from_permit_or_closed(bytes, completion, permit),
+            Err(err) => Err(err.into_write_error()),
+        }
+    }
+
+    async fn standard_request(
+        &self,
+        bytes: Bytes,
+        completion: Option<oneshot::Sender<Result<(), WriteError>>>,
+    ) -> Result<WriteRequest, WriteError> {
+        match self.budget_permit(bytes.len()).await {
+            Ok(permit) => self.standard_request_from_permit_or_closed(bytes, completion, permit),
             Err(err) => Err(err.into_write_error()),
         }
     }
@@ -336,7 +698,31 @@ impl WriteHandoff {
     fn request_from_permit(
         &self,
         bytes: Bytes,
-        completion: Option<oneshot::Sender<WriteCompletion>>,
+        completion: Option<WriteCompletionTarget>,
+        permit: BudgetPermit<'_>,
+    ) -> Result<WriteMessage, WriteBackpressure> {
+        match self.closed.load(Ordering::Acquire) {
+            false => Ok(WriteMessage::from_parts(bytes, completion, permit.commit())),
+            true => Err(WriteBackpressure::closed(bytes)),
+        }
+    }
+
+    fn request_from_permit_or_closed(
+        &self,
+        bytes: Bytes,
+        completion: Option<WriteCompletionTarget>,
+        permit: BudgetPermit<'_>,
+    ) -> Result<WriteMessage, WriteError> {
+        match self.closed.load(Ordering::Acquire) {
+            false => Ok(WriteMessage::from_parts(bytes, completion, permit.commit())),
+            true => Err(WriteError::Closed),
+        }
+    }
+
+    fn standard_request_from_permit(
+        &self,
+        bytes: Bytes,
+        completion: Option<oneshot::Sender<Result<(), WriteError>>>,
         permit: BudgetPermit<'_>,
     ) -> Result<WriteRequest, WriteBackpressure> {
         match self.closed.load(Ordering::Acquire) {
@@ -345,10 +731,10 @@ impl WriteHandoff {
         }
     }
 
-    fn request_from_permit_or_closed(
+    fn standard_request_from_permit_or_closed(
         &self,
         bytes: Bytes,
-        completion: Option<oneshot::Sender<WriteCompletion>>,
+        completion: Option<oneshot::Sender<Result<(), WriteError>>>,
         permit: BudgetPermit<'_>,
     ) -> Result<WriteRequest, WriteError> {
         match self.closed.load(Ordering::Acquire) {
@@ -358,45 +744,47 @@ impl WriteHandoff {
     }
 
     fn try_budget_permit(&self, bytes: usize) -> Result<BudgetPermit<'_>, BudgetAcquireError> {
-        match self.closed.load(Ordering::Acquire) {
-            false => self
-                .budget
-                .try_acquire(bytes)
-                .map(|permit| BudgetPermit::new(self.budget.as_ref(), permit)),
-            true => Err(BudgetAcquireError::Closed),
-        }
+        self.budget
+            .try_acquire(bytes)
+            .map(|permit| BudgetPermit::new(self.budget.as_ref(), permit))
     }
 
     async fn budget_permit(&self, bytes: usize) -> Result<BudgetPermit<'_>, BudgetAcquireError> {
-        match self.closed.load(Ordering::Acquire) {
-            false => self
-                .budget
-                .acquire(bytes)
-                .await
-                .map(|permit| BudgetPermit::new(self.budget.as_ref(), permit)),
-            true => Err(BudgetAcquireError::Closed),
-        }
+        self.budget
+            .acquire(bytes)
+            .await
+            .map(|permit| BudgetPermit::new(self.budget.as_ref(), permit))
     }
 
-    fn try_send_request(&self, request: WriteRequest) -> Result<(), WriteBackpressure> {
-        match self.tx.try_send(WriteMessage::Write(request)) {
+    fn try_send_request(&self, request: WriteMessage) -> Result<(), WriteBackpressure> {
+        match self.tx.try_send(request) {
             Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(WriteMessage::Write(request))) => Err(
-                WriteBackpressure::queue_full(request.release_into_bytes(&self.budget)),
-            ),
-            Err(mpsc::error::TrySendError::Closed(WriteMessage::Write(request))) => {
+            Err(mpsc::error::TrySendError::Full(request @ WriteMessage::Write(_)))
+            | Err(mpsc::error::TrySendError::Full(request @ WriteMessage::FireAndForget(_)))
+            | Err(mpsc::error::TrySendError::Full(request @ WriteMessage::ObservedWrite(_))) => {
+                Err(WriteBackpressure::queue_full(
+                    request.release_into_bytes(&self.budget),
+                ))
+            }
+            Err(mpsc::error::TrySendError::Closed(request @ WriteMessage::Write(_)))
+            | Err(mpsc::error::TrySendError::Closed(request @ WriteMessage::FireAndForget(_)))
+            | Err(mpsc::error::TrySendError::Closed(request @ WriteMessage::ObservedWrite(_))) => {
                 self.mark_closed();
                 Err(WriteBackpressure::closed(
                     request.release_into_bytes(&self.budget),
                 ))
             }
             Err(mpsc::error::TrySendError::Full(WriteMessage::Shutdown))
+            | Err(mpsc::error::TrySendError::Full(WriteMessage::Drain(_)))
+            | Err(mpsc::error::TrySendError::Full(WriteMessage::Flush(_)))
+            | Err(mpsc::error::TrySendError::Closed(WriteMessage::Drain(_)))
+            | Err(mpsc::error::TrySendError::Closed(WriteMessage::Flush(_)))
             | Err(mpsc::error::TrySendError::Closed(WriteMessage::Shutdown)) => unreachable!(),
         }
     }
 
-    async fn send_request(&self, request: WriteRequest) -> Result<(), WriteError> {
-        match self.tx.send(WriteMessage::Write(request)).await {
+    async fn send_request(&self, request: WriteMessage) -> Result<(), WriteError> {
+        match self.tx.send(request).await {
             Ok(()) => Ok(()),
             Err(err) => match err.0 {
                 WriteMessage::Write(mut request) => {
@@ -404,7 +792,41 @@ impl WriteHandoff {
                     self.mark_closed();
                     Err(WriteError::Closed)
                 }
+                WriteMessage::FireAndForget(mut request) => {
+                    request.release_budget(&self.budget);
+                    self.mark_closed();
+                    Err(WriteError::Closed)
+                }
+                WriteMessage::ObservedWrite(mut request) => {
+                    request.release_budget(&self.budget);
+                    self.mark_closed();
+                    Err(WriteError::Closed)
+                }
+                WriteMessage::Drain(_) => unreachable!(),
+                WriteMessage::Flush(_) => unreachable!(),
                 WriteMessage::Shutdown => unreachable!(),
+            },
+        }
+    }
+
+    async fn send_fire_and_forget_request_reclaim(
+        &self,
+        request: WriteRequest,
+    ) -> Result<(), (WriteError, Bytes)> {
+        match self.tx.send(WriteMessage::FireAndForget(request)).await {
+            Ok(()) => Ok(()),
+            Err(err) => match err.0 {
+                WriteMessage::FireAndForget(request) => {
+                    self.mark_closed();
+                    Err((WriteError::Closed, request.release_into_bytes(&self.budget)))
+                }
+                WriteMessage::Write(_)
+                | WriteMessage::ObservedWrite(_)
+                | WriteMessage::Drain(_)
+                | WriteMessage::Flush(_)
+                | WriteMessage::Shutdown => {
+                    unreachable!()
+                }
             },
         }
     }
@@ -501,22 +923,24 @@ impl WriteCoalescer {
             return Ok(());
         }
         let bytes = self.pending.split().freeze();
+        let bytes_len = bytes.len();
         let chunks = std::mem::take(&mut self.pending_chunks);
         let started_at = self.pending_started_at.take();
-        let restore = bytes.clone();
-        if let Err(err) = self.enqueue_fire_and_forget(bytes).await {
-            self.pending.extend_from_slice(&restore);
+        if let Err((err, bytes)) = self.enqueue_fire_and_forget(bytes).await {
+            self.pending.extend_from_slice(&bytes);
             self.pending_chunks = chunks;
             self.pending_started_at = started_at;
             return Err(err);
         }
-        self.record_buffered_flush(restore.len(), chunks, started_at);
+        self.record_buffered_flush(bytes_len, chunks, started_at);
         Ok(())
     }
 
     async fn write_direct(&mut self, bytes: Bytes) -> Result<(), WriteError> {
         let len = bytes.len();
-        self.enqueue_fire_and_forget(bytes).await?;
+        self.enqueue_fire_and_forget(bytes)
+            .await
+            .map_err(|(err, _bytes)| err)?;
         self.record_direct_flush(len);
         Ok(())
     }
@@ -545,11 +969,8 @@ impl WriteCoalescer {
         }
     }
 
-    async fn enqueue_fire_and_forget(&self, bytes: Bytes) -> Result<(), WriteError> {
-        if let Err(err) = self.handoff.try_write_fire_and_forget(bytes) {
-            self.handoff.write_fire_and_forget(err.into_bytes()).await?;
-        }
-        Ok(())
+    async fn enqueue_fire_and_forget(&self, bytes: Bytes) -> Result<(), (WriteError, Bytes)> {
+        self.handoff.enqueue_fire_and_forget_reclaim(bytes).await
     }
 
     fn start_buffered_flush_timer(&mut self) {
@@ -606,11 +1027,44 @@ impl WriteCoalescer {
 }
 
 impl WriteTicket {
-    pub async fn wait(self) -> Result<(), WriteError> {
-        match self.rx.await {
-            Ok(completion) => completion.result,
-            Err(_) => Err(WriteError::Closed),
+    /// Waits for the full completion record, including timing stats.
+    pub async fn wait_completion(self) -> Result<WriteCompletion, WriteError> {
+        match self.rx {
+            WriteTicketReceiver::Result(rx) => {
+                let result = rx.await.map_err(|_| WriteError::Closed)?;
+                Ok(WriteCompletion {
+                    result,
+                    stats: WriteCompletionStats::default(),
+                })
+            }
+            WriteTicketReceiver::Completion(rx) => rx.await.map_err(|_| WriteError::Closed),
         }
+    }
+
+    pub async fn wait(self) -> Result<(), WriteError> {
+        self.wait_completion().await?.into_result()
+    }
+}
+
+impl WriteCompletion {
+    /// Returns the write result without consuming the completion record.
+    pub fn result(&self) -> Result<(), &WriteError> {
+        self.result.as_ref().map(|_| ())
+    }
+
+    /// Returns handoff-local completion timing for this write.
+    pub fn stats(&self) -> WriteCompletionStats {
+        self.stats
+    }
+
+    /// Consumes the completion record and returns the write result.
+    pub fn into_result(self) -> Result<(), WriteError> {
+        self.result
+    }
+
+    /// Consumes the completion record and returns both the result and stats.
+    pub fn into_parts(self) -> (Result<(), WriteError>, WriteCompletionStats) {
+        (self.result, self.stats)
     }
 }
 
@@ -732,6 +1186,7 @@ async fn writer_loop<W>(
 {
     let mut messages = Vec::with_capacity(MAX_BATCH_ITEMS);
     let mut requests = Vec::with_capacity(MAX_BATCH_ITEMS);
+    let mut requests_have_completions = false;
 
     loop {
         messages.clear();
@@ -743,17 +1198,118 @@ async fn writer_loop<W>(
         let mut shutdown = false;
         for message in messages.drain(..) {
             match message {
-                WriteMessage::Write(request) if !shutdown => requests.push(request),
+                WriteMessage::Write(request) if !shutdown => {
+                    requests_have_completions = true;
+                    requests.push(request);
+                }
+                WriteMessage::FireAndForget(request) if !shutdown => {
+                    requests.push(request);
+                }
+                WriteMessage::ObservedWrite(mut request) if !shutdown => {
+                    if write_request_batches(
+                        &mut writer,
+                        &budget,
+                        &mut requests,
+                        requests_have_completions,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        closed.store(true, Ordering::Release);
+                        budget.close();
+                        drain_closed(&budget, &mut rx);
+                        return;
+                    }
+                    requests.clear();
+                    requests_have_completions = false;
+                    if write_observed_request(&mut writer, &budget, &mut request)
+                        .await
+                        .is_err()
+                    {
+                        closed.store(true, Ordering::Release);
+                        budget.close();
+                        drain_closed(&budget, &mut rx);
+                        return;
+                    }
+                }
+                WriteMessage::Drain(completion) if !shutdown => {
+                    if write_request_batches(
+                        &mut writer,
+                        &budget,
+                        &mut requests,
+                        requests_have_completions,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        let _ = completion.send(Err(WriteError::Closed));
+                        closed.store(true, Ordering::Release);
+                        budget.close();
+                        drain_closed(&budget, &mut rx);
+                        return;
+                    }
+                    requests.clear();
+                    requests_have_completions = false;
+                    let _ = completion.send(Ok(()));
+                }
+                WriteMessage::Flush(completion) if !shutdown => {
+                    if write_request_batches(
+                        &mut writer,
+                        &budget,
+                        &mut requests,
+                        requests_have_completions,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        let _ = completion.send(Err(WriteError::Closed));
+                        closed.store(true, Ordering::Release);
+                        budget.close();
+                        drain_closed(&budget, &mut rx);
+                        return;
+                    }
+                    requests.clear();
+                    requests_have_completions = false;
+                    match writer.flush().await {
+                        Ok(()) => {
+                            let _ = completion.send(Ok(()));
+                        }
+                        Err(err) => {
+                            let _ = completion.send(Err(WriteError::Io(err)));
+                            closed.store(true, Ordering::Release);
+                            budget.close();
+                            drain_closed(&budget, &mut rx);
+                            return;
+                        }
+                    }
+                }
                 WriteMessage::Write(mut request) => {
-                    complete_request(&budget, &mut request, Err(WriteError::Closed));
+                    complete_request(&budget, &mut request, Err(WriteError::Closed), true);
+                }
+                WriteMessage::FireAndForget(mut request) => {
+                    complete_request(&budget, &mut request, Err(WriteError::Closed), false);
+                }
+                WriteMessage::ObservedWrite(mut request) => {
+                    complete_observed_request(&budget, &mut request, Err(WriteError::Closed), None);
+                }
+                WriteMessage::Drain(completion) => {
+                    let _ = completion.send(Err(WriteError::Closed));
+                }
+                WriteMessage::Flush(completion) => {
+                    let _ = completion.send(Err(WriteError::Closed));
                 }
                 WriteMessage::Shutdown => shutdown = true,
             }
         }
 
-        if write_request_batches(&mut writer, &budget, &mut requests)
-            .await
-            .is_err()
+        if write_request_batches(
+            &mut writer,
+            &budget,
+            &mut requests,
+            requests_have_completions,
+        )
+        .await
+        .is_err()
         {
             closed.store(true, Ordering::Release);
             budget.close();
@@ -761,6 +1317,7 @@ async fn writer_loop<W>(
             return;
         }
         requests.clear();
+        requests_have_completions = false;
 
         if shutdown || (closed.load(Ordering::Acquire) && rx.is_empty()) {
             break;
@@ -775,6 +1332,7 @@ async fn write_request_batches<W>(
     writer: &mut W,
     budget: &Budget,
     requests: &mut [WriteRequest],
+    requests_have_completions: bool,
 ) -> Result<(), ()>
 where
     W: AsyncWrite + Unpin,
@@ -782,22 +1340,31 @@ where
     let mut start = 0;
     while start < requests.len() {
         let end = batch_end(requests, start);
-        match write_batch(writer, &requests[start..end]).await {
+        match write_batch(writer, &mut requests[start..end]).await {
             Ok(written) => {
                 debug_assert_eq!(written, end - start);
-                complete_ok(budget, &mut requests[start..end]);
+                complete_ok(budget, &mut requests[start..end], requests_have_completions);
             }
             Err((written, err)) => {
-                complete_ok(budget, &mut requests[start..start + written]);
+                complete_ok(
+                    budget,
+                    &mut requests[start..start + written],
+                    requests_have_completions,
+                );
                 if start + written < end {
                     complete_request(
                         budget,
                         &mut requests[start + written],
                         Err(WriteError::Io(err)),
+                        requests_have_completions,
                     );
                 }
                 if start + written + 1 < requests.len() {
-                    complete_closed(budget, &mut requests[start + written + 1..]);
+                    complete_closed(
+                        budget,
+                        &mut requests[start + written + 1..],
+                        requests_have_completions,
+                    );
                 }
                 return Err(());
             }
@@ -806,6 +1373,39 @@ where
     }
 
     Ok(())
+}
+
+async fn write_observed_request<W>(
+    writer: &mut W,
+    budget: &Budget,
+    request: &mut ObservedWriteRequest,
+) -> Result<(), ()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let write_started_at = Instant::now();
+    match writer.write_all(&request.bytes).await {
+        Ok(()) => {
+            let completed_at = Instant::now();
+            complete_observed_request(
+                budget,
+                request,
+                Ok(()),
+                Some((write_started_at, completed_at)),
+            );
+            Ok(())
+        }
+        Err(err) => {
+            let completed_at = Instant::now();
+            complete_observed_request(
+                budget,
+                request,
+                Err(WriteError::Io(err)),
+                Some((write_started_at, completed_at)),
+            );
+            Err(())
+        }
+    }
 }
 
 fn batch_end(requests: &[WriteRequest], start: usize) -> usize {
@@ -827,7 +1427,7 @@ fn batch_end(requests: &[WriteRequest], start: usize) -> usize {
 
 async fn write_batch<W>(
     writer: &mut W,
-    requests: &[WriteRequest],
+    requests: &mut [WriteRequest],
 ) -> Result<usize, (usize, io::Error)>
 where
     W: AsyncWrite + Unpin,
@@ -887,44 +1487,74 @@ fn fill_io_slices<'a>(
 ) -> usize {
     let mut slice_count = 0;
     for (index, request) in requests[request_index..].iter().enumerate() {
-        let bytes = if index == 0 {
-            &request.bytes[offset..]
-        } else {
-            &request.bytes
-        };
+        let bytes = &request.bytes;
+        let bytes = if index == 0 { &bytes[offset..] } else { bytes };
         slices[slice_count] = IoSlice::new(bytes);
         slice_count += 1;
     }
     slice_count
 }
 
-fn complete_ok(budget: &Budget, requests: &mut [WriteRequest]) {
+fn complete_ok(budget: &Budget, requests: &mut [WriteRequest], deliver_completions: bool) {
     let released = take_budget(requests);
     budget.release(released);
-    for request in requests {
-        if let Some(completion) = request.completion.take() {
-            let _ = completion.send(WriteCompletion { result: Ok(()) });
+    if deliver_completions {
+        for request in requests {
+            send_completion(request, Ok(()));
         }
+    } else {
+        debug_assert!(requests.iter().all(|request| request.completion.is_none()));
     }
 }
 
-fn complete_closed(budget: &Budget, requests: &mut [WriteRequest]) {
+fn complete_closed(budget: &Budget, requests: &mut [WriteRequest], deliver_completions: bool) {
     let released = take_budget(requests);
     budget.release(released);
-    for request in requests {
-        if let Some(completion) = request.completion.take() {
-            let _ = completion.send(WriteCompletion {
-                result: Err(WriteError::Closed),
-            });
+    if deliver_completions {
+        for request in requests {
+            send_completion(request, Err(WriteError::Closed));
         }
+    } else {
+        debug_assert!(requests.iter().all(|request| request.completion.is_none()));
     }
 }
 
-fn complete_request(budget: &Budget, request: &mut WriteRequest, result: Result<(), WriteError>) {
+fn complete_request(
+    budget: &Budget,
+    request: &mut WriteRequest,
+    result: Result<(), WriteError>,
+    deliver_completion: bool,
+) {
     budget.release(request.budget_bytes);
     request.budget_bytes = 0;
+    if deliver_completion {
+        send_completion(request, result);
+    } else {
+        debug_assert!(request.completion.is_none());
+    }
+}
+
+fn send_completion(request: &mut WriteRequest, result: Result<(), WriteError>) {
     if let Some(completion) = request.completion.take() {
-        let _ = completion.send(WriteCompletion { result });
+        let _ = completion.send(result);
+    }
+}
+
+fn complete_observed_request(
+    budget: &Budget,
+    request: &mut ObservedWriteRequest,
+    result: Result<(), WriteError>,
+    write_window: Option<(Instant, Instant)>,
+) {
+    budget.release(request.budget_bytes);
+    request.budget_bytes = 0;
+    let (write_started_at, completed_at) = match write_window {
+        Some((write_started_at, completed_at)) => (Some(write_started_at), completed_at),
+        None => (None, Instant::now()),
+    };
+    if let Some(completion) = request.completion.take() {
+        let stats = completion.stats(write_started_at, completed_at);
+        completion.complete(WriteCompletion { result, stats });
     }
 }
 
@@ -939,8 +1569,23 @@ fn take_budget(requests: &mut [WriteRequest]) -> usize {
 
 fn drain_closed(budget: &Budget, rx: &mut mpsc::Receiver<WriteMessage>) {
     while let Ok(message) = rx.try_recv() {
-        if let WriteMessage::Write(mut request) = message {
-            complete_request(budget, &mut request, Err(WriteError::Closed));
+        match message {
+            WriteMessage::Write(mut request) => {
+                complete_request(budget, &mut request, Err(WriteError::Closed), true);
+            }
+            WriteMessage::FireAndForget(mut request) => {
+                complete_request(budget, &mut request, Err(WriteError::Closed), false);
+            }
+            WriteMessage::ObservedWrite(mut request) => {
+                complete_observed_request(budget, &mut request, Err(WriteError::Closed), None);
+            }
+            WriteMessage::Drain(completion) => {
+                let _ = completion.send(Err(WriteError::Closed));
+            }
+            WriteMessage::Flush(completion) => {
+                let _ = completion.send(Err(WriteError::Closed));
+            }
+            WriteMessage::Shutdown => {}
         }
     }
 }
@@ -955,6 +1600,21 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     use super::*;
+
+    #[test]
+    fn write_handoff_config_defaults_and_builders_are_named_budgets() {
+        let config = WriteHandoffConfig::default();
+        assert_eq!(config.max_items, DEFAULT_WRITE_MAX_ITEMS);
+        assert_eq!(config.max_pending_bytes, DEFAULT_WRITE_MAX_PENDING_BYTES);
+        assert_eq!(
+            DEFAULT_WRITE_MAX_PENDING_BYTES,
+            DEFAULT_WRITE_COALESCE_THRESHOLD * DEFAULT_WRITE_PENDING_CHUNKS
+        );
+
+        let tuned = config.with_max_items(17).with_max_pending_bytes(32 * 1024);
+        assert_eq!(tuned.max_items, 17);
+        assert_eq!(tuned.max_pending_bytes, 32 * 1024);
+    }
 
     #[tokio::test]
     async fn writes_owned_bytes_in_order() {
@@ -998,7 +1658,7 @@ mod tests {
         let handoff = WriteHandoff::spawn(client, WriteHandoffConfig::new(4, 8));
 
         let ticket = handoff
-            .write(Bytes::from_static(b"hello"))
+            .write_with_completion_stats(Bytes::from_static(b"hello"))
             .await
             .expect("handoff");
         assert!(handoff.pending_bytes() <= 8);
@@ -1010,6 +1670,65 @@ mod tests {
             .await
             .expect("read written bytes");
         assert_eq!(&out, b"hello");
+    }
+
+    #[tokio::test]
+    async fn completion_ticket_reports_queue_write_and_e2e_stats() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let handoff = WriteHandoff::spawn(client, WriteHandoffConfig::new(4, 64));
+
+        let ticket = handoff
+            .write_with_completion_stats(Bytes::from_static(b"hello"))
+            .await
+            .expect("handoff");
+        let completion = ticket
+            .wait_completion()
+            .await
+            .expect("completion delivered");
+
+        assert!(completion.result().is_ok());
+        let stats = completion.stats();
+        assert_eq!(stats.bytes, 5);
+        assert!(stats.e2e_nanos >= stats.queue_nanos);
+        assert!(stats.e2e_nanos >= stats.write_nanos);
+        completion.into_result().expect("write succeeded");
+
+        let mut out = [0_u8; 5];
+        server
+            .read_exact(&mut out)
+            .await
+            .expect("read written bytes");
+        assert_eq!(&out, b"hello");
+    }
+
+    #[tokio::test]
+    async fn completion_callback_can_capture_request_metadata() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let handoff = WriteHandoff::spawn(client, WriteHandoffConfig::new(4, 64));
+        let (done_tx, done_rx) = oneshot::channel();
+        let command_count = 3usize;
+        let request_started_at = Instant::now();
+
+        handoff
+            .try_write_with_completion_callback(Bytes::from_static(b"abc"), move |completion| {
+                let app_e2e_nanos = nanos_u64(request_started_at.elapsed());
+                let (result, stats) = completion.into_parts();
+                let _ = done_tx.send((command_count, result.is_ok(), stats, app_e2e_nanos));
+            })
+            .expect("handoff");
+
+        let (observed_commands, ok, stats, app_e2e_nanos) = done_rx.await.expect("callback runs");
+        assert_eq!(observed_commands, 3);
+        assert!(ok);
+        assert_eq!(stats.bytes, 3);
+        assert!(app_e2e_nanos >= stats.e2e_nanos);
+
+        let mut out = [0_u8; 3];
+        server
+            .read_exact(&mut out)
+            .await
+            .expect("read written bytes");
+        assert_eq!(&out, b"abc");
     }
 
     #[tokio::test]
@@ -1033,6 +1752,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flush_waits_for_prior_fire_and_forget_writes() {
+        let writer = CountingWriter::default();
+        let output = writer.output.clone();
+        let flushes = writer.flushes.clone();
+        let handoff = WriteHandoff::spawn(writer, WriteHandoffConfig::new(4, 64));
+
+        handoff
+            .write_fire_and_forget(Bytes::from_static(b"abc"))
+            .await
+            .expect("fire-and-forget write");
+        handoff.flush().await.expect("flush completes");
+
+        assert_eq!(&*output.lock().expect("output mutex"), b"abc");
+        assert_eq!(handoff.pending_bytes(), 0);
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn drain_waits_for_prior_fire_and_forget_writes_without_flushing() {
+        let writer = CountingWriter::default();
+        let output = writer.output.clone();
+        let flushes = writer.flushes.clone();
+        let handoff = WriteHandoff::spawn(writer, WriteHandoffConfig::new(4, 64));
+
+        handoff
+            .write_fire_and_forget(Bytes::from_static(b"abc"))
+            .await
+            .expect("fire-and-forget write");
+        handoff.drain().await.expect("drain completes");
+
+        assert_eq!(&*output.lock().expect("output mutex"), b"abc");
+        assert_eq!(handoff.pending_bytes(), 0);
+        assert_eq!(flushes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn coalescer_buffers_until_threshold_or_flush() {
         let writer = CountingWriter::default();
         let output = writer.output.clone();
@@ -1051,12 +1806,11 @@ mod tests {
             .write_fire_and_forget(Bytes::from_static(b"cd"))
             .await
             .expect("threshold flush");
-        let barrier = coalescer
+        coalescer
             .handoff()
-            .write(Bytes::new())
+            .flush()
             .await
-            .expect("submit barrier");
-        barrier.wait().await.expect("barrier completes");
+            .expect("barrier completes");
 
         assert_eq!(&*output.lock().expect("output mutex"), b"abcd");
         assert_eq!(coalescer.pending_bytes(), 0);
@@ -1084,12 +1838,11 @@ mod tests {
             .await
             .expect("buffer tail");
         coalescer.flush().await.expect("flush tail");
-        let barrier = coalescer
+        coalescer
             .handoff()
-            .write(Bytes::new())
+            .flush()
             .await
-            .expect("submit barrier");
-        barrier.wait().await.expect("barrier completes");
+            .expect("barrier completes");
 
         assert_eq!(&*output.lock().expect("output mutex"), b"tail");
         assert_eq!(coalescer.pending_bytes(), 0);
@@ -1107,12 +1860,11 @@ mod tests {
             .write_fire_and_forget(Bytes::from_static(b"abc"))
             .await
             .expect("submit immediately");
-        let barrier = coalescer
+        coalescer
             .handoff()
-            .write(Bytes::new())
+            .flush()
             .await
-            .expect("submit barrier");
-        barrier.wait().await.expect("barrier completes");
+            .expect("barrier completes");
 
         assert_eq!(&*output.lock().expect("output mutex"), b"abc");
         assert_eq!(coalescer.pending_bytes(), 0);
@@ -1238,7 +1990,7 @@ mod tests {
         ];
 
         let mut writer = writer;
-        write_request_batches(&mut writer, &budget, &mut requests)
+        write_request_batches(&mut writer, &budget, &mut requests, false)
             .await
             .expect("batch writes");
 
@@ -1251,17 +2003,14 @@ mod tests {
         let budget_bytes = budget
             .try_acquire(bytes.len())
             .expect("test budget has capacity");
-        WriteRequest {
-            bytes,
-            completion: None,
-            budget_bytes,
-        }
+        WriteRequest::new(bytes, None, budget_bytes)
     }
 
     #[derive(Default)]
     struct CountingWriter {
         output: Arc<Mutex<Vec<u8>>>,
         vectored_calls: Arc<AtomicUsize>,
+        flushes: Arc<AtomicUsize>,
     }
 
     impl AsyncWrite for CountingWriter {
@@ -1278,6 +2027,7 @@ mod tests {
         }
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
             Poll::Ready(Ok(()))
         }
 

@@ -1,7 +1,7 @@
 use bytes::{Bytes, BytesMut};
 use bytes_handoff::{
-    DEFAULT_WRITE_COALESCE_THRESHOLD, HandoffBuffer, HandoffBufferConfig, WriteCoalescer,
-    WriteCoalescerStats, WriteHandoff, WriteHandoffConfig,
+    DEFAULT_WRITE_COALESCE_THRESHOLD, DEFAULT_WRITE_PENDING_CHUNKS, HandoffBuffer,
+    HandoffBufferConfig, WriteCoalescer, WriteCoalescerStats, WriteHandoff, WriteHandoffConfig,
 };
 #[cfg(feature = "telemetry")]
 use bytes_handoff::{HandoffReadTelemetry, HandoffReadTelemetryHandle};
@@ -284,7 +284,8 @@ impl Config {
 
     fn write_pending_bytes(self) -> usize {
         if self.write_pending_bytes == 0 {
-            self.read_reserve.saturating_mul(2)
+            self.read_reserve
+                .saturating_mul(DEFAULT_WRITE_PENDING_CHUNKS)
         } else {
             self.write_pending_bytes
         }
@@ -776,6 +777,12 @@ fn parse_args() -> Cli {
                 println!(
                     "  read-telemetry: attach fast-telemetry read metrics to HandoffBuffer"
                 );
+                println!(
+                    "  handoff-flush-bytes: output coalescer threshold, default DEFAULT_WRITE_COALESCE_THRESHOLD"
+                );
+                println!(
+                    "  write-pending-bytes: WriteHandoff byte budget, default DEFAULT_WRITE_PENDING_CHUNKS * read_reserve"
+                );
                 std::process::exit(0);
             }
             arg => panic!("unknown arg: {arg}"),
@@ -820,14 +827,16 @@ fn parse_args() -> Cli {
         "--handoff-flush-bytes must be >= 1"
     );
     let effective_write_pending_bytes = if write_pending_bytes == 0 {
-        read_reserve.saturating_mul(2)
+        read_reserve.saturating_mul(DEFAULT_WRITE_PENDING_CHUNKS)
     } else {
         write_pending_bytes
     };
     assert!(
         !matches!(
             implementation,
-            Implementation::Handoff | Implementation::MonoioHandoff | Implementation::BytesMutHandoff
+            Implementation::Handoff
+                | Implementation::MonoioHandoff
+                | Implementation::BytesMutHandoff
         ) || handoff_flush_bytes <= effective_write_pending_bytes,
         "--handoff-flush-bytes must be <= effective write pending byte budget"
     );
@@ -1502,26 +1511,20 @@ fn run_monoio_tcp_service_process(
     let mut handles = Vec::with_capacity(worker_threads);
 
     for worker_id in 0..worker_threads {
-        let ready_tx = ready_tx.clone();
-        let total_accepts = total_accepts.clone();
-        let first_accept = first_accept.clone();
-        let last_accept = last_accept.clone();
+        let worker = MonoioTcpServiceWorker {
+            config,
+            service_addr,
+            sink_addr,
+            idle_timeout,
+            ready_tx: ready_tx.clone(),
+            total_accepts: total_accepts.clone(),
+            first_accept: first_accept.clone(),
+            last_accept: last_accept.clone(),
+        };
         handles.push(
             std::thread::Builder::new()
                 .name(format!("monoio-tcp-service-{worker_id}"))
-                .spawn(move || {
-                    run_monoio_tcp_service_worker(
-                        worker_id,
-                        config,
-                        service_addr,
-                        sink_addr,
-                        idle_timeout,
-                        ready_tx,
-                        total_accepts,
-                        first_accept,
-                        last_accept,
-                    )
-                })
+                .spawn(move || run_monoio_tcp_service_worker(worker_id, worker))
                 .expect("spawn monoio tcp service worker"),
         );
     }
@@ -1596,8 +1599,7 @@ fn run_monoio_tcp_service_process(
 }
 
 #[cfg(target_os = "linux")]
-fn run_monoio_tcp_service_worker(
-    worker_id: usize,
+struct MonoioTcpServiceWorker {
     config: Config,
     service_addr: SocketAddr,
     sink_addr: SocketAddr,
@@ -1606,41 +1608,51 @@ fn run_monoio_tcp_service_worker(
     total_accepts: Arc<AtomicUsize>,
     first_accept: Arc<Mutex<Option<Instant>>>,
     last_accept: Arc<Mutex<Option<Instant>>>,
-) -> usize {
+}
+
+#[cfg(target_os = "linux")]
+fn run_monoio_tcp_service_worker(worker_id: usize, worker: MonoioTcpServiceWorker) -> usize {
     let mut runtime = monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
         .enable_timer()
         .build()
         .expect("build monoio tcp service runtime");
 
     runtime.block_on(async move {
-        let worker_service_addr = tcp_service_addr_for_worker(service_addr, worker_id, config);
+        let worker_service_addr =
+            tcp_service_addr_for_worker(worker.service_addr, worker_id, worker.config);
         let listener_opts = monoio::net::ListenerOpts::new()
             .reuse_addr(true)
-            .reuse_port(matches!(config.tcp_shard_mode, TcpShardMode::Shared))
+            .reuse_port(matches!(
+                worker.config.tcp_shard_mode,
+                TcpShardMode::Shared
+            ))
             .backlog(4096);
         let listener =
             match monoio::net::TcpListener::bind_with_config(worker_service_addr, &listener_opts) {
                 Ok(listener) => listener,
                 Err(error) => {
-                    let _ = ready_tx.send(Err(format!("worker {worker_id}: {error}")));
+                    let _ = worker
+                        .ready_tx
+                        .send(Err(format!("worker {worker_id}: {error}")));
                     panic!("bind monoio tcp service listener on worker {worker_id}: {error}");
                 }
             };
         let local_addr = listener
             .local_addr()
             .expect("read monoio tcp service listener address");
-        ready_tx
+        worker
+            .ready_tx
             .send(Ok(local_addr))
             .expect("report monoio tcp service worker ready");
 
         accept_monoio_tcp_service_until_idle(
             listener,
-            sink_addr,
-            config,
-            idle_timeout,
-            total_accepts,
-            first_accept,
-            last_accept,
+            worker.sink_addr,
+            worker.config,
+            worker.idle_timeout,
+            worker.total_accepts,
+            worker.first_accept,
+            worker.last_accept,
         )
         .await
     })
@@ -2072,7 +2084,7 @@ where
     let read_buffer_coalescing = should_coalesce_in_read_buffer(config);
     let mut tunnel_recorder =
         BufferedTunnelRecorder::new(config.coalescer_stats && read_buffer_coalescing);
-    let mut tunnel_coalescer = if config.coalescer_stats && !read_buffer_coalescing {
+    let mut output_coalescer = if config.coalescer_stats && !read_buffer_coalescing {
         WriteCoalescer::with_threshold_and_stats(handoff.clone(), config.handoff_flush_bytes)
     } else {
         WriteCoalescer::with_threshold(handoff.clone(), config.handoff_flush_bytes)
@@ -2090,7 +2102,13 @@ where
         }
 
         if !tunnel {
-            tunnel = route_complete_prefixes(&mut buffer, &handoff, config.completion).await;
+            tunnel = route_complete_prefixes(
+                &mut buffer,
+                &handoff,
+                &mut output_coalescer,
+                config.completion,
+            )
+            .await;
         }
 
         if tunnel {
@@ -2104,7 +2122,7 @@ where
                 TunnelBufferDecision::Submit { record_flush } => {
                     let bytes = buffer.freeze_all();
                     record_tunnel_flush(&mut tunnel_recorder, bytes.len(), record_flush, config);
-                    submit_tunnel(&handoff, &mut tunnel_coalescer, config.completion, bytes).await;
+                    submit_output(&handoff, &mut output_coalescer, config.completion, bytes).await;
                 }
             }
         }
@@ -2118,28 +2136,18 @@ where
             read_buffer_coalescing,
             config,
         );
-        submit_tunnel(
-            &handoff,
-            &mut tunnel_coalescer,
-            config.completion,
-            bytes,
-        )
-        .await;
+        submit_output(&handoff, &mut output_coalescer, config.completion, bytes).await;
     }
-    tunnel_coalescer.flush().await.expect("flush tunnel coalescer");
+    output_coalescer.flush().await.expect("flush output coalescer");
 
-    let barrier = handoff
-        .write(Bytes::new())
-        .await
-        .expect("submit completion barrier");
-    barrier.wait().await.expect("completion barrier");
+    handoff.drain().await.expect("completion barrier");
     handoff.close();
 
     ProxyMetrics {
         coalescer: if read_buffer_coalescing {
             tunnel_recorder.stats()
         } else {
-            tunnel_coalescer.stats()
+            output_coalescer.stats()
         },
     }
 }
@@ -2228,7 +2236,7 @@ where
     let read_buffer_coalescing = should_coalesce_in_read_buffer(config);
     let mut tunnel_recorder =
         BufferedTunnelRecorder::new(config.coalescer_stats && read_buffer_coalescing);
-    let mut tunnel_coalescer = if config.coalescer_stats && !read_buffer_coalescing {
+    let mut output_coalescer = if config.coalescer_stats && !read_buffer_coalescing {
         WriteCoalescer::with_threshold_and_stats(handoff.clone(), config.handoff_flush_bytes)
     } else {
         WriteCoalescer::with_threshold(handoff.clone(), config.handoff_flush_bytes)
@@ -2253,8 +2261,13 @@ where
         );
 
         if !tunnel {
-            tunnel =
-                route_complete_prefixes_bytesmut(&mut buffer, &handoff, config.completion).await;
+            tunnel = route_complete_prefixes_bytesmut(
+                &mut buffer,
+                &handoff,
+                &mut output_coalescer,
+                config.completion,
+            )
+            .await;
         }
 
         if tunnel {
@@ -2268,7 +2281,7 @@ where
                 TunnelBufferDecision::Submit { record_flush } => {
                     let bytes = buffer.split().freeze();
                     record_tunnel_flush(&mut tunnel_recorder, bytes.len(), record_flush, config);
-                    submit_tunnel(&handoff, &mut tunnel_coalescer, config.completion, bytes).await;
+                    submit_output(&handoff, &mut output_coalescer, config.completion, bytes).await;
                 }
             }
         }
@@ -2282,28 +2295,18 @@ where
             read_buffer_coalescing,
             config,
         );
-        submit_tunnel(
-            &handoff,
-            &mut tunnel_coalescer,
-            config.completion,
-            bytes,
-        )
-        .await;
+        submit_output(&handoff, &mut output_coalescer, config.completion, bytes).await;
     }
-    tunnel_coalescer.flush().await.expect("flush tunnel coalescer");
+    output_coalescer.flush().await.expect("flush output coalescer");
 
-    let barrier = handoff
-        .write(Bytes::new())
-        .await
-        .expect("submit bytesmut completion barrier");
-    barrier.wait().await.expect("bytesmut completion barrier");
+    handoff.drain().await.expect("bytesmut completion barrier");
     handoff.close();
 
     ProxyMetrics {
         coalescer: if read_buffer_coalescing {
             tunnel_recorder.stats()
         } else {
-            tunnel_coalescer.stats()
+            output_coalescer.stats()
         },
     }
 }
@@ -2407,11 +2410,16 @@ where
 async fn route_complete_prefixes(
     buffer: &mut HandoffBuffer,
     handoff: &WriteHandoff,
+    coalescer: &mut WriteCoalescer,
     completion: CompletionMode,
 ) -> bool {
     loop {
         let bytes = buffer.peek();
         if bytes.starts_with(b"TUNNEL\n") {
+            coalescer
+                .flush()
+                .await
+                .expect("flush route prefixes before tunnel");
             return true;
         }
         if bytes.starts_with(b"TUN") {
@@ -2423,7 +2431,7 @@ async fn route_complete_prefixes(
         let frame = buffer
             .split_prefix(newline + 1)
             .expect("newline prefix is in bounds");
-        submit(handoff, completion, frame).await;
+        submit_output(handoff, coalescer, completion, frame).await;
     }
 }
 
@@ -2452,10 +2460,15 @@ where
 async fn route_complete_prefixes_bytesmut(
     buffer: &mut BytesMut,
     handoff: &WriteHandoff,
+    coalescer: &mut WriteCoalescer,
     completion: CompletionMode,
 ) -> bool {
     loop {
         if buffer.starts_with(b"TUNNEL\n") {
+            coalescer
+                .flush()
+                .await
+                .expect("flush route prefixes before tunnel");
             return true;
         }
         if buffer.starts_with(b"TUN") {
@@ -2465,7 +2478,7 @@ async fn route_complete_prefixes_bytesmut(
             return false;
         };
         let frame = buffer.split_to(newline + 1).freeze();
-        submit(handoff, completion, frame).await;
+        submit_output(handoff, coalescer, completion, frame).await;
     }
 }
 
@@ -2510,7 +2523,7 @@ fn should_coalesce_in_read_buffer(config: Config) -> bool {
         && config.handoff_flush_bytes > 1
 }
 
-async fn submit_tunnel(
+async fn submit_output(
     handoff: &WriteHandoff,
     coalescer: &mut WriteCoalescer,
     completion: CompletionMode,

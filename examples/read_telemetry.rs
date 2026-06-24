@@ -6,13 +6,17 @@
 
 use bytes_handoff::{
     HandoffBuffer, HandoffReadMetricsDogStatsDState, HandoffReadTelemetry,
-    HandoffReadTelemetryHandle,
+    HandoffReadTelemetryHandle, HandoffReadTelemetryRuntime,
 };
 use tokio::io::AsyncWriteExt;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let telemetry = HandoffReadTelemetry::with_available_parallelism();
+    let parent_read_telemetry: Option<HandoffReadTelemetryRuntime> = Some(
+        fast_telemetry::Runtime::new(fast_telemetry::RuntimeConfig::default()),
+    );
+    let telemetry = HandoffReadTelemetry::from_optional_runtime(parent_read_telemetry);
+    let read_metrics = telemetry.shared_metrics();
     let handle = HandoffReadTelemetryHandle::from_arc(&telemetry);
     let (mut client, mut server) = tokio::io::duplex(128);
     let mut buffer = HandoffBuffer::new(1024).with_telemetry(handle);
@@ -28,6 +32,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("route: {:?}", String::from_utf8_lossy(&route));
     println!("tail: {:?}", String::from_utf8_lossy(buffer.peek()));
     println!("snapshot: {:?}", telemetry.snapshot());
+    println!("caller-owned snapshot: {:?}", read_metrics.snapshot());
+    if let Some(runtime) = telemetry.runtime() {
+        println!("runtime_metric_groups={}", runtime.registered_metrics_len());
+    }
     println!("{}", telemetry.export_prometheus());
 
     let mut dogstatsd = String::new();

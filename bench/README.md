@@ -97,6 +97,9 @@ collects before submitting one owned `Bytes` chunk to `WriteHandoff`. The
 default handoff flush threshold is 16 KiB, matching
 `DEFAULT_WRITE_COALESCE_THRESHOLD`; pass `--handoff-flush-bytes 1` to model
 flush-every-read behavior.
+`--write-pending-bytes` controls the `WriteHandoff` pending byte budget. The
+default is `DEFAULT_WRITE_PENDING_CHUNKS * read_reserve`, which is 128 KiB for
+the stock 16 KiB read reserve.
 
 To find the crossover between tiny fragmented input and larger coalesced input,
 run:
@@ -263,8 +266,14 @@ Scenarios:
 - `input_model=tcp`: cached reads or client writes are capped at
   `tcp_mss_bytes`, default 1460 bytes. This models standard Ethernet MSS-sized
   TCP payloads for testing rather than a userspace `read()` buffer size.
-- `handoff_flush_bytes`: tunnel-mode flush threshold for the handoff
-  implementations. The default is 16 KiB; use `1` for immediate flushes.
+- `handoff_flush_bytes`: fire-and-forget output flush threshold for the handoff
+  implementations. Route prefixes and tunnel bytes share this coalescer. The
+  default is 16 KiB; use `1` for immediate flushes.
+- `write_pending_bytes`: pending output byte budget for handoff writes. The
+  harness default is `DEFAULT_WRITE_PENDING_CHUNKS * read_reserve`; with the
+  stock value of 8 and default 16 KiB read reserve, that is 128 KiB. Set
+  `WRITE_PENDING_BYTES=...` in the matrix scripts or pass
+  `--write-pending-bytes ...` to the harness to override it.
 
 Useful fields in each run output:
 
@@ -277,6 +286,7 @@ Useful fields in each run output:
 - `input_model`
 - `tcp_mss_bytes`
 - `handoff_flush_bytes`
+- `write_pending_bytes`
 - `coalescer_stats_enabled`
 - `coalescer_input_chunks`
 - `coalescer_flushes`

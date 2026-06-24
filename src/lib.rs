@@ -41,6 +41,7 @@ pub use read::{
 pub use read_telemetry::{
     HandoffReadHistogramSummary, HandoffReadMetrics, HandoffReadMetricsDogStatsDState,
     HandoffReadMetricsSnapshot, HandoffReadTelemetry, HandoffReadTelemetryHandle,
+    HandoffReadTelemetryRuntime,
 };
 pub use tune::{
     DEFAULT_TUNING_BATCH_SIZE, DEFAULT_TUNING_MAX_READS_PER_FLUSH,
@@ -52,6 +53,7 @@ pub use tune::{
     WriteCoalescingTuningError,
 };
 pub use write::{
-    DEFAULT_WRITE_COALESCE_THRESHOLD, WriteCoalescer, WriteCoalescerConfig, WriteCoalescerStats,
-    WriteCompletion, WriteHandoff, WriteHandoffConfig, WriteTicket,
+    DEFAULT_WRITE_COALESCE_THRESHOLD, DEFAULT_WRITE_MAX_ITEMS, DEFAULT_WRITE_MAX_PENDING_BYTES,
+    DEFAULT_WRITE_PENDING_CHUNKS, WriteCoalescer, WriteCoalescerConfig, WriteCoalescerStats,
+    WriteCompletion, WriteCompletionStats, WriteHandoff, WriteHandoffConfig, WriteTicket,
 };
