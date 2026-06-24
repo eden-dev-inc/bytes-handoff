@@ -1511,26 +1511,20 @@ fn run_monoio_tcp_service_process(
     let mut handles = Vec::with_capacity(worker_threads);
 
     for worker_id in 0..worker_threads {
-        let ready_tx = ready_tx.clone();
-        let total_accepts = total_accepts.clone();
-        let first_accept = first_accept.clone();
-        let last_accept = last_accept.clone();
+        let worker = MonoioTcpServiceWorker {
+            config,
+            service_addr,
+            sink_addr,
+            idle_timeout,
+            ready_tx: ready_tx.clone(),
+            total_accepts: total_accepts.clone(),
+            first_accept: first_accept.clone(),
+            last_accept: last_accept.clone(),
+        };
         handles.push(
             std::thread::Builder::new()
                 .name(format!("monoio-tcp-service-{worker_id}"))
-                .spawn(move || {
-                    run_monoio_tcp_service_worker(
-                        worker_id,
-                        config,
-                        service_addr,
-                        sink_addr,
-                        idle_timeout,
-                        ready_tx,
-                        total_accepts,
-                        first_accept,
-                        last_accept,
-                    )
-                })
+                .spawn(move || run_monoio_tcp_service_worker(worker_id, worker))
                 .expect("spawn monoio tcp service worker"),
         );
     }
@@ -1605,8 +1599,7 @@ fn run_monoio_tcp_service_process(
 }
 
 #[cfg(target_os = "linux")]
-fn run_monoio_tcp_service_worker(
-    worker_id: usize,
+struct MonoioTcpServiceWorker {
     config: Config,
     service_addr: SocketAddr,
     sink_addr: SocketAddr,
@@ -1615,41 +1608,51 @@ fn run_monoio_tcp_service_worker(
     total_accepts: Arc<AtomicUsize>,
     first_accept: Arc<Mutex<Option<Instant>>>,
     last_accept: Arc<Mutex<Option<Instant>>>,
-) -> usize {
+}
+
+#[cfg(target_os = "linux")]
+fn run_monoio_tcp_service_worker(worker_id: usize, worker: MonoioTcpServiceWorker) -> usize {
     let mut runtime = monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
         .enable_timer()
         .build()
         .expect("build monoio tcp service runtime");
 
     runtime.block_on(async move {
-        let worker_service_addr = tcp_service_addr_for_worker(service_addr, worker_id, config);
+        let worker_service_addr =
+            tcp_service_addr_for_worker(worker.service_addr, worker_id, worker.config);
         let listener_opts = monoio::net::ListenerOpts::new()
             .reuse_addr(true)
-            .reuse_port(matches!(config.tcp_shard_mode, TcpShardMode::Shared))
+            .reuse_port(matches!(
+                worker.config.tcp_shard_mode,
+                TcpShardMode::Shared
+            ))
             .backlog(4096);
         let listener =
             match monoio::net::TcpListener::bind_with_config(worker_service_addr, &listener_opts) {
                 Ok(listener) => listener,
                 Err(error) => {
-                    let _ = ready_tx.send(Err(format!("worker {worker_id}: {error}")));
+                    let _ = worker
+                        .ready_tx
+                        .send(Err(format!("worker {worker_id}: {error}")));
                     panic!("bind monoio tcp service listener on worker {worker_id}: {error}");
                 }
             };
         let local_addr = listener
             .local_addr()
             .expect("read monoio tcp service listener address");
-        ready_tx
+        worker
+            .ready_tx
             .send(Ok(local_addr))
             .expect("report monoio tcp service worker ready");
 
         accept_monoio_tcp_service_until_idle(
             listener,
-            sink_addr,
-            config,
-            idle_timeout,
-            total_accepts,
-            first_accept,
-            last_accept,
+            worker.sink_addr,
+            worker.config,
+            worker.idle_timeout,
+            worker.total_accepts,
+            worker.first_accept,
+            worker.last_accept,
         )
         .await
     })
