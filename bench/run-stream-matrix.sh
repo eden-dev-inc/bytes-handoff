@@ -22,6 +22,7 @@ ROUTE_FRAMES="${ROUTE_FRAMES:-64}"
 TUNNEL_BYTES="${TUNNEL_BYTES:-1048576}"
 READ_RESERVE="${READ_RESERVE:-16384}"
 HANDOFF_FLUSH_BYTES="${HANDOFF_FLUSH_BYTES:-}"
+WRITE_PENDING_BYTES="${WRITE_PENDING_BYTES:-}"
 DURATION_SECONDS="${DURATION_SECONDS:-0}"
 
 usage() {
@@ -35,7 +36,7 @@ usage() {
   echo "  FRAME_SIZES='64 256 1024 4096 16384 65536 1048576'"
   echo "  INPUT_FRAGMENTS='64 128 256 512 1024 2048 4096 8192 16384' (optional; defaults to scenario behavior)"
   echo "  COMPLETION='ticket|fire_and_forget'"
-  echo "  WORKER_THREADS=8 RUNS=3 ROUTE_FRAMES=64 TUNNEL_BYTES=1048576 READ_RESERVE=16384 HANDOFF_FLUSH_BYTES=16384"
+  echo "  WORKER_THREADS=8 RUNS=3 ROUTE_FRAMES=64 TUNNEL_BYTES=1048576 READ_RESERVE=16384 HANDOFF_FLUSH_BYTES=16384 WRITE_PENDING_BYTES=131072"
   echo "  DURATION_SECONDS=60"
 }
 
@@ -52,6 +53,9 @@ if [[ -n "$INPUT_FRAGMENTS" ]]; then
 fi
 if [[ -n "$HANDOFF_FLUSH_BYTES" ]]; then
   echo "handoff_flush_bytes=$HANDOFF_FLUSH_BYTES"
+fi
+if [[ -n "$WRITE_PENDING_BYTES" ]]; then
+  echo "write_pending_bytes=$WRITE_PENDING_BYTES"
 fi
 
 if [[ -n "$INPUT_FRAGMENTS" ]]; then
@@ -89,6 +93,9 @@ for implementation in $IMPLEMENTATIONS; do
           fi
           if [[ -n "$HANDOFF_FLUSH_BYTES" ]]; then
             cmd+=(--handoff-flush-bytes "$HANDOFF_FLUSH_BYTES")
+          fi
+          if [[ -n "$WRITE_PENDING_BYTES" ]]; then
+            cmd+=(--write-pending-bytes "$WRITE_PENDING_BYTES")
           fi
           if [[ "$DURATION_SECONDS" != "0" ]]; then
             cmd+=(--duration-seconds "$DURATION_SECONDS")

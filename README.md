@@ -214,19 +214,78 @@ async fn submit_owned_write<W>(writer: W) -> Result<(), Box<dyn std::error::Erro
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let handoff = WriteHandoff::spawn(writer, WriteHandoffConfig::new(1024, 8 * 1024 * 1024));
+    let handoff = WriteHandoff::spawn(writer, WriteHandoffConfig::default());
     let mut coalescer = WriteCoalescer::new(handoff.clone());
 
     coalescer
         .write_fire_and_forget(Bytes::from_static(b"owned bytes"))
         .await?;
     coalescer.flush().await?;
+    handoff.flush().await?;
 
     // Use `try_write` or `write` instead when the producer needs a completion
     // ticket for this chunk.
     Ok(())
 }
 ```
+
+`WriteHandoff::flush()` waits for all previously accepted writes to reach the
+underlying writer and then flushes that writer. Use it when downstream flush
+semantics matter.
+Use `WriteHandoff::drain()` instead when you only need the accepted-write
+barrier and do not need to call `AsyncWrite::flush` on the underlying writer.
+
+`WriteHandoffConfig::default()` uses the measured default write budgets:
+`DEFAULT_WRITE_MAX_ITEMS` is 1024 queued items, `DEFAULT_WRITE_COALESCE_THRESHOLD`
+is 16 KiB, `DEFAULT_WRITE_PENDING_CHUNKS` is 8, and
+`DEFAULT_WRITE_MAX_PENDING_BYTES` is therefore 128 KiB. Tune
+`max_pending_bytes` upward when producers can legitimately accumulate more than
+eight coalesced chunks without downstream progress; tune it downward to put a
+tighter cap on queued owned bytes. Tune `max_items` when many small producers can
+fill the item queue before they fill the byte budget. Use
+`WriteHandoffConfig::default().with_max_pending_bytes(...)` or
+`with_max_items(...)` when you want to change one budget and keep the rest of the
+measured defaults.
+
+Completion tickets can expose the write completion record when producers need
+handoff-local timing:
+
+```rust
+let ticket = handoff
+    .write_with_completion_stats(Bytes::from_static(b"SET key value\r\n"))
+    .await?;
+let completion = ticket.wait_completion().await?;
+let stats = completion.stats();
+
+// `stats` includes accepted-to-write queue time, writer-call time, and
+// accepted-to-completion handoff time.
+record_write_metrics(stats.queue_nanos, stats.write_nanos, stats.e2e_nanos);
+completion.into_result()?;
+```
+
+For request metadata such as Eden command count or an upstream request start
+time, use a completion callback and capture that metadata in the closure:
+
+```rust
+let command_count = request.command_count();
+let request_started_at = std::time::Instant::now();
+let bytes = request.into_response_bytes();
+
+handoff
+    .write_with_completion_callback(bytes, move |completion| {
+        let app_e2e_nanos = request_started_at.elapsed().as_nanos();
+        let stats = completion.stats();
+        record_response_metrics(command_count, app_e2e_nanos, stats);
+        if let Err(err) = completion.into_result() {
+            record_write_error(command_count, err);
+        }
+    })
+    .await?;
+```
+
+The callback is registered only after the write is accepted into the handoff. If
+submission returns an immediate error, no completion callback runs and the caller
+still owns that synchronous failure path.
 
 `WriteCoalescer` is an optional fire-and-forget helper around `WriteHandoff`.
 It collects small adjacent writes up to a byte threshold before submitting one
@@ -235,8 +294,9 @@ owned `Bytes` chunk to the writer task. The default threshold is 16 KiB
 `WriteCoalescer::with_threshold`, or use `WriteCoalescerConfig::immediate()` for
 flush-every-write behavior. Always call `flush()` at message boundaries, before
 switching modes when downstream latency matters, and before closing. Keep the
-`WriteHandoffConfig` pending-byte budget at least as large as the coalescing
-threshold.
+`WriteHandoffConfig` pending-byte budget large enough to cover the coalescing
+threshold plus any message-boundary prefix or tail writes that may be accepted
+before the writer task catches up.
 
 The tradeoff is direct: a larger threshold reduces queueing, notification, and
 writer-task overhead under tiny fragmented input; a smaller threshold makes
@@ -366,7 +426,7 @@ assert_eq!(first_step.thresholds(), &[1]);
 ## Telemetry Feature
 
 The `telemetry` feature exposes `HandoffReadTelemetry` and
-`HandoffReadTelemetryHandle`, backed by `fast-telemetry 0.4`. Attach a handle to
+`HandoffReadTelemetryHandle`, backed by `fast-telemetry 0.6`. Attach a handle to
 a buffer when you want read-path counters, size histograms, peak gauges,
 snapshots, or text serialization:
 
@@ -385,6 +445,39 @@ telemetry.export_dogstatsd(&mut dogstatsd, &[("component", "bytes_handoff")]);
 println!("{snapshot:?}");
 println!("{prometheus}");
 ```
+
+If the parent application already owns a `fast-telemetry` runtime, pass that
+runtime to `bytes-handoff` as `Some(parent)`. The read metrics are registered
+under the `bytes_handoff_read` scope and the returned direct handle records into
+the parent runtime. Passing `None` starts a local `bytes-handoff` runtime with
+available parallelism:
+
+```rust
+use bytes_handoff::{HandoffBuffer, HandoffReadTelemetryRuntime};
+
+let parent_read_telemetry: Option<HandoffReadTelemetryRuntime> =
+    Some(fast_telemetry::Runtime::new(fast_telemetry::RuntimeConfig::default()));
+let mut buffer = HandoffBuffer::new(64 * 1024)
+    .with_optional_telemetry(parent_read_telemetry.clone());
+
+// The parent app can snapshot or export the same metrics from its normal
+// telemetry task by visiting the shared runtime.
+let runtime = parent_read_telemetry.expect("parent telemetry configured");
+assert_eq!(runtime.registered_metrics_len(), 1);
+
+let mut local_buffer = HandoffBuffer::new(64 * 1024)
+    .with_optional_telemetry(None);
+```
+
+`HandoffReadTelemetry::from_optional_runtime` and
+`HandoffReadTelemetryHandle::from_optional_runtime` provide the same
+`Some(parent)` / `None(local)` behavior when the parent app wants to keep the
+wrapper or handle directly. The older `from_optional_shared_metrics` helpers
+still accept a raw `Arc<HandoffReadMetrics>` for tests or embedded collectors
+that do not use the `fast-telemetry` runtime registry.
+`HandoffReadTelemetry::visit_metrics` and the
+generated `HandoffReadMetrics::visit_metrics` method expose the structured
+`fast_telemetry::MetricVisitor` path for custom in-process collectors.
 
 The read metric set covers successful reads, read errors, buffer-limit read
 errors, read-size and buffered-size distributions, peak buffered bytes, buffer
@@ -535,8 +628,8 @@ Run shape:
 - tunnel handoff flush threshold: immediate or the 16 KiB default, as shown
 - fragmented TCP/MSS rows: 512 KiB handoff write pending budget, so the
   threshold comparison is not primarily a backpressure measurement
-- coalesced table: 32 KiB default handoff write pending budget
-  (`2 * read_reserve`)
+- coalesced table: 128 KiB default handoff write pending budget
+  (`DEFAULT_WRITE_PENDING_CHUNKS * read_reserve`)
 - completion mode: fire-and-forget
 - runs: 2 per point
 - target duration: 5 seconds per run

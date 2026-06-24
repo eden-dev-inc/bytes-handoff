@@ -11,7 +11,7 @@ use tokio::io::AsyncReadExt;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (client, mut server) = tokio::io::duplex(128);
-    let handoff = WriteHandoff::spawn(client, WriteHandoffConfig::new(16, 1024));
+    let handoff = WriteHandoff::spawn(client, WriteHandoffConfig::default());
     let mut coalescer = WriteCoalescer::with_threshold_and_stats(handoff, 8);
 
     coalescer

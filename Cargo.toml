@@ -20,8 +20,8 @@ resolver = "3"
 
 [dependencies]
 bytes = "1.11"
-fast-telemetry = { version = "0.4", optional = true }
-fast-telemetry-export = { version = "0.4", optional = true, default-features = false }
+fast-telemetry = { version = "0.6", features = ["runtime"], optional = true }
+fast-telemetry-export = { version = "0.6", optional = true, default-features = false }
 hdrhistogram = { version = "7", optional = true }
 libc = { version = "0.2", optional = true }
 monoio = { version = "0.2.4", default-features = false, features = ["bytes", "legacy"], optional = true }

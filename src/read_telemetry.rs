@@ -1,6 +1,10 @@
 use std::sync::Arc;
 
-use fast_telemetry::{Counter, ExportMetrics, Histogram, MaxGauge};
+use fast_telemetry::{
+    Counter, ExportMetrics, Histogram, MaxGauge, MetricScope, MetricVisitor, Runtime, RuntimeConfig,
+};
+
+pub const HANDOFF_READ_METRIC_SCOPE: &str = "bytes_handoff_read";
 
 const SIZE_BUCKETS: &[u64] = &[
     0, 64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768, 65_536, 131_072, 262_144,
@@ -127,6 +131,9 @@ pub struct HandoffReadMetrics {
     pub buffered_bytes: Histogram,
 }
 
+/// Shared fast-telemetry runtime for bytes-handoff read metrics.
+pub type HandoffReadTelemetryRuntime = Arc<Runtime>;
+
 impl HandoffReadMetrics {
     pub fn new(metric_shards: usize) -> Self {
         let metric_shards = metric_shards.max(1);
@@ -159,10 +166,42 @@ impl HandoffReadMetrics {
             buffered_bytes: Histogram::new(SIZE_BUCKETS, metric_shards),
         }
     }
+
+    pub fn snapshot(&self) -> HandoffReadMetricsSnapshot {
+        HandoffReadMetricsSnapshot {
+            read_calls: counter_sum(&self.read_calls),
+            read_bytes: counter_sum(&self.read_bytes),
+            read_errors: counter_sum(&self.read_errors),
+            read_error_limit_exceeded: counter_sum(&self.read_error_limit_exceeded),
+            zero_reads: counter_sum(&self.zero_reads),
+            buffer_growths: counter_sum(&self.buffer_growths),
+            buffer_growth_bytes: counter_sum(&self.buffer_growth_bytes),
+            max_buffered_bytes: max_gauge_value(&self.max_buffered_bytes),
+            split_prefixes: counter_sum(&self.split_prefixes),
+            split_prefix_bytes: counter_sum(&self.split_prefix_bytes),
+            copied_prefixes: counter_sum(&self.copied_prefixes),
+            copied_prefix_bytes: counter_sum(&self.copied_prefix_bytes),
+            frozen_prefixes: counter_sum(&self.frozen_prefixes),
+            frozen_prefix_bytes: counter_sum(&self.frozen_prefix_bytes),
+            mutable_prefixes: counter_sum(&self.mutable_prefixes),
+            mutable_prefix_bytes: counter_sum(&self.mutable_prefix_bytes),
+            freeze_all_calls: counter_sum(&self.freeze_all_calls),
+            freeze_all_bytes: counter_sum(&self.freeze_all_bytes),
+            advances: counter_sum(&self.advances),
+            advanced_bytes: counter_sum(&self.advanced_bytes),
+            tails_taken: counter_sum(&self.tails_taken),
+            tail_bytes: counter_sum(&self.tail_bytes),
+            monoio_read_buffer_swaps: counter_sum(&self.monoio_read_buffer_swaps),
+            monoio_read_buffer_copies: counter_sum(&self.monoio_read_buffer_copies),
+            read_size_bytes: histogram_summary(&self.read_size_bytes),
+            buffered_bytes: histogram_summary(&self.buffered_bytes),
+        }
+    }
 }
 
 pub struct HandoffReadTelemetry {
-    metrics: HandoffReadMetrics,
+    runtime: Option<HandoffReadTelemetryRuntime>,
+    metrics: Arc<HandoffReadMetrics>,
 }
 
 impl std::fmt::Debug for HandoffReadTelemetry {
@@ -175,21 +214,104 @@ impl std::fmt::Debug for HandoffReadTelemetry {
 
 impl HandoffReadTelemetry {
     pub fn new(metric_shards: usize) -> Arc<Self> {
-        Arc::new(Self {
-            metrics: HandoffReadMetrics::new(metric_shards),
-        })
+        let runtime = Runtime::new(RuntimeConfig::default());
+        Self::from_runtime_with_shards(runtime, metric_shards)
     }
 
     pub fn with_available_parallelism() -> Arc<Self> {
+        let runtime = Runtime::new(RuntimeConfig::default());
+        Self::from_runtime(runtime)
+    }
+
+    pub fn metric_scope() -> MetricScope {
+        MetricScope::from(HANDOFF_READ_METRIC_SCOPE)
+    }
+
+    pub fn from_metrics(metrics: HandoffReadMetrics) -> Arc<Self> {
+        let runtime = Runtime::new(RuntimeConfig::default());
+        Self::from_runtime_and_metrics(runtime, metrics)
+    }
+
+    pub fn from_shared_metrics(metrics: Arc<HandoffReadMetrics>) -> Arc<Self> {
+        Arc::new(Self {
+            runtime: None,
+            metrics,
+        })
+    }
+
+    /// Register a bytes-handoff read metric group on `runtime`.
+    ///
+    /// Recording uses the returned direct metric handles. Parent applications
+    /// can export the registered group by visiting the shared runtime.
+    pub fn from_runtime(runtime: HandoffReadTelemetryRuntime) -> Arc<Self> {
         let metric_shards = std::thread::available_parallelism()
             .map(|value| value.get())
             .unwrap_or(1);
-        Self::new(metric_shards)
+        Self::from_runtime_with_shards(runtime, metric_shards)
+    }
+
+    /// Register a bytes-handoff read metric group on `runtime` with an explicit
+    /// metric shard count.
+    pub fn from_runtime_with_shards(
+        runtime: HandoffReadTelemetryRuntime,
+        metric_shards: usize,
+    ) -> Arc<Self> {
+        Self::from_runtime_and_metrics(runtime, HandoffReadMetrics::new(metric_shards))
+    }
+
+    /// Register an already constructed bytes-handoff read metric group on
+    /// `runtime`.
+    pub fn from_runtime_and_metrics(
+        runtime: HandoffReadTelemetryRuntime,
+        metrics: HandoffReadMetrics,
+    ) -> Arc<Self> {
+        let metrics = runtime
+            .register_metrics(Self::metric_scope(), metrics)
+            .into_metrics();
+        Arc::new(Self {
+            runtime: Some(runtime),
+            metrics,
+        })
+    }
+
+    /// Use the parent fast-telemetry runtime when provided, or create a local
+    /// runtime with available parallelism when `runtime` is `None`.
+    pub fn from_optional_runtime(runtime: Option<HandoffReadTelemetryRuntime>) -> Arc<Self> {
+        match runtime {
+            Some(runtime) => Self::from_runtime(runtime),
+            None => Self::with_available_parallelism(),
+        }
+    }
+
+    pub fn from_optional_shared_metrics(metrics: Option<Arc<HandoffReadMetrics>>) -> Arc<Self> {
+        match metrics {
+            Some(metrics) => Self::from_shared_metrics(metrics),
+            None => Self::with_available_parallelism(),
+        }
     }
 
     #[inline(always)]
     pub fn metrics(&self) -> &HandoffReadMetrics {
-        &self.metrics
+        self.metrics.as_ref()
+    }
+
+    #[inline(always)]
+    pub fn runtime(&self) -> Option<&HandoffReadTelemetryRuntime> {
+        self.runtime.as_ref()
+    }
+
+    #[inline(always)]
+    pub fn shared_runtime(&self) -> Option<HandoffReadTelemetryRuntime> {
+        self.runtime.clone()
+    }
+
+    #[inline(always)]
+    pub fn shared_metrics(&self) -> Arc<HandoffReadMetrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    pub fn visit_metrics(&self, visitor: &mut dyn MetricVisitor) {
+        self.metrics.visit_metrics(visitor);
     }
 
     pub fn export_prometheus(&self) -> String {
@@ -245,34 +367,7 @@ impl HandoffReadTelemetry {
     }
 
     pub fn snapshot(&self) -> HandoffReadMetricsSnapshot {
-        HandoffReadMetricsSnapshot {
-            read_calls: counter_sum(&self.metrics.read_calls),
-            read_bytes: counter_sum(&self.metrics.read_bytes),
-            read_errors: counter_sum(&self.metrics.read_errors),
-            read_error_limit_exceeded: counter_sum(&self.metrics.read_error_limit_exceeded),
-            zero_reads: counter_sum(&self.metrics.zero_reads),
-            buffer_growths: counter_sum(&self.metrics.buffer_growths),
-            buffer_growth_bytes: counter_sum(&self.metrics.buffer_growth_bytes),
-            max_buffered_bytes: max_gauge_value(&self.metrics.max_buffered_bytes),
-            split_prefixes: counter_sum(&self.metrics.split_prefixes),
-            split_prefix_bytes: counter_sum(&self.metrics.split_prefix_bytes),
-            copied_prefixes: counter_sum(&self.metrics.copied_prefixes),
-            copied_prefix_bytes: counter_sum(&self.metrics.copied_prefix_bytes),
-            frozen_prefixes: counter_sum(&self.metrics.frozen_prefixes),
-            frozen_prefix_bytes: counter_sum(&self.metrics.frozen_prefix_bytes),
-            mutable_prefixes: counter_sum(&self.metrics.mutable_prefixes),
-            mutable_prefix_bytes: counter_sum(&self.metrics.mutable_prefix_bytes),
-            freeze_all_calls: counter_sum(&self.metrics.freeze_all_calls),
-            freeze_all_bytes: counter_sum(&self.metrics.freeze_all_bytes),
-            advances: counter_sum(&self.metrics.advances),
-            advanced_bytes: counter_sum(&self.metrics.advanced_bytes),
-            tails_taken: counter_sum(&self.metrics.tails_taken),
-            tail_bytes: counter_sum(&self.metrics.tail_bytes),
-            monoio_read_buffer_swaps: counter_sum(&self.metrics.monoio_read_buffer_swaps),
-            monoio_read_buffer_copies: counter_sum(&self.metrics.monoio_read_buffer_copies),
-            read_size_bytes: histogram_summary(&self.metrics.read_size_bytes),
-            buffered_bytes: histogram_summary(&self.metrics.buffered_bytes),
-        }
+        self.metrics.snapshot()
     }
 
     #[inline(always)]
@@ -387,6 +482,36 @@ impl HandoffReadTelemetryHandle {
         }
     }
 
+    pub fn from_metrics(metrics: HandoffReadMetrics) -> Self {
+        Self {
+            inner: HandoffReadTelemetry::from_metrics(metrics),
+        }
+    }
+
+    pub fn from_shared_metrics(metrics: Arc<HandoffReadMetrics>) -> Self {
+        Self {
+            inner: HandoffReadTelemetry::from_shared_metrics(metrics),
+        }
+    }
+
+    pub fn from_runtime(runtime: HandoffReadTelemetryRuntime) -> Self {
+        Self {
+            inner: HandoffReadTelemetry::from_runtime(runtime),
+        }
+    }
+
+    pub fn from_optional_runtime(runtime: Option<HandoffReadTelemetryRuntime>) -> Self {
+        Self {
+            inner: HandoffReadTelemetry::from_optional_runtime(runtime),
+        }
+    }
+
+    pub fn from_optional_shared_metrics(metrics: Option<Arc<HandoffReadMetrics>>) -> Self {
+        Self {
+            inner: HandoffReadTelemetry::from_optional_shared_metrics(metrics),
+        }
+    }
+
     #[inline(always)]
     pub fn telemetry(&self) -> &HandoffReadTelemetry {
         self.inner.as_ref()
@@ -488,6 +613,59 @@ mod tests {
         telemetry.record_split_prefix(16, true, 48);
         telemetry.record_freeze_all(48);
         telemetry
+    }
+
+    #[test]
+    fn records_into_caller_owned_metrics() {
+        let metrics = Arc::new(HandoffReadMetrics::new(1));
+        let telemetry = HandoffReadTelemetry::from_shared_metrics(Arc::clone(&metrics));
+
+        telemetry.record_read(64, 64);
+        telemetry.record_split_prefix(16, false, 48);
+        telemetry.record_advance(8, 40);
+
+        assert!(Arc::ptr_eq(&metrics, &telemetry.shared_metrics()));
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.read_calls, 1);
+        assert_eq!(snapshot.read_bytes, 64);
+        assert_eq!(snapshot.split_prefixes, 1);
+        assert_eq!(snapshot.frozen_prefixes, 1);
+        assert_eq!(snapshot.advances, 1);
+        assert_eq!(snapshot.advanced_bytes, 8);
+
+        let mut prometheus = String::new();
+        metrics.export_prometheus(&mut prometheus);
+        assert!(prometheus.contains("bytes_handoff_read_read_calls 1"));
+    }
+
+    #[test]
+    fn optional_runtime_uses_parent_or_creates_local_metrics() {
+        let parent_runtime = Runtime::new(RuntimeConfig::default());
+        let parent_telemetry =
+            HandoffReadTelemetry::from_optional_runtime(Some(Arc::clone(&parent_runtime)));
+
+        assert!(
+            parent_telemetry
+                .runtime()
+                .is_some_and(|runtime| Arc::ptr_eq(runtime, &parent_runtime))
+        );
+        assert_eq!(parent_runtime.registered_metrics_len(), 1);
+        assert_eq!(
+            parent_runtime.scopes(),
+            vec![HandoffReadTelemetry::metric_scope()]
+        );
+        parent_telemetry.record_read(32, 32);
+        assert_eq!(parent_telemetry.snapshot().read_bytes, 32);
+
+        let local_telemetry = HandoffReadTelemetry::from_optional_runtime(None);
+        assert!(local_telemetry.runtime().is_some());
+        assert!(!Arc::ptr_eq(
+            &parent_telemetry.shared_metrics(),
+            &local_telemetry.shared_metrics()
+        ));
+        local_telemetry.record_read(16, 16);
+        assert_eq!(local_telemetry.snapshot().read_bytes, 16);
     }
 
     #[test]

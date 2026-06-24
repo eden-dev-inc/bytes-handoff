@@ -164,6 +164,8 @@ echo "transport=$TRANSPORT implementation=$IMPLEMENTATION scenario=$SCENARIO com
 echo "route_frames=$ROUTE_FRAMES frame_len=$FRAME_LEN tunnel_bytes=$TUNNEL_BYTES input_model=$INPUT_MODEL tcp_mss_bytes=$TCP_MSS_BYTES tcp_shard_mode=$TCP_SHARD_MODE read_reserve=$READ_RESERVE duplex_capacity=$DUPLEX_CAPACITY"
 if [[ -n "$WRITE_PENDING_BYTES" ]]; then
   echo "write_pending_bytes=$WRITE_PENDING_BYTES"
+else
+  echo "write_pending_bytes=default_8x_read_reserve"
 fi
 if [[ -n "$HANDOFF_FLUSH_BYTES" ]]; then
   echo "handoff_flush_bytes=$HANDOFF_FLUSH_BYTES"
