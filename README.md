@@ -46,7 +46,7 @@ to read from `monoio::io::AsyncReadRent` sources without changing the
 `HandoffBuffer` parsing model:
 
 ```toml
-bytes-handoff = { version = "1.2", features = ["monoio"] }
+bytes-handoff = { version = "1.3", features = ["monoio"] }
 ```
 
 Enable `telemetry` to attach `fast-telemetry` counters, histograms, and gauges to
@@ -54,7 +54,7 @@ Enable `telemetry` to attach `fast-telemetry` counters, histograms, and gauges t
 serialize Prometheus or DogStatsD text:
 
 ```toml
-bytes-handoff = { version = "1.2", features = ["telemetry"] }
+bytes-handoff = { version = "1.3", features = ["telemetry"] }
 ```
 
 Enable `telemetry-otlp` or `telemetry-clickhouse` when the parent application
@@ -68,7 +68,7 @@ read API plus `fast-telemetry-export`'s Monoio-native exporter and local
 flushing helpers:
 
 ```toml
-bytes-handoff = { version = "1.2", features = ["telemetry-monoio"] }
+bytes-handoff = { version = "1.3", features = ["telemetry-monoio"] }
 ```
 
 The telemetry feature is disabled by default. When it is off, the optional
@@ -521,7 +521,7 @@ should run inside Monoio workers.
 Enable `monoio` to use Monoio's ownership-based I/O traits directly:
 
 ```toml
-bytes-handoff = { version = "1.2", features = ["monoio"] }
+bytes-handoff = { version = "1.3", features = ["monoio"] }
 ```
 
 With the feature enabled, `HandoffBuffer::read_available_monoio` accepts
