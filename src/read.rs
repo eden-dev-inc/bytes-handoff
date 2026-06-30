@@ -448,10 +448,21 @@ impl HandoffBuffer {
         self.config.max_len.saturating_sub(self.buf.len())
     }
 
+    #[cfg(not(feature = "telemetry"))]
+    fn read_reserve(&self) -> Result<usize, BufferError> {
+        match self.remaining_capacity().min(self.config.read_reserve) {
+            0 => Err(BufferError::LimitExceeded {
+                attempted: self.buf.len().saturating_add(1),
+                limit: self.config.max_len,
+            }),
+            reserve => Ok(reserve),
+        }
+    }
+
+    #[cfg(feature = "telemetry")]
     fn read_reserve(&mut self) -> Result<usize, BufferError> {
         match self.remaining_capacity().min(self.config.read_reserve) {
             0 => {
-                #[cfg(feature = "telemetry")]
                 self.record_read_error(true);
                 Err(BufferError::LimitExceeded {
                     attempted: self.buf.len().saturating_add(1),
@@ -502,12 +513,22 @@ impl HandoffBuffer {
         read_buf
     }
 
-    #[cfg(feature = "monoio")]
+    #[cfg(all(feature = "monoio", not(feature = "telemetry")))]
+    fn check_monoio_read_len(&self, read: usize, reserve: usize) -> Result<(), BufferError> {
+        match read.cmp(&reserve) {
+            Ordering::Less | Ordering::Equal => Ok(()),
+            Ordering::Greater => Err(BufferError::LimitExceeded {
+                attempted: self.buf.len().saturating_add(read),
+                limit: self.config.max_len,
+            }),
+        }
+    }
+
+    #[cfg(all(feature = "monoio", feature = "telemetry"))]
     fn check_monoio_read_len(&mut self, read: usize, reserve: usize) -> Result<(), BufferError> {
         match read.cmp(&reserve) {
             Ordering::Less | Ordering::Equal => Ok(()),
             Ordering::Greater => {
-                #[cfg(feature = "telemetry")]
                 self.record_read_error(true);
                 Err(BufferError::LimitExceeded {
                     attempted: self.buf.len().saturating_add(read),

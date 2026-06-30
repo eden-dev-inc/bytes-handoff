@@ -10,20 +10,50 @@ New commit: `072eb54`
 
 Update: a later commit on this branch changes the default
 `HandoffReadTelemetryHandle` mode from direct counters to the grouped
-`CounterSet` buffer. The measurements below isolate the earlier `072eb54`
-state, where grouped counters were available but opt-in.
+`CounterSet` buffer. A follow-up investigation found that the apparent large
+8-worker regression was caused by the local, untracked `Cargo.lock` resolving
+older benchmark dependencies in the new worktree (`bytes 1.11.1` and
+`tokio 1.52.1`) than in the old worktree (`bytes 1.12.0` and `tokio 1.52.3`).
+After `cargo update`, the no-telemetry baseline recovered.
 
-After the default switch, a short smoke run of the grouped default path produced
-these telemetry-on results:
+The grouped-counter default was also retuned from flushing every `64` counter
+operations to flushing every `1_024` counter operations. The stream harness now
+has benchmark-only switches for direct counters and explicit grouped flush
+intervals so this comparison can be repeated directly.
 
-| workers | runs | duration | mean MiB/s | mean CPU cores | mean ns/B | mean p99 us | result directory |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| 1 | 3 | 2 s | 274.84 | 0.85 | 3.03 | 5246.33 | `bench/results/stream_cached_handoff_fragmented_ticket_20260630_174621_97527` |
-| 8 | 3 | 2 s | 1100.80 | 7.27 | 6.30 | 3937.00 | `bench/results/stream_cached_handoff_fragmented_ticket_20260630_174635_98147` |
+Corrected 8-worker head-to-head rerun after dependency lock update and the
+`1_024` default flush interval:
 
-The single-worker smoke run was noisy and should not be treated as a final
-comparison. Re-run the full matrix against the latest branch head when making a
-release decision on the default grouped-counter path.
+| commit | workers | telemetry | mean MiB/s | median MiB/s | stdev MiB/s | mean CPU cores | mean ns/B | mean p99 us |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| old `b494c45` | 8 | off | 1643.84 | 1665.71 | 47.50 | 7.35 | 4.27 | 2778.60 |
+| old `b494c45` | 8 | on | 1586.23 | 1592.66 | 18.38 | 7.45 | 4.48 | 2799.00 |
+| new working tree | 8 | off | 1760.39 | 1771.44 | 53.75 | 7.45 | 4.04 | 2561.40 |
+| new working tree | 8 | on, grouped default 1024 | 1678.84 | 1680.15 | 11.79 | 7.46 | 4.24 | 2676.60 |
+
+Corrected 8-worker overheads:
+
+| workers | old mean overhead | new mean overhead | mean delta-of-deltas | new on vs old on | new off vs old off |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | -3.50% | -4.63% | -1.13 pp | +5.84% | +7.09% |
+
+Counter-mode tuning sweep on the new branch:
+
+| telemetry counter mode | runs | mean MiB/s | median MiB/s | stdev MiB/s | mean ns/B | mean p99 us |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| direct counters | 3 | 1611.10 | 1614.23 | 67.11 | 4.43 | 2758.33 |
+| grouped flush 1024 | 3 | 1637.10 | 1634.94 | 5.13 | 4.35 | 2749.00 |
+| grouped flush 4096 | 3 | 1636.03 | 1630.96 | 60.19 | 4.35 | 2683.67 |
+| grouped flush 8192 | 3 | 1613.68 | 1609.15 | 9.75 | 4.40 | 2791.67 |
+| grouped default 1024 | 5 | 1678.84 | 1680.15 | 11.79 | 4.24 | 2676.60 |
+
+The corrected result no longer shows a new baseline regression. The new
+telemetry-on row is slightly higher than the old telemetry-on row, while the
+remaining overhead is about one percentage point larger than the old path on
+this workload. That remaining cost is expected to be dominated by the
+read-size/buffered-size histograms and max gauge, which still record directly on
+every read/consume event; grouped counters remove only the counter-update part
+of the hot path.
 
 ## Goal
 
@@ -69,6 +99,14 @@ Old commit results were produced from
 | old 8 workers, telemetry on | `/private/tmp/bytes-handoff-existing-telemetry-b494c45/bench/results/stream_cached_handoff_fragmented_ticket_20260630_173533_42093` |
 | new 8 workers, telemetry off | `bench/results/stream_cached_handoff_fragmented_ticket_20260630_173604_45050` |
 | new 8 workers, telemetry on | `bench/results/stream_cached_handoff_fragmented_ticket_20260630_173636_47301` |
+| corrected old 8 workers, telemetry off | `/private/tmp/bytes-handoff-existing-telemetry-b494c45/bench/results/stream_cached_handoff_fragmented_ticket_20260630_180014_64382` |
+| corrected old 8 workers, telemetry on | `/private/tmp/bytes-handoff-existing-telemetry-b494c45/bench/results/stream_cached_handoff_fragmented_ticket_20260630_180243_69604` |
+| corrected new 8 workers, telemetry off | `bench/results/stream_cached_handoff_fragmented_ticket_20260630_180823_91590` |
+| corrected new 8 workers, telemetry on, grouped default 1024 | `bench/results/stream_cached_handoff_fragmented_ticket_20260630_180746_90981` |
+| new 8 workers, telemetry on, direct counters | `bench/results/stream_cached_handoff_fragmented_ticket_20260630_180557_88196` |
+| new 8 workers, telemetry on, grouped flush 1024 | `bench/results/stream_cached_handoff_fragmented_ticket_20260630_180620_88468` |
+| new 8 workers, telemetry on, grouped flush 4096 | `bench/results/stream_cached_handoff_fragmented_ticket_20260630_180640_89499` |
+| new 8 workers, telemetry on, grouped flush 8192 | `bench/results/stream_cached_handoff_fragmented_ticket_20260630_180704_90020` |
 
 ## Summary
 
@@ -113,15 +151,12 @@ mean comparison is not reliable. The median comparison is more useful: new
 telemetry-on was `363.27 MiB/s` vs new telemetry-off at `358.20 MiB/s`, which is
 within noise and does not show a single-worker regression.
 
-There is a separate baseline shift in the 8-worker no-telemetry control:
-`1594.52 MiB/s` old vs `1240.75 MiB/s` new by mean throughput. Because telemetry
-is disabled in both rows, that shift should not be attributed to the
-`fast-telemetry` recording path. The source diff outside `src/read_telemetry.rs`
-is small, but `src/read.rs` does change a few methods from shared to mutable
-receivers so telemetry buffers can flush and record through `&mut self`. If the
-8-worker no-telemetry shift persists under a more controlled run, that should be
-isolated separately with either a revert experiment or Criterion
-`read_telemetry_cost` comparisons.
+The apparent baseline shift in that first 8-worker no-telemetry control was not
+caused by the source changes. The new worktree had an untracked stale
+`Cargo.lock` that resolved older benchmark dependencies than the old worktree.
+After `cargo update`, the corrected new no-telemetry row rose to
+`1760.39 MiB/s` and the corrected new default telemetry row rose to
+`1678.84 MiB/s`.
 
 ## Raw Throughput Samples
 
@@ -135,3 +170,7 @@ isolated separately with either a revert experiment or Criterion
 | old 8 workers, telemetry on | `1545.62`, `1507.84`, `1458.87`, `1529.62`, `1533.84` |
 | new 8 workers, telemetry off | `1206.69`, `1253.10`, `1262.14`, `1240.56`, `1241.28` |
 | new 8 workers, telemetry on | `1182.39`, `1203.17`, `1178.04`, `1171.98`, `1126.47` |
+| corrected old 8 workers, telemetry off | `1670.94`, `1665.71`, `1686.66`, `1627.66`, `1568.23` |
+| corrected old 8 workers, telemetry on | `1597.05`, `1558.73`, `1592.66`, `1605.22`, `1577.47` |
+| corrected new 8 workers, telemetry off | `1812.43`, `1809.07`, `1711.77`, `1771.44`, `1697.22` |
+| corrected new 8 workers, telemetry on, grouped default 1024 | `1689.73`, `1677.80`, `1686.92`, `1680.15`, `1659.62` |

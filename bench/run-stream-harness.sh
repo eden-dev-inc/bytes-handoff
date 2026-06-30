@@ -28,6 +28,8 @@ TCP_SHARD_MODE="${TCP_SHARD_MODE:-shared}"
 READ_RESERVE="16384"
 HANDOFF_FLUSH_BYTES=""
 READ_TELEMETRY="0"
+READ_TELEMETRY_DIRECT="0"
+READ_TELEMETRY_COUNTER_FLUSH_EVERY=""
 COALESCER_STATS="0"
 WRITE_PENDING_BYTES=""
 DUPLEX_CAPACITY="262144"
@@ -57,6 +59,8 @@ while [[ $# -gt 0 ]]; do
     --read-reserve) READ_RESERVE="$2"; shift 2 ;;
     --handoff-flush-bytes) HANDOFF_FLUSH_BYTES="$2"; shift 2 ;;
     --read-telemetry) READ_TELEMETRY="1"; shift ;;
+    --read-telemetry-direct) READ_TELEMETRY="1"; READ_TELEMETRY_DIRECT="1"; shift ;;
+    --read-telemetry-counter-flush-every) READ_TELEMETRY="1"; READ_TELEMETRY_COUNTER_FLUSH_EVERY="$2"; shift 2 ;;
     --coalescer-stats) COALESCER_STATS="1"; shift ;;
     --write-pending-bytes) WRITE_PENDING_BYTES="$2"; shift 2 ;;
     --duplex-capacity) DUPLEX_CAPACITY="$2"; shift 2 ;;
@@ -68,7 +72,7 @@ while [[ $# -gt 0 ]]; do
     --help)
       echo "Usage: $0 [--transport duplex|cached|tcp] [--implementation handoff|monoio_handoff|bytesmut_handoff|manual_vec|raw_copy] [--scenario fragmented|coalesced|all] [--completion ticket|fire_and_forget] [--worker-threads N] [--connections N] [--runs N]"
       echo "          [--route-frames N] [--frame-len N] [--tunnel-bytes N] [--input-fragment N] [--input-model fixed|tcp] [--tcp-mss-bytes N] [--tcp-shard-mode shared|direct]"
-      echo "          [--read-reserve N] [--handoff-flush-bytes N] [--read-telemetry] [--coalescer-stats] [--write-pending-bytes N] [--duplex-capacity N] [--iterations N] [--duration-seconds N]"
+      echo "          [--read-reserve N] [--handoff-flush-bytes N] [--read-telemetry] [--read-telemetry-direct] [--read-telemetry-counter-flush-every N] [--coalescer-stats] [--write-pending-bytes N] [--duplex-capacity N] [--iterations N] [--duration-seconds N]"
       echo "          [--service-cores CPUSET --driver-cores CPUSET] [--idle-timeout-millis N]"
       echo ""
       echo "Environment:"
@@ -174,6 +178,12 @@ else
 fi
 echo "coalescer_stats_enabled=$COALESCER_STATS"
 echo "read_telemetry_enabled=$READ_TELEMETRY"
+echo "read_telemetry_direct=$READ_TELEMETRY_DIRECT"
+if [[ -n "$READ_TELEMETRY_COUNTER_FLUSH_EVERY" ]]; then
+  echo "read_telemetry_counter_flush_every=$READ_TELEMETRY_COUNTER_FLUSH_EVERY"
+else
+  echo "read_telemetry_counter_flush_every=default"
+fi
 echo "cargo_features=$CARGO_FEATURES"
 if [[ -n "$SERVICE_CORES" || -n "$DRIVER_CORES" ]]; then
   echo "split_tcp_service_cores=${SERVICE_CORES:-none} split_tcp_driver_cores=${DRIVER_CORES:-none} idle_timeout_millis=$IDLE_TIMEOUT_MILLIS"
@@ -235,6 +245,12 @@ run_one_scenario() {
   fi
   if [[ "$READ_TELEMETRY" == "1" ]]; then
     cmd+=(--read-telemetry)
+  fi
+  if [[ "$READ_TELEMETRY_DIRECT" == "1" ]]; then
+    cmd+=(--read-telemetry-direct)
+  fi
+  if [[ -n "$READ_TELEMETRY_COUNTER_FLUSH_EVERY" ]]; then
+    cmd+=(--read-telemetry-counter-flush-every "$READ_TELEMETRY_COUNTER_FLUSH_EVERY")
   fi
   if [[ -n "${ITERATIONS:-}" ]]; then
     cmd+=(--iterations "$ITERATIONS")

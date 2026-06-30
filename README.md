@@ -487,10 +487,10 @@ Monoio read-buffer copy versus swap decisions.
 By default, attached `HandoffReadTelemetryHandle`s use a grouped
 `fast_telemetry::CounterSet` buffer. Related counter deltas are accumulated
 locally and flushed to the shared `CounterSet` every
-`DEFAULT_READ_COUNTER_BUFFER_FLUSH_EVERY` operations, on drop, or when
-`flush_counter_buffer` / `HandoffBuffer::flush_telemetry` is called. This keeps
-the hot path on the efficient grouped-counter update path while avoiding a
-shared counter write for every read or prefix split.
+`DEFAULT_READ_COUNTER_BUFFER_FLUSH_EVERY` operations (currently `1_024`), on
+drop, or when `flush_counter_buffer` / `HandoffBuffer::flush_telemetry` is
+called. This keeps the hot path on the efficient grouped-counter update path
+while avoiding a shared counter write for every read or prefix split.
 
 ```rust
 use bytes_handoff::{

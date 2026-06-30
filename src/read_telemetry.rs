@@ -40,7 +40,7 @@ const TAIL_BYTES: usize = 20;
 const MONOIO_READ_BUFFER_SWAPS: usize = 21;
 const MONOIO_READ_BUFFER_COPIES: usize = 22;
 const READ_COUNTER_COUNT: usize = 23;
-pub const DEFAULT_READ_COUNTER_BUFFER_FLUSH_EVERY: usize = 64;
+pub const DEFAULT_READ_COUNTER_BUFFER_FLUSH_EVERY: usize = 1_024;
 
 const MAX_BUFFERED_BYTES_NAME: &str = "bytes_handoff_read_max_buffered_bytes";
 const MAX_BUFFERED_BYTES_DOGSTATSD_NAME: &str = "bytes_handoff_read.max_buffered_bytes";
