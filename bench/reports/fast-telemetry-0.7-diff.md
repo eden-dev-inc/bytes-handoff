@@ -8,6 +8,23 @@ Old commit: `b494c45`
 
 New commit: `072eb54`
 
+Update: a later commit on this branch changes the default
+`HandoffReadTelemetryHandle` mode from direct counters to the grouped
+`CounterSet` buffer. The measurements below isolate the earlier `072eb54`
+state, where grouped counters were available but opt-in.
+
+After the default switch, a short smoke run of the grouped default path produced
+these telemetry-on results:
+
+| workers | runs | duration | mean MiB/s | mean CPU cores | mean ns/B | mean p99 us | result directory |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 3 | 2 s | 274.84 | 0.85 | 3.03 | 5246.33 | `bench/results/stream_cached_handoff_fragmented_ticket_20260630_174621_97527` |
+| 8 | 3 | 2 s | 1100.80 | 7.27 | 6.30 | 3937.00 | `bench/results/stream_cached_handoff_fragmented_ticket_20260630_174635_98147` |
+
+The single-worker smoke run was noisy and should not be treated as a final
+comparison. Re-run the full matrix against the latest branch head when making a
+release decision on the default grouped-counter path.
+
 ## Goal
 
 Isolate the benchmark difference between the old `fast-telemetry 0.6` read
@@ -118,4 +135,3 @@ isolated separately with either a revert experiment or Criterion
 | old 8 workers, telemetry on | `1545.62`, `1507.84`, `1458.87`, `1529.62`, `1533.84` |
 | new 8 workers, telemetry off | `1206.69`, `1253.10`, `1262.14`, `1240.56`, `1241.28` |
 | new 8 workers, telemetry on | `1182.39`, `1203.17`, `1178.04`, `1171.98`, `1126.47` |
-

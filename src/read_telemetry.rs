@@ -562,6 +562,10 @@ impl HandoffReadCounterBuffer {
         }
     }
 
+    fn empty_like(&self) -> Self {
+        Self::new(self.flush_every)
+    }
+
     #[inline(always)]
     fn inc(&mut self, counter_idx: usize) {
         self.add(counter_idx, 1);
@@ -605,9 +609,18 @@ impl HandoffReadCounterBuffer {
             return;
         }
 
-        if self.deltas.iter().any(|delta| *delta != 0) {
-            metrics.counters.add_values(&self.deltas);
-            self.deltas.fill(0);
+        let mut updates = [(0_usize, 0_isize); READ_COUNTER_COUNT];
+        let mut update_count = 0;
+        for (counter_idx, delta) in self.deltas.iter_mut().enumerate() {
+            if *delta == 0 {
+                continue;
+            }
+            updates[update_count] = (counter_idx, *delta);
+            update_count += 1;
+            *delta = 0;
+        }
+        if update_count > 0 {
+            metrics.counters.add_index_values(&updates[..update_count]);
         }
         self.ops_since_flush = 0;
         self.dirty = false;
@@ -926,7 +939,13 @@ pub struct HandoffReadTelemetryHandle {
 
 impl Clone for HandoffReadTelemetryHandle {
     fn clone(&self) -> Self {
-        Self::from_arc(&self.inner)
+        Self {
+            inner: Arc::clone(&self.inner),
+            counter_buffer: self
+                .counter_buffer
+                .as_ref()
+                .map(HandoffReadCounterBuffer::empty_like),
+        }
     }
 }
 
@@ -941,7 +960,7 @@ impl HandoffReadTelemetryHandle {
     pub fn from_arc(telemetry: &Arc<HandoffReadTelemetry>) -> Self {
         Self {
             inner: Arc::clone(telemetry),
-            counter_buffer: None,
+            counter_buffer: Some(HandoffReadCounterBuffer::default()),
         }
     }
 
@@ -979,6 +998,12 @@ impl HandoffReadTelemetryHandle {
     pub fn with_counter_flush_every(mut self, flush_every: usize) -> Self {
         self.flush_counter_buffer();
         self.counter_buffer = Some(HandoffReadCounterBuffer::new(flush_every));
+        self
+    }
+
+    pub fn with_direct_counters(mut self) -> Self {
+        self.flush_counter_buffer();
+        self.counter_buffer = None;
         self
     }
 
@@ -1280,17 +1305,17 @@ mod tests {
     }
 
     #[test]
-    fn direct_and_buffered_handles_share_snapshot_counters() {
+    fn grouped_default_and_direct_handles_share_snapshot_counters() {
         let telemetry = HandoffReadTelemetry::new(1);
-        let mut direct = HandoffReadTelemetryHandle::from_arc(&telemetry);
-        let mut buffered = HandoffReadTelemetryHandle::from_arc(&telemetry)
-            .with_counter_flush_every(DEFAULT_READ_COUNTER_BUFFER_FLUSH_EVERY);
+        let mut grouped = HandoffReadTelemetryHandle::from_arc(&telemetry);
+        let mut direct = HandoffReadTelemetryHandle::from_arc(&telemetry).with_direct_counters();
 
+        grouped.record_read(20, 20);
         direct.record_read(10, 10);
-        buffered.record_read(20, 20);
 
         assert_eq!(telemetry.snapshot().read_calls, 1);
-        buffered.flush_counter_buffer();
+        assert_eq!(telemetry.snapshot().read_size_bytes.count, 2);
+        grouped.flush_counter_buffer();
 
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot.read_calls, 2);

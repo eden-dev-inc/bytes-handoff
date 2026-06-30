@@ -482,15 +482,15 @@ that do not use the `fast-telemetry` runtime registry.
 The read metric set covers successful reads, read errors, buffer-limit read
 errors, read-size and buffered-size distributions, peak buffered bytes, buffer
 growth, prefix split strategy, tail handoff, advance/freeze activity, and
-Monoio read-buffer copy versus swap decisions. By default, attached
-`HandoffReadTelemetryHandle`s record counters directly, which keeps the
-single-writer hot path aligned with the existing telemetry implementation.
+Monoio read-buffer copy versus swap decisions.
 
-For high-contention read telemetry, handles can opt into a grouped
-`fast_telemetry::CounterSet` buffer. The buffer accumulates related counter
-deltas locally and flushes them to the shared `CounterSet` every
+By default, attached `HandoffReadTelemetryHandle`s use a grouped
+`fast_telemetry::CounterSet` buffer. Related counter deltas are accumulated
+locally and flushed to the shared `CounterSet` every
 `DEFAULT_READ_COUNTER_BUFFER_FLUSH_EVERY` operations, on drop, or when
-`flush_counter_buffer` / `HandoffBuffer::flush_telemetry` is called:
+`flush_counter_buffer` / `HandoffBuffer::flush_telemetry` is called. This keeps
+the hot path on the efficient grouped-counter update path while avoiding a
+shared counter write for every read or prefix split.
 
 ```rust
 use bytes_handoff::{
@@ -507,7 +507,11 @@ buffer.flush_telemetry();
 let exact = telemetry.snapshot();
 ```
 
-Direct handles do not require an explicit flush before snapshots or exports.
+Call `flush_counter_buffer` or `HandoffBuffer::flush_telemetry` before an exact
+snapshot or export if a buffer is still live. Dropping the handle also flushes
+pending counter deltas. Embedded collectors that need every counter immediately
+visible can opt out with `HandoffReadTelemetryHandle::with_direct_counters()`,
+trading off the grouped default path for direct counter updates.
 
 For exporter loops, the parent application owns the task and destination. The
 crate exposes the metric schema and export methods:
