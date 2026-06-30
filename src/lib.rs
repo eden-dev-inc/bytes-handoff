@@ -39,9 +39,9 @@ pub use read::{
 };
 #[cfg(feature = "telemetry")]
 pub use read_telemetry::{
-    HandoffReadHistogramSummary, HandoffReadMetrics, HandoffReadMetricsDogStatsDState,
-    HandoffReadMetricsSnapshot, HandoffReadTelemetry, HandoffReadTelemetryHandle,
-    HandoffReadTelemetryRuntime,
+    DEFAULT_READ_COUNTER_BUFFER_FLUSH_EVERY, HandoffReadHistogramSummary, HandoffReadMetrics,
+    HandoffReadMetricsDogStatsDState, HandoffReadMetricsSnapshot, HandoffReadTelemetry,
+    HandoffReadTelemetryHandle, HandoffReadTelemetryRuntime,
 };
 pub use tune::{
     DEFAULT_TUNING_BATCH_SIZE, DEFAULT_TUNING_MAX_READS_PER_FLUSH,
