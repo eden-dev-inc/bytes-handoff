@@ -1,7 +1,12 @@
 use std::sync::Arc;
 
+#[cfg(feature = "telemetry-clickhouse")]
+use fast_telemetry::ClickHouseExport;
+#[cfg(feature = "telemetry-otlp")]
+use fast_telemetry::OtlpExport;
 use fast_telemetry::{
-    Counter, ExportMetrics, Histogram, MaxGauge, MetricScope, MetricVisitor, Runtime, RuntimeConfig,
+    Counter, CounterSet, DogStatsDExport, ExportMetrics, Histogram, MaxGauge, MetricKind,
+    MetricLabels, MetricMeta, MetricScope, MetricVisitor, PrometheusExport, Runtime, RuntimeConfig,
 };
 
 pub const HANDOFF_READ_METRIC_SCOPE: &str = "bytes_handoff_read";
@@ -9,6 +14,191 @@ pub const HANDOFF_READ_METRIC_SCOPE: &str = "bytes_handoff_read";
 const SIZE_BUCKETS: &[u64] = &[
     0, 64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768, 65_536, 131_072, 262_144,
     524_288, 1_048_576, 4_194_304, 16_777_216,
+];
+
+const READ_CALLS: usize = 0;
+const READ_BYTES: usize = 1;
+const READ_ERRORS: usize = 2;
+const READ_ERROR_LIMIT_EXCEEDED: usize = 3;
+const ZERO_READS: usize = 4;
+const BUFFER_GROWTHS: usize = 5;
+const BUFFER_GROWTH_BYTES: usize = 6;
+const SPLIT_PREFIXES: usize = 7;
+const SPLIT_PREFIX_BYTES: usize = 8;
+const COPIED_PREFIXES: usize = 9;
+const COPIED_PREFIX_BYTES: usize = 10;
+const FROZEN_PREFIXES: usize = 11;
+const FROZEN_PREFIX_BYTES: usize = 12;
+const MUTABLE_PREFIXES: usize = 13;
+const MUTABLE_PREFIX_BYTES: usize = 14;
+const FREEZE_ALL_CALLS: usize = 15;
+const FREEZE_ALL_BYTES: usize = 16;
+const ADVANCES: usize = 17;
+const ADVANCED_BYTES: usize = 18;
+const TAILS_TAKEN: usize = 19;
+const TAIL_BYTES: usize = 20;
+const MONOIO_READ_BUFFER_SWAPS: usize = 21;
+const MONOIO_READ_BUFFER_COPIES: usize = 22;
+const READ_COUNTER_COUNT: usize = 23;
+pub const DEFAULT_READ_COUNTER_BUFFER_FLUSH_EVERY: usize = 1_024;
+
+const MAX_BUFFERED_BYTES_NAME: &str = "bytes_handoff_read_max_buffered_bytes";
+const MAX_BUFFERED_BYTES_DOGSTATSD_NAME: &str = "bytes_handoff_read.max_buffered_bytes";
+const MAX_BUFFERED_BYTES_HELP: &str = "Maximum buffered bytes observed by HandoffBuffer";
+const READ_SIZE_BYTES_NAME: &str = "bytes_handoff_read_read_size_bytes";
+const READ_SIZE_BYTES_DOGSTATSD_NAME: &str = "bytes_handoff_read.read_size_bytes";
+const READ_SIZE_BYTES_HELP: &str = "Read sizes returned by HandoffBuffer";
+const BUFFERED_BYTES_NAME: &str = "bytes_handoff_read_buffered_bytes";
+const BUFFERED_BYTES_DOGSTATSD_NAME: &str = "bytes_handoff_read.buffered_bytes";
+const BUFFERED_BYTES_HELP: &str = "Buffered byte counts observed after read and consume operations";
+
+#[derive(Clone, Copy, Debug)]
+struct CounterMetric {
+    counter_idx: usize,
+    name: &'static str,
+    dogstatsd_name: &'static str,
+    help: &'static str,
+}
+
+const COUNTER_METRICS: [CounterMetric; 23] = [
+    CounterMetric {
+        counter_idx: READ_CALLS,
+        name: "bytes_handoff_read_read_calls",
+        dogstatsd_name: "bytes_handoff_read.read_calls",
+        help: "Total read attempts completed by HandoffBuffer",
+    },
+    CounterMetric {
+        counter_idx: READ_BYTES,
+        name: "bytes_handoff_read_read_bytes",
+        dogstatsd_name: "bytes_handoff_read.read_bytes",
+        help: "Total bytes read into HandoffBuffer",
+    },
+    CounterMetric {
+        counter_idx: READ_ERRORS,
+        name: "bytes_handoff_read_read_errors",
+        dogstatsd_name: "bytes_handoff_read.read_errors",
+        help: "Total read attempts that returned an error",
+    },
+    CounterMetric {
+        counter_idx: READ_ERROR_LIMIT_EXCEEDED,
+        name: "bytes_handoff_read_read_error_limit_exceeded",
+        dogstatsd_name: "bytes_handoff_read.read_error_limit_exceeded",
+        help: "Total read attempts rejected because the configured buffer limit was exceeded",
+    },
+    CounterMetric {
+        counter_idx: ZERO_READS,
+        name: "bytes_handoff_read_zero_reads",
+        dogstatsd_name: "bytes_handoff_read.zero_reads",
+        help: "Total reads that returned no bytes",
+    },
+    CounterMetric {
+        counter_idx: BUFFER_GROWTHS,
+        name: "bytes_handoff_read_buffer_growths",
+        dogstatsd_name: "bytes_handoff_read.buffer_growths",
+        help: "Total buffer growth events before reads",
+    },
+    CounterMetric {
+        counter_idx: BUFFER_GROWTH_BYTES,
+        name: "bytes_handoff_read_buffer_growth_bytes",
+        dogstatsd_name: "bytes_handoff_read.buffer_growth_bytes",
+        help: "Total spare capacity bytes reserved during buffer growth",
+    },
+    CounterMetric {
+        counter_idx: SPLIT_PREFIXES,
+        name: "bytes_handoff_read_split_prefixes",
+        dogstatsd_name: "bytes_handoff_read.split_prefixes",
+        help: "Total immutable prefix splits",
+    },
+    CounterMetric {
+        counter_idx: SPLIT_PREFIX_BYTES,
+        name: "bytes_handoff_read_split_prefix_bytes",
+        dogstatsd_name: "bytes_handoff_read.split_prefix_bytes",
+        help: "Total bytes emitted by immutable prefix splits",
+    },
+    CounterMetric {
+        counter_idx: COPIED_PREFIXES,
+        name: "bytes_handoff_read_copied_prefixes",
+        dogstatsd_name: "bytes_handoff_read.copied_prefixes",
+        help: "Total immutable prefix splits served by copying",
+    },
+    CounterMetric {
+        counter_idx: COPIED_PREFIX_BYTES,
+        name: "bytes_handoff_read_copied_prefix_bytes",
+        dogstatsd_name: "bytes_handoff_read.copied_prefix_bytes",
+        help: "Total bytes emitted by copied immutable prefix splits",
+    },
+    CounterMetric {
+        counter_idx: FROZEN_PREFIXES,
+        name: "bytes_handoff_read_frozen_prefixes",
+        dogstatsd_name: "bytes_handoff_read.frozen_prefixes",
+        help: "Total immutable prefix splits served by freezing",
+    },
+    CounterMetric {
+        counter_idx: FROZEN_PREFIX_BYTES,
+        name: "bytes_handoff_read_frozen_prefix_bytes",
+        dogstatsd_name: "bytes_handoff_read.frozen_prefix_bytes",
+        help: "Total bytes emitted by frozen immutable prefix splits",
+    },
+    CounterMetric {
+        counter_idx: MUTABLE_PREFIXES,
+        name: "bytes_handoff_read_mutable_prefixes",
+        dogstatsd_name: "bytes_handoff_read.mutable_prefixes",
+        help: "Total mutable prefix splits",
+    },
+    CounterMetric {
+        counter_idx: MUTABLE_PREFIX_BYTES,
+        name: "bytes_handoff_read_mutable_prefix_bytes",
+        dogstatsd_name: "bytes_handoff_read.mutable_prefix_bytes",
+        help: "Total bytes emitted by mutable prefix splits",
+    },
+    CounterMetric {
+        counter_idx: FREEZE_ALL_CALLS,
+        name: "bytes_handoff_read_freeze_all_calls",
+        dogstatsd_name: "bytes_handoff_read.freeze_all_calls",
+        help: "Total calls that freeze all buffered bytes",
+    },
+    CounterMetric {
+        counter_idx: FREEZE_ALL_BYTES,
+        name: "bytes_handoff_read_freeze_all_bytes",
+        dogstatsd_name: "bytes_handoff_read.freeze_all_bytes",
+        help: "Total bytes emitted by freeze_all",
+    },
+    CounterMetric {
+        counter_idx: ADVANCES,
+        name: "bytes_handoff_read_advances",
+        dogstatsd_name: "bytes_handoff_read.advances",
+        help: "Total buffer advance calls",
+    },
+    CounterMetric {
+        counter_idx: ADVANCED_BYTES,
+        name: "bytes_handoff_read_advanced_bytes",
+        dogstatsd_name: "bytes_handoff_read.advanced_bytes",
+        help: "Total bytes consumed by advance calls",
+    },
+    CounterMetric {
+        counter_idx: TAILS_TAKEN,
+        name: "bytes_handoff_read_tails_taken",
+        dogstatsd_name: "bytes_handoff_read.tails_taken",
+        help: "Total tail handoffs",
+    },
+    CounterMetric {
+        counter_idx: TAIL_BYTES,
+        name: "bytes_handoff_read_tail_bytes",
+        dogstatsd_name: "bytes_handoff_read.tail_bytes",
+        help: "Total bytes emitted by tail handoffs",
+    },
+    CounterMetric {
+        counter_idx: MONOIO_READ_BUFFER_SWAPS,
+        name: "bytes_handoff_read_monoio_read_buffer_swaps",
+        dogstatsd_name: "bytes_handoff_read.monoio_read_buffer_swaps",
+        help: "Total monoio reads stored by swapping the read buffer into place",
+    },
+    CounterMetric {
+        counter_idx: MONOIO_READ_BUFFER_COPIES,
+        name: "bytes_handoff_read_monoio_read_buffer_copies",
+        dogstatsd_name: "bytes_handoff_read.monoio_read_buffer_copies",
+        help: "Total monoio reads stored by copying from the read buffer",
+    },
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,87 +237,11 @@ pub struct HandoffReadMetricsSnapshot {
     pub buffered_bytes: HandoffReadHistogramSummary,
 }
 
-#[derive(ExportMetrics)]
-#[metric_prefix = "bytes_handoff_read"]
-#[cfg_attr(feature = "telemetry-otlp", otlp)]
-#[cfg_attr(feature = "telemetry-clickhouse", clickhouse)]
 pub struct HandoffReadMetrics {
-    #[help = "Total read attempts completed by HandoffBuffer"]
-    pub read_calls: Counter,
-
-    #[help = "Total bytes read into HandoffBuffer"]
-    pub read_bytes: Counter,
-
-    #[help = "Total read attempts that returned an error"]
-    pub read_errors: Counter,
-
-    #[help = "Total read attempts rejected because the configured buffer limit was exceeded"]
-    pub read_error_limit_exceeded: Counter,
-
-    #[help = "Total reads that returned no bytes"]
-    pub zero_reads: Counter,
-
-    #[help = "Total buffer growth events before reads"]
-    pub buffer_growths: Counter,
-
-    #[help = "Total spare capacity bytes reserved during buffer growth"]
-    pub buffer_growth_bytes: Counter,
-
-    #[help = "Maximum buffered bytes observed by HandoffBuffer"]
+    direct_counters: [Counter; READ_COUNTER_COUNT],
+    counters: CounterSet,
     pub max_buffered_bytes: MaxGauge,
-
-    #[help = "Total immutable prefix splits"]
-    pub split_prefixes: Counter,
-
-    #[help = "Total bytes emitted by immutable prefix splits"]
-    pub split_prefix_bytes: Counter,
-
-    #[help = "Total immutable prefix splits served by copying"]
-    pub copied_prefixes: Counter,
-
-    #[help = "Total bytes emitted by copied immutable prefix splits"]
-    pub copied_prefix_bytes: Counter,
-
-    #[help = "Total immutable prefix splits served by freezing"]
-    pub frozen_prefixes: Counter,
-
-    #[help = "Total bytes emitted by frozen immutable prefix splits"]
-    pub frozen_prefix_bytes: Counter,
-
-    #[help = "Total mutable prefix splits"]
-    pub mutable_prefixes: Counter,
-
-    #[help = "Total bytes emitted by mutable prefix splits"]
-    pub mutable_prefix_bytes: Counter,
-
-    #[help = "Total calls that freeze all buffered bytes"]
-    pub freeze_all_calls: Counter,
-
-    #[help = "Total bytes emitted by freeze_all"]
-    pub freeze_all_bytes: Counter,
-
-    #[help = "Total buffer advance calls"]
-    pub advances: Counter,
-
-    #[help = "Total bytes consumed by advance calls"]
-    pub advanced_bytes: Counter,
-
-    #[help = "Total tail handoffs"]
-    pub tails_taken: Counter,
-
-    #[help = "Total bytes emitted by tail handoffs"]
-    pub tail_bytes: Counter,
-
-    #[help = "Total monoio reads stored by swapping the read buffer into place"]
-    pub monoio_read_buffer_swaps: Counter,
-
-    #[help = "Total monoio reads stored by copying from the read buffer"]
-    pub monoio_read_buffer_copies: Counter,
-
-    #[help = "Read sizes returned by HandoffBuffer"]
     pub read_size_bytes: Histogram,
-
-    #[help = "Buffered byte counts observed after read and consume operations"]
     pub buffered_bytes: Histogram,
 }
 
@@ -138,30 +252,9 @@ impl HandoffReadMetrics {
     pub fn new(metric_shards: usize) -> Self {
         let metric_shards = metric_shards.max(1);
         Self {
-            read_calls: Counter::new(metric_shards),
-            read_bytes: Counter::new(metric_shards),
-            read_errors: Counter::new(metric_shards),
-            read_error_limit_exceeded: Counter::new(metric_shards),
-            zero_reads: Counter::new(metric_shards),
-            buffer_growths: Counter::new(metric_shards),
-            buffer_growth_bytes: Counter::new(metric_shards),
+            direct_counters: std::array::from_fn(|_| Counter::new(metric_shards)),
+            counters: CounterSet::new(metric_shards, READ_COUNTER_COUNT),
             max_buffered_bytes: MaxGauge::new(metric_shards),
-            split_prefixes: Counter::new(metric_shards),
-            split_prefix_bytes: Counter::new(metric_shards),
-            copied_prefixes: Counter::new(metric_shards),
-            copied_prefix_bytes: Counter::new(metric_shards),
-            frozen_prefixes: Counter::new(metric_shards),
-            frozen_prefix_bytes: Counter::new(metric_shards),
-            mutable_prefixes: Counter::new(metric_shards),
-            mutable_prefix_bytes: Counter::new(metric_shards),
-            freeze_all_calls: Counter::new(metric_shards),
-            freeze_all_bytes: Counter::new(metric_shards),
-            advances: Counter::new(metric_shards),
-            advanced_bytes: Counter::new(metric_shards),
-            tails_taken: Counter::new(metric_shards),
-            tail_bytes: Counter::new(metric_shards),
-            monoio_read_buffer_swaps: Counter::new(metric_shards),
-            monoio_read_buffer_copies: Counter::new(metric_shards),
             read_size_bytes: Histogram::new(SIZE_BUCKETS, metric_shards),
             buffered_bytes: Histogram::new(SIZE_BUCKETS, metric_shards),
         }
@@ -169,33 +262,368 @@ impl HandoffReadMetrics {
 
     pub fn snapshot(&self) -> HandoffReadMetricsSnapshot {
         HandoffReadMetricsSnapshot {
-            read_calls: counter_sum(&self.read_calls),
-            read_bytes: counter_sum(&self.read_bytes),
-            read_errors: counter_sum(&self.read_errors),
-            read_error_limit_exceeded: counter_sum(&self.read_error_limit_exceeded),
-            zero_reads: counter_sum(&self.zero_reads),
-            buffer_growths: counter_sum(&self.buffer_growths),
-            buffer_growth_bytes: counter_sum(&self.buffer_growth_bytes),
+            read_calls: self.counter_value(READ_CALLS),
+            read_bytes: self.counter_value(READ_BYTES),
+            read_errors: self.counter_value(READ_ERRORS),
+            read_error_limit_exceeded: self.counter_value(READ_ERROR_LIMIT_EXCEEDED),
+            zero_reads: self.counter_value(ZERO_READS),
+            buffer_growths: self.counter_value(BUFFER_GROWTHS),
+            buffer_growth_bytes: self.counter_value(BUFFER_GROWTH_BYTES),
             max_buffered_bytes: max_gauge_value(&self.max_buffered_bytes),
-            split_prefixes: counter_sum(&self.split_prefixes),
-            split_prefix_bytes: counter_sum(&self.split_prefix_bytes),
-            copied_prefixes: counter_sum(&self.copied_prefixes),
-            copied_prefix_bytes: counter_sum(&self.copied_prefix_bytes),
-            frozen_prefixes: counter_sum(&self.frozen_prefixes),
-            frozen_prefix_bytes: counter_sum(&self.frozen_prefix_bytes),
-            mutable_prefixes: counter_sum(&self.mutable_prefixes),
-            mutable_prefix_bytes: counter_sum(&self.mutable_prefix_bytes),
-            freeze_all_calls: counter_sum(&self.freeze_all_calls),
-            freeze_all_bytes: counter_sum(&self.freeze_all_bytes),
-            advances: counter_sum(&self.advances),
-            advanced_bytes: counter_sum(&self.advanced_bytes),
-            tails_taken: counter_sum(&self.tails_taken),
-            tail_bytes: counter_sum(&self.tail_bytes),
-            monoio_read_buffer_swaps: counter_sum(&self.monoio_read_buffer_swaps),
-            monoio_read_buffer_copies: counter_sum(&self.monoio_read_buffer_copies),
+            split_prefixes: self.counter_value(SPLIT_PREFIXES),
+            split_prefix_bytes: self.counter_value(SPLIT_PREFIX_BYTES),
+            copied_prefixes: self.counter_value(COPIED_PREFIXES),
+            copied_prefix_bytes: self.counter_value(COPIED_PREFIX_BYTES),
+            frozen_prefixes: self.counter_value(FROZEN_PREFIXES),
+            frozen_prefix_bytes: self.counter_value(FROZEN_PREFIX_BYTES),
+            mutable_prefixes: self.counter_value(MUTABLE_PREFIXES),
+            mutable_prefix_bytes: self.counter_value(MUTABLE_PREFIX_BYTES),
+            freeze_all_calls: self.counter_value(FREEZE_ALL_CALLS),
+            freeze_all_bytes: self.counter_value(FREEZE_ALL_BYTES),
+            advances: self.counter_value(ADVANCES),
+            advanced_bytes: self.counter_value(ADVANCED_BYTES),
+            tails_taken: self.counter_value(TAILS_TAKEN),
+            tail_bytes: self.counter_value(TAIL_BYTES),
+            monoio_read_buffer_swaps: self.counter_value(MONOIO_READ_BUFFER_SWAPS),
+            monoio_read_buffer_copies: self.counter_value(MONOIO_READ_BUFFER_COPIES),
             read_size_bytes: histogram_summary(&self.read_size_bytes),
             buffered_bytes: histogram_summary(&self.buffered_bytes),
         }
+    }
+
+    pub fn visit_metrics<V: MetricVisitor + ?Sized>(&self, visitor: &mut V) {
+        <Self as ExportMetrics>::visit_metrics(self, visitor);
+    }
+
+    pub fn export_prometheus(&self, output: &mut String) {
+        for metric in &COUNTER_METRICS {
+            write_counter_prometheus(
+                output,
+                metric.name,
+                metric.help,
+                self.counter_value(metric.counter_idx),
+            );
+        }
+        self.max_buffered_bytes.export_prometheus(
+            output,
+            MAX_BUFFERED_BYTES_NAME,
+            MAX_BUFFERED_BYTES_HELP,
+        );
+        self.read_size_bytes
+            .export_prometheus(output, READ_SIZE_BYTES_NAME, READ_SIZE_BYTES_HELP);
+        self.buffered_bytes
+            .export_prometheus(output, BUFFERED_BYTES_NAME, BUFFERED_BYTES_HELP);
+    }
+
+    pub fn export_dogstatsd(&self, output: &mut String, tags: &[(&str, &str)]) {
+        for metric in &COUNTER_METRICS {
+            write_counter_dogstatsd(
+                output,
+                metric.dogstatsd_name,
+                self.counter_value(metric.counter_idx),
+                tags,
+            );
+        }
+        self.max_buffered_bytes
+            .export_dogstatsd(output, MAX_BUFFERED_BYTES_DOGSTATSD_NAME, tags);
+        write_histogram_dogstatsd(
+            output,
+            READ_SIZE_BYTES_DOGSTATSD_NAME,
+            self.read_size_bytes.count(),
+            self.read_size_bytes.sum(),
+            tags,
+        );
+        write_histogram_dogstatsd(
+            output,
+            BUFFERED_BYTES_DOGSTATSD_NAME,
+            self.buffered_bytes.count(),
+            self.buffered_bytes.sum(),
+            tags,
+        );
+    }
+
+    pub fn export_dogstatsd_delta(
+        &self,
+        output: &mut String,
+        tags: &[(&str, &str)],
+        state: &mut HandoffReadMetricsDogStatsDState,
+    ) {
+        for metric in &COUNTER_METRICS {
+            let current = self.counter_value(metric.counter_idx);
+            let delta = current.saturating_sub(state.counters[metric.counter_idx]);
+            state.counters[metric.counter_idx] = current;
+            write_counter_dogstatsd(output, metric.dogstatsd_name, delta, tags);
+        }
+
+        self.max_buffered_bytes
+            .export_dogstatsd(output, MAX_BUFFERED_BYTES_DOGSTATSD_NAME, tags);
+
+        let read_size_count = self.read_size_bytes.count();
+        let read_size_sum = self.read_size_bytes.sum();
+        write_histogram_dogstatsd(
+            output,
+            READ_SIZE_BYTES_DOGSTATSD_NAME,
+            read_size_count.saturating_sub(state.read_size_count),
+            read_size_sum.saturating_sub(state.read_size_sum),
+            tags,
+        );
+        state.read_size_count = read_size_count;
+        state.read_size_sum = read_size_sum;
+
+        let buffered_count = self.buffered_bytes.count();
+        let buffered_sum = self.buffered_bytes.sum();
+        write_histogram_dogstatsd(
+            output,
+            BUFFERED_BYTES_DOGSTATSD_NAME,
+            buffered_count.saturating_sub(state.buffered_count),
+            buffered_sum.saturating_sub(state.buffered_sum),
+            tags,
+        );
+        state.buffered_count = buffered_count;
+        state.buffered_sum = buffered_sum;
+    }
+
+    pub fn export_dogstatsd_with_temporality(
+        &self,
+        output: &mut String,
+        tags: &[(&str, &str)],
+        temporality: fast_telemetry::Temporality,
+        state: &mut HandoffReadMetricsDogStatsDState,
+    ) {
+        match temporality {
+            fast_telemetry::Temporality::Cumulative => self.export_dogstatsd(output, tags),
+            fast_telemetry::Temporality::Delta => self.export_dogstatsd_delta(output, tags, state),
+        }
+    }
+
+    #[cfg(feature = "telemetry-otlp")]
+    pub fn export_otlp(
+        &self,
+        metrics: &mut Vec<fast_telemetry::otlp::pb::Metric>,
+        time_unix_nano: u64,
+    ) {
+        for metric in &COUNTER_METRICS {
+            counter_from_value(self.counter_value(metric.counter_idx)).export_otlp(
+                metrics,
+                metric.name,
+                metric.help,
+                time_unix_nano,
+            );
+        }
+        self.max_buffered_bytes.export_otlp(
+            metrics,
+            MAX_BUFFERED_BYTES_NAME,
+            MAX_BUFFERED_BYTES_HELP,
+            time_unix_nano,
+        );
+        self.read_size_bytes.export_otlp(
+            metrics,
+            READ_SIZE_BYTES_NAME,
+            READ_SIZE_BYTES_HELP,
+            time_unix_nano,
+        );
+        self.buffered_bytes.export_otlp(
+            metrics,
+            BUFFERED_BYTES_NAME,
+            BUFFERED_BYTES_HELP,
+            time_unix_nano,
+        );
+    }
+
+    #[cfg(feature = "telemetry-clickhouse")]
+    pub fn export_clickhouse(
+        &self,
+        batch: &mut fast_telemetry::clickhouse::ClickHouseMetricBatch,
+        time_unix_nano: u64,
+    ) {
+        for metric in &COUNTER_METRICS {
+            counter_from_value(self.counter_value(metric.counter_idx)).export_clickhouse(
+                batch,
+                metric.name,
+                metric.help,
+                time_unix_nano,
+            );
+        }
+        self.max_buffered_bytes.export_clickhouse(
+            batch,
+            MAX_BUFFERED_BYTES_NAME,
+            MAX_BUFFERED_BYTES_HELP,
+            time_unix_nano,
+        );
+        self.read_size_bytes.export_clickhouse(
+            batch,
+            READ_SIZE_BYTES_NAME,
+            READ_SIZE_BYTES_HELP,
+            time_unix_nano,
+        );
+        self.buffered_bytes.export_clickhouse(
+            batch,
+            BUFFERED_BYTES_NAME,
+            BUFFERED_BYTES_HELP,
+            time_unix_nano,
+        );
+    }
+
+    #[inline(always)]
+    fn counter_value(&self, counter_idx: usize) -> u64 {
+        let total = self.direct_counters[counter_idx].sum() + self.counters.sum(counter_idx);
+        total.max(0) as u64
+    }
+}
+
+impl ExportMetrics for HandoffReadMetrics {
+    fn visit_metrics<V: MetricVisitor + ?Sized>(&self, visitor: &mut V) {
+        for metric in &COUNTER_METRICS {
+            visitor.counter(
+                MetricMeta {
+                    name: metric.name,
+                    help: metric.help,
+                    kind: MetricKind::Counter,
+                    unit: None,
+                },
+                MetricLabels::none(),
+                saturating_i64_from_u64(self.counter_value(metric.counter_idx)),
+            );
+        }
+        visitor.gauge_i64(
+            MetricMeta {
+                name: MAX_BUFFERED_BYTES_NAME,
+                help: MAX_BUFFERED_BYTES_HELP,
+                kind: MetricKind::Gauge,
+                unit: None,
+            },
+            MetricLabels::none(),
+            self.max_buffered_bytes.get(),
+        );
+        visitor.histogram(
+            MetricMeta {
+                name: READ_SIZE_BYTES_NAME,
+                help: READ_SIZE_BYTES_HELP,
+                kind: MetricKind::Histogram,
+                unit: None,
+            },
+            MetricLabels::none(),
+            &self.read_size_bytes,
+        );
+        visitor.histogram(
+            MetricMeta {
+                name: BUFFERED_BYTES_NAME,
+                help: BUFFERED_BYTES_HELP,
+                kind: MetricKind::Histogram,
+                unit: None,
+            },
+            MetricLabels::none(),
+            &self.buffered_bytes,
+        );
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct HandoffReadMetricsDogStatsDState {
+    counters: [u64; READ_COUNTER_COUNT],
+    read_size_count: u64,
+    read_size_sum: u64,
+    buffered_count: u64,
+    buffered_sum: u64,
+}
+
+impl HandoffReadMetricsDogStatsDState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn tracked_label_sets(&self) -> usize {
+        0
+    }
+}
+
+#[derive(Debug)]
+struct HandoffReadCounterBuffer {
+    deltas: [isize; READ_COUNTER_COUNT],
+    ops_since_flush: usize,
+    flush_every: usize,
+    dirty: bool,
+}
+
+impl Default for HandoffReadCounterBuffer {
+    fn default() -> Self {
+        Self::new(DEFAULT_READ_COUNTER_BUFFER_FLUSH_EVERY)
+    }
+}
+
+impl HandoffReadCounterBuffer {
+    fn new(flush_every: usize) -> Self {
+        assert!(flush_every >= 1, "flush_every must be >= 1");
+        Self {
+            deltas: [0; READ_COUNTER_COUNT],
+            ops_since_flush: 0,
+            flush_every,
+            dirty: false,
+        }
+    }
+
+    fn empty_like(&self) -> Self {
+        Self::new(self.flush_every)
+    }
+
+    #[inline(always)]
+    fn inc(&mut self, counter_idx: usize) {
+        self.add(counter_idx, 1);
+    }
+
+    #[inline(always)]
+    fn add(&mut self, counter_idx: usize, value: isize) {
+        debug_assert!(counter_idx < self.deltas.len());
+        let delta = &mut self.deltas[counter_idx];
+        *delta = delta.saturating_add(value);
+        self.dirty = true;
+    }
+
+    #[inline(always)]
+    fn add_pair(&mut self, first_idx: usize, first: isize, second_idx: usize, second: isize) {
+        self.add(first_idx, first);
+        self.add(second_idx, second);
+    }
+
+    #[inline(always)]
+    fn add_quad(&mut self, updates: [(usize, isize); 4]) {
+        for (counter_idx, value) in updates {
+            self.add(counter_idx, value);
+        }
+    }
+
+    #[inline(always)]
+    fn finish_op(&mut self) -> bool {
+        if !self.dirty {
+            return false;
+        }
+
+        self.dirty = false;
+        self.ops_since_flush += 1;
+        self.ops_since_flush >= self.flush_every
+    }
+
+    #[inline]
+    fn flush_into(&mut self, metrics: &HandoffReadMetrics) {
+        if self.ops_since_flush == 0 && !self.dirty {
+            return;
+        }
+
+        let mut updates = [(0_usize, 0_isize); READ_COUNTER_COUNT];
+        let mut update_count = 0;
+        for (counter_idx, delta) in self.deltas.iter_mut().enumerate() {
+            if *delta == 0 {
+                continue;
+            }
+            updates[update_count] = (counter_idx, *delta);
+            update_count += 1;
+            *delta = 0;
+        }
+        if update_count > 0 {
+            metrics.counters.add_index_values(&updates[..update_count]);
+        }
+        self.ops_since_flush = 0;
+        self.dirty = false;
     }
 }
 
@@ -370,94 +798,128 @@ impl HandoffReadTelemetry {
         self.metrics.snapshot()
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     #[inline(always)]
     fn record_read(&self, read: usize, buffered: usize) {
-        self.metrics.read_calls.inc();
-        self.metrics.read_bytes.add(saturating_isize(read));
         if read == 0 {
-            self.metrics.zero_reads.inc();
+            let updates = [(READ_CALLS, 1), (ZERO_READS, 1)];
+            self.metrics.counters.add_index_values(&updates);
+        } else {
+            let updates = [(READ_CALLS, 1), (READ_BYTES, saturating_isize(read))];
+            self.metrics.counters.add_index_values(&updates);
         }
         self.metrics.read_size_bytes.record(read as u64);
         self.record_buffered(buffered);
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     #[inline(always)]
     fn record_read_error(&self, limit_exceeded: bool) {
-        self.metrics.read_errors.inc();
         if limit_exceeded {
-            self.metrics.read_error_limit_exceeded.inc();
+            let updates = [READ_ERRORS, READ_ERROR_LIMIT_EXCEEDED];
+            self.metrics.counters.add_indices(&updates, 1);
+        } else {
+            self.metrics.counters.inc(READ_ERRORS);
         }
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     #[inline(always)]
     fn record_buffer_growth(&self, bytes: usize) {
-        self.metrics.buffer_growths.inc();
-        self.metrics
-            .buffer_growth_bytes
-            .add(saturating_isize(bytes));
+        let updates = [
+            (BUFFER_GROWTHS, 1),
+            (BUFFER_GROWTH_BYTES, saturating_isize(bytes)),
+        ];
+        self.metrics.counters.add_index_values(&updates);
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     #[inline(always)]
     fn record_split_prefix(&self, bytes: usize, copied: bool, buffered: usize) {
-        self.metrics.split_prefixes.inc();
-        self.metrics.split_prefix_bytes.add(saturating_isize(bytes));
+        let bytes = saturating_isize(bytes);
         match copied {
             true => {
-                self.metrics.copied_prefixes.inc();
-                self.metrics
-                    .copied_prefix_bytes
-                    .add(saturating_isize(bytes));
+                let updates = [
+                    (SPLIT_PREFIXES, 1),
+                    (SPLIT_PREFIX_BYTES, bytes),
+                    (COPIED_PREFIXES, 1),
+                    (COPIED_PREFIX_BYTES, bytes),
+                ];
+                self.metrics.counters.add_index_values(&updates);
             }
             false => {
-                self.metrics.frozen_prefixes.inc();
-                self.metrics
-                    .frozen_prefix_bytes
-                    .add(saturating_isize(bytes));
+                let updates = [
+                    (SPLIT_PREFIXES, 1),
+                    (SPLIT_PREFIX_BYTES, bytes),
+                    (FROZEN_PREFIXES, 1),
+                    (FROZEN_PREFIX_BYTES, bytes),
+                ];
+                self.metrics.counters.add_index_values(&updates);
             }
         }
         self.record_buffered(buffered);
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     #[inline(always)]
     fn record_mutable_prefix(&self, bytes: usize, buffered: usize) {
-        self.metrics.mutable_prefixes.inc();
-        self.metrics
-            .mutable_prefix_bytes
-            .add(saturating_isize(bytes));
+        let updates = [
+            (MUTABLE_PREFIXES, 1),
+            (MUTABLE_PREFIX_BYTES, saturating_isize(bytes)),
+        ];
+        self.metrics.counters.add_index_values(&updates);
         self.record_buffered(buffered);
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     #[inline(always)]
     fn record_freeze_all(&self, bytes: usize) {
-        self.metrics.freeze_all_calls.inc();
-        self.metrics.freeze_all_bytes.add(saturating_isize(bytes));
+        let updates = [
+            (FREEZE_ALL_CALLS, 1),
+            (FREEZE_ALL_BYTES, saturating_isize(bytes)),
+        ];
+        self.metrics.counters.add_index_values(&updates);
         self.record_buffered(0);
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     #[inline(always)]
     fn record_advance(&self, bytes: usize, buffered: usize) {
-        self.metrics.advances.inc();
-        self.metrics.advanced_bytes.add(saturating_isize(bytes));
+        let updates = [(ADVANCES, 1), (ADVANCED_BYTES, saturating_isize(bytes))];
+        self.metrics.counters.add_index_values(&updates);
         self.record_buffered(buffered);
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     #[inline(always)]
     fn record_tail(&self, bytes: usize) {
-        self.metrics.tails_taken.inc();
-        self.metrics.tail_bytes.add(saturating_isize(bytes));
+        let updates = [(TAILS_TAKEN, 1), (TAIL_BYTES, saturating_isize(bytes))];
+        self.metrics.counters.add_index_values(&updates);
         self.record_buffered(0);
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     #[inline(always)]
     #[cfg(feature = "monoio")]
     fn record_monoio_read_buffer_swap(&self) {
-        self.metrics.monoio_read_buffer_swaps.inc();
+        self.metrics.counters.inc(MONOIO_READ_BUFFER_SWAPS);
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     #[inline(always)]
     #[cfg(feature = "monoio")]
     fn record_monoio_read_buffer_copy(&self) {
-        self.metrics.monoio_read_buffer_copies.inc();
+        self.metrics.counters.inc(MONOIO_READ_BUFFER_COPIES);
     }
 
     #[inline(always)]
@@ -469,9 +931,28 @@ impl HandoffReadTelemetry {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct HandoffReadTelemetryHandle {
     inner: Arc<HandoffReadTelemetry>,
+    counter_buffer: Option<HandoffReadCounterBuffer>,
+}
+
+impl Clone for HandoffReadTelemetryHandle {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            counter_buffer: self
+                .counter_buffer
+                .as_ref()
+                .map(HandoffReadCounterBuffer::empty_like),
+        }
+    }
+}
+
+impl Drop for HandoffReadTelemetryHandle {
+    fn drop(&mut self) {
+        self.flush_counter_buffer();
+    }
 }
 
 impl HandoffReadTelemetryHandle {
@@ -479,37 +960,28 @@ impl HandoffReadTelemetryHandle {
     pub fn from_arc(telemetry: &Arc<HandoffReadTelemetry>) -> Self {
         Self {
             inner: Arc::clone(telemetry),
+            counter_buffer: Some(HandoffReadCounterBuffer::default()),
         }
     }
 
     pub fn from_metrics(metrics: HandoffReadMetrics) -> Self {
-        Self {
-            inner: HandoffReadTelemetry::from_metrics(metrics),
-        }
+        Self::from_arc(&HandoffReadTelemetry::from_metrics(metrics))
     }
 
     pub fn from_shared_metrics(metrics: Arc<HandoffReadMetrics>) -> Self {
-        Self {
-            inner: HandoffReadTelemetry::from_shared_metrics(metrics),
-        }
+        Self::from_arc(&HandoffReadTelemetry::from_shared_metrics(metrics))
     }
 
     pub fn from_runtime(runtime: HandoffReadTelemetryRuntime) -> Self {
-        Self {
-            inner: HandoffReadTelemetry::from_runtime(runtime),
-        }
+        Self::from_arc(&HandoffReadTelemetry::from_runtime(runtime))
     }
 
     pub fn from_optional_runtime(runtime: Option<HandoffReadTelemetryRuntime>) -> Self {
-        Self {
-            inner: HandoffReadTelemetry::from_optional_runtime(runtime),
-        }
+        Self::from_arc(&HandoffReadTelemetry::from_optional_runtime(runtime))
     }
 
     pub fn from_optional_shared_metrics(metrics: Option<Arc<HandoffReadMetrics>>) -> Self {
-        Self {
-            inner: HandoffReadTelemetry::from_optional_shared_metrics(metrics),
-        }
+        Self::from_arc(&HandoffReadTelemetry::from_optional_shared_metrics(metrics))
     }
 
     #[inline(always)]
@@ -517,67 +989,183 @@ impl HandoffReadTelemetryHandle {
         self.inner.as_ref()
     }
 
-    #[inline(always)]
-    pub(crate) fn record_read(&self, read: usize, buffered: usize) {
-        self.inner.record_read(read, buffered);
+    pub fn flush_counter_buffer(&mut self) {
+        if let Some(counter_buffer) = &mut self.counter_buffer {
+            counter_buffer.flush_into(self.inner.metrics());
+        }
+    }
+
+    pub fn with_counter_flush_every(mut self, flush_every: usize) -> Self {
+        self.flush_counter_buffer();
+        self.counter_buffer = Some(HandoffReadCounterBuffer::new(flush_every));
+        self
+    }
+
+    pub fn with_direct_counters(mut self) -> Self {
+        self.flush_counter_buffer();
+        self.counter_buffer = None;
+        self
     }
 
     #[inline(always)]
-    pub(crate) fn record_read_error(&self, limit_exceeded: bool) {
-        self.inner.record_read_error(limit_exceeded);
+    fn record_counter_inc(&mut self, counter_idx: usize) {
+        let metrics = self.inner.metrics();
+        match &mut self.counter_buffer {
+            Some(counter_buffer) => {
+                counter_buffer.inc(counter_idx);
+                if counter_buffer.finish_op() {
+                    counter_buffer.flush_into(metrics);
+                }
+            }
+            None => metrics.direct_counters[counter_idx].inc(),
+        }
     }
 
     #[inline(always)]
-    pub(crate) fn record_buffer_growth(&self, bytes: usize) {
-        self.inner.record_buffer_growth(bytes);
+    fn record_counter_pair(
+        &mut self,
+        first_idx: usize,
+        first: isize,
+        second_idx: usize,
+        second: isize,
+    ) {
+        let metrics = self.inner.metrics();
+        match &mut self.counter_buffer {
+            Some(counter_buffer) => {
+                counter_buffer.add_pair(first_idx, first, second_idx, second);
+                if counter_buffer.finish_op() {
+                    counter_buffer.flush_into(metrics);
+                }
+            }
+            None => {
+                metrics.direct_counters[first_idx].add(first);
+                metrics.direct_counters[second_idx].add(second);
+            }
+        }
     }
 
     #[inline(always)]
-    pub(crate) fn record_split_prefix(&self, bytes: usize, copied: bool, buffered: usize) {
-        self.inner.record_split_prefix(bytes, copied, buffered);
+    fn record_counter_quad(&mut self, updates: [(usize, isize); 4]) {
+        let metrics = self.inner.metrics();
+        match &mut self.counter_buffer {
+            Some(counter_buffer) => {
+                counter_buffer.add_quad(updates);
+                if counter_buffer.finish_op() {
+                    counter_buffer.flush_into(metrics);
+                }
+            }
+            None => {
+                for (counter_idx, value) in updates {
+                    metrics.direct_counters[counter_idx].add(value);
+                }
+            }
+        }
     }
 
     #[inline(always)]
-    pub(crate) fn record_mutable_prefix(&self, bytes: usize, buffered: usize) {
-        self.inner.record_mutable_prefix(bytes, buffered);
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_freeze_all(&self, bytes: usize) {
-        self.inner.record_freeze_all(bytes);
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_advance(&self, bytes: usize, buffered: usize) {
-        self.inner.record_advance(bytes, buffered);
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_tail(&self, bytes: usize) {
-        self.inner.record_tail(bytes);
-    }
-
-    #[inline(always)]
-    #[cfg(feature = "monoio")]
-    pub(crate) fn record_monoio_read_buffer_swap(&self) {
-        self.inner.record_monoio_read_buffer_swap();
-    }
-
-    #[inline(always)]
-    #[cfg(feature = "monoio")]
-    pub(crate) fn record_monoio_read_buffer_copy(&self) {
-        self.inner.record_monoio_read_buffer_copy();
-    }
-
-    #[inline(always)]
-    pub(crate) fn record_buffered(&self, buffered: usize) {
+    pub(crate) fn record_read(&mut self, read: usize, buffered: usize) {
+        if read == 0 {
+            self.record_counter_pair(READ_CALLS, 1, ZERO_READS, 1);
+        } else {
+            self.record_counter_pair(READ_CALLS, 1, READ_BYTES, saturating_isize(read));
+        }
+        self.inner.metrics.read_size_bytes.record(read as u64);
         self.inner.record_buffered(buffered);
     }
-}
 
-#[inline(always)]
-fn counter_sum(counter: &Counter) -> u64 {
-    counter.sum().max(0) as u64
+    #[inline(always)]
+    pub(crate) fn record_read_error(&mut self, limit_exceeded: bool) {
+        if limit_exceeded {
+            self.record_counter_pair(READ_ERRORS, 1, READ_ERROR_LIMIT_EXCEEDED, 1);
+        } else {
+            self.record_counter_inc(READ_ERRORS);
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn record_buffer_growth(&mut self, bytes: usize) {
+        self.record_counter_pair(
+            BUFFER_GROWTHS,
+            1,
+            BUFFER_GROWTH_BYTES,
+            saturating_isize(bytes),
+        );
+    }
+
+    #[inline(always)]
+    pub(crate) fn record_split_prefix(&mut self, bytes: usize, copied: bool, buffered: usize) {
+        let bytes = saturating_isize(bytes);
+        match copied {
+            true => {
+                self.record_counter_quad([
+                    (SPLIT_PREFIXES, 1),
+                    (SPLIT_PREFIX_BYTES, bytes),
+                    (COPIED_PREFIXES, 1),
+                    (COPIED_PREFIX_BYTES, bytes),
+                ]);
+            }
+            false => {
+                self.record_counter_quad([
+                    (SPLIT_PREFIXES, 1),
+                    (SPLIT_PREFIX_BYTES, bytes),
+                    (FROZEN_PREFIXES, 1),
+                    (FROZEN_PREFIX_BYTES, bytes),
+                ]);
+            }
+        }
+        self.inner.record_buffered(buffered);
+    }
+
+    #[inline(always)]
+    pub(crate) fn record_mutable_prefix(&mut self, bytes: usize, buffered: usize) {
+        self.record_counter_pair(
+            MUTABLE_PREFIXES,
+            1,
+            MUTABLE_PREFIX_BYTES,
+            saturating_isize(bytes),
+        );
+        self.inner.record_buffered(buffered);
+    }
+
+    #[inline(always)]
+    pub(crate) fn record_freeze_all(&mut self, bytes: usize) {
+        self.record_counter_pair(
+            FREEZE_ALL_CALLS,
+            1,
+            FREEZE_ALL_BYTES,
+            saturating_isize(bytes),
+        );
+        self.inner.record_buffered(0);
+    }
+
+    #[inline(always)]
+    pub(crate) fn record_advance(&mut self, bytes: usize, buffered: usize) {
+        self.record_counter_pair(ADVANCES, 1, ADVANCED_BYTES, saturating_isize(bytes));
+        self.inner.record_buffered(buffered);
+    }
+
+    #[inline(always)]
+    pub(crate) fn record_tail(&mut self, bytes: usize) {
+        self.record_counter_pair(TAILS_TAKEN, 1, TAIL_BYTES, saturating_isize(bytes));
+        self.inner.record_buffered(0);
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "monoio")]
+    pub(crate) fn record_monoio_read_buffer_swap(&mut self) {
+        self.record_counter_inc(MONOIO_READ_BUFFER_SWAPS);
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "monoio")]
+    pub(crate) fn record_monoio_read_buffer_copy(&mut self) {
+        self.record_counter_inc(MONOIO_READ_BUFFER_COPIES);
+    }
+
+    #[inline(always)]
+    pub(crate) fn record_buffered(&mut self, buffered: usize) {
+        self.inner.record_buffered(buffered);
+    }
 }
 
 #[inline(always)]
@@ -601,6 +1189,83 @@ fn saturating_isize(value: usize) -> isize {
 #[inline(always)]
 fn saturating_i64(value: usize) -> i64 {
     value.min(i64::MAX as usize) as i64
+}
+
+#[inline(always)]
+fn saturating_i64_from_u64(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
+}
+
+#[inline]
+fn write_counter_prometheus(output: &mut String, name: &str, help: &str, value: u64) {
+    output.push_str("# HELP ");
+    output.push_str(name);
+    output.push(' ');
+    output.push_str(help);
+    output.push_str("\n# TYPE ");
+    output.push_str(name);
+    output.push_str(" counter\n");
+    output.push_str(name);
+    output.push(' ');
+    output.push_str(&value.to_string());
+    output.push('\n');
+}
+
+#[inline]
+fn write_counter_dogstatsd(output: &mut String, name: &str, value: u64, tags: &[(&str, &str)]) {
+    output.push_str(name);
+    output.push(':');
+    output.push_str(&value.to_string());
+    output.push_str("|c");
+    append_dogstatsd_tags(output, tags);
+    output.push('\n');
+}
+
+#[inline]
+fn write_histogram_dogstatsd(
+    output: &mut String,
+    name: &str,
+    count: u64,
+    sum: u64,
+    tags: &[(&str, &str)],
+) {
+    output.push_str(name);
+    output.push_str(".count:");
+    output.push_str(&count.to_string());
+    output.push_str("|c");
+    append_dogstatsd_tags(output, tags);
+    output.push('\n');
+
+    output.push_str(name);
+    output.push_str(".sum:");
+    output.push_str(&sum.to_string());
+    output.push_str("|c");
+    append_dogstatsd_tags(output, tags);
+    output.push('\n');
+}
+
+#[inline]
+fn append_dogstatsd_tags(output: &mut String, tags: &[(&str, &str)]) {
+    if tags.is_empty() {
+        return;
+    }
+
+    output.push_str("|#");
+    for (idx, (name, value)) in tags.iter().enumerate() {
+        if idx > 0 {
+            output.push(',');
+        }
+        output.push_str(name);
+        output.push(':');
+        output.push_str(value);
+    }
+}
+
+#[cfg(any(feature = "telemetry-otlp", feature = "telemetry-clickhouse"))]
+fn counter_from_value(value: u64) -> Counter {
+    let counter = Counter::new(1);
+    counter.add(value.min(isize::MAX as u64) as isize);
+    counter
 }
 
 #[cfg(test)]
@@ -637,6 +1302,25 @@ mod tests {
         let mut prometheus = String::new();
         metrics.export_prometheus(&mut prometheus);
         assert!(prometheus.contains("bytes_handoff_read_read_calls 1"));
+    }
+
+    #[test]
+    fn grouped_default_and_direct_handles_share_snapshot_counters() {
+        let telemetry = HandoffReadTelemetry::new(1);
+        let mut grouped = HandoffReadTelemetryHandle::from_arc(&telemetry);
+        let mut direct = HandoffReadTelemetryHandle::from_arc(&telemetry).with_direct_counters();
+
+        grouped.record_read(20, 20);
+        direct.record_read(10, 10);
+
+        assert_eq!(telemetry.snapshot().read_calls, 1);
+        assert_eq!(telemetry.snapshot().read_size_bytes.count, 2);
+        grouped.flush_counter_buffer();
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.read_calls, 2);
+        assert_eq!(snapshot.read_bytes, 30);
+        assert_eq!(snapshot.read_size_bytes.count, 2);
     }
 
     #[test]

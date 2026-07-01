@@ -426,7 +426,7 @@ assert_eq!(first_step.thresholds(), &[1]);
 ## Telemetry Feature
 
 The `telemetry` feature exposes `HandoffReadTelemetry` and
-`HandoffReadTelemetryHandle`, backed by `fast-telemetry 0.6`. Attach a handle to
+`HandoffReadTelemetryHandle`, backed by `fast-telemetry 0.7.1`. Attach a handle to
 a buffer when you want read-path counters, size histograms, peak gauges,
 snapshots, or text serialization:
 
@@ -476,7 +476,7 @@ wrapper or handle directly. The older `from_optional_shared_metrics` helpers
 still accept a raw `Arc<HandoffReadMetrics>` for tests or embedded collectors
 that do not use the `fast-telemetry` runtime registry.
 `HandoffReadTelemetry::visit_metrics` and the
-generated `HandoffReadMetrics::visit_metrics` method expose the structured
+`HandoffReadMetrics::visit_metrics` method expose the structured
 `fast_telemetry::MetricVisitor` path for custom in-process collectors.
 
 The read metric set covers successful reads, read errors, buffer-limit read
@@ -484,8 +484,37 @@ errors, read-size and buffered-size distributions, peak buffered bytes, buffer
 growth, prefix split strategy, tail handoff, advance/freeze activity, and
 Monoio read-buffer copy versus swap decisions.
 
+By default, attached `HandoffReadTelemetryHandle`s use a grouped
+`fast_telemetry::CounterSet` buffer. Related counter deltas are accumulated
+locally and flushed to the shared `CounterSet` every
+`DEFAULT_READ_COUNTER_BUFFER_FLUSH_EVERY` operations (currently `1_024`), on
+drop, or when `flush_counter_buffer` / `HandoffBuffer::flush_telemetry` is
+called. This keeps the hot path on the efficient grouped-counter update path
+while avoiding a shared counter write for every read or prefix split.
+
+```rust
+use bytes_handoff::{
+    DEFAULT_READ_COUNTER_BUFFER_FLUSH_EVERY, HandoffBuffer, HandoffReadTelemetry,
+    HandoffReadTelemetryHandle,
+};
+
+let telemetry = HandoffReadTelemetry::with_available_parallelism();
+let handle = HandoffReadTelemetryHandle::from_arc(&telemetry)
+    .with_counter_flush_every(DEFAULT_READ_COUNTER_BUFFER_FLUSH_EVERY);
+let mut buffer = HandoffBuffer::new(64 * 1024).with_telemetry(handle);
+
+buffer.flush_telemetry();
+let exact = telemetry.snapshot();
+```
+
+Call `flush_counter_buffer` or `HandoffBuffer::flush_telemetry` before an exact
+snapshot or export if a buffer is still live. Dropping the handle also flushes
+pending counter deltas. Embedded collectors that need every counter immediately
+visible can opt out with `HandoffReadTelemetryHandle::with_direct_counters()`,
+trading off the grouped default path for direct counter updates.
+
 For exporter loops, the parent application owns the task and destination. The
-crate exposes the metric schema and generated export methods:
+crate exposes the metric schema and export methods:
 
 ```rust
 use bytes_handoff::{HandoffReadMetricsDogStatsDState, HandoffReadTelemetry};

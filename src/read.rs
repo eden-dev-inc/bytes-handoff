@@ -201,7 +201,7 @@ impl HandoffBuffer {
     }
 
     #[cfg(feature = "telemetry")]
-    pub fn attach_telemetry(&mut self, telemetry: HandoffReadTelemetryHandle) {
+    pub fn attach_telemetry(&mut self, mut telemetry: HandoffReadTelemetryHandle) {
         telemetry.record_buffered(self.buf.len());
         self.telemetry = Some(telemetry);
     }
@@ -219,7 +219,15 @@ impl HandoffBuffer {
 
     #[cfg(feature = "telemetry")]
     pub fn clear_telemetry(&mut self) -> Option<HandoffReadTelemetryHandle> {
+        self.flush_telemetry();
         self.telemetry.take()
+    }
+
+    #[cfg(feature = "telemetry")]
+    pub fn flush_telemetry(&mut self) {
+        if let Some(telemetry) = &mut self.telemetry {
+            telemetry.flush_counter_buffer();
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -440,10 +448,21 @@ impl HandoffBuffer {
         self.config.max_len.saturating_sub(self.buf.len())
     }
 
+    #[cfg(not(feature = "telemetry"))]
     fn read_reserve(&self) -> Result<usize, BufferError> {
         match self.remaining_capacity().min(self.config.read_reserve) {
+            0 => Err(BufferError::LimitExceeded {
+                attempted: self.buf.len().saturating_add(1),
+                limit: self.config.max_len,
+            }),
+            reserve => Ok(reserve),
+        }
+    }
+
+    #[cfg(feature = "telemetry")]
+    fn read_reserve(&mut self) -> Result<usize, BufferError> {
+        match self.remaining_capacity().min(self.config.read_reserve) {
             0 => {
-                #[cfg(feature = "telemetry")]
                 self.record_read_error(true);
                 Err(BufferError::LimitExceeded {
                     attempted: self.buf.len().saturating_add(1),
@@ -494,12 +513,22 @@ impl HandoffBuffer {
         read_buf
     }
 
-    #[cfg(feature = "monoio")]
+    #[cfg(all(feature = "monoio", not(feature = "telemetry")))]
     fn check_monoio_read_len(&self, read: usize, reserve: usize) -> Result<(), BufferError> {
         match read.cmp(&reserve) {
             Ordering::Less | Ordering::Equal => Ok(()),
+            Ordering::Greater => Err(BufferError::LimitExceeded {
+                attempted: self.buf.len().saturating_add(read),
+                limit: self.config.max_len,
+            }),
+        }
+    }
+
+    #[cfg(all(feature = "monoio", feature = "telemetry"))]
+    fn check_monoio_read_len(&mut self, read: usize, reserve: usize) -> Result<(), BufferError> {
+        match read.cmp(&reserve) {
+            Ordering::Less | Ordering::Equal => Ok(()),
             Ordering::Greater => {
-                #[cfg(feature = "telemetry")]
                 self.record_read_error(true);
                 Err(BufferError::LimitExceeded {
                     attempted: self.buf.len().saturating_add(read),
@@ -547,74 +576,74 @@ impl HandoffBuffer {
 
     #[cfg(feature = "telemetry")]
     #[inline(always)]
-    fn record_read(&self, read: usize) {
-        if let Some(telemetry) = &self.telemetry {
+    fn record_read(&mut self, read: usize) {
+        if let Some(telemetry) = &mut self.telemetry {
             telemetry.record_read(read, self.buf.len());
         }
     }
 
     #[cfg(feature = "telemetry")]
     #[inline(always)]
-    fn record_read_error(&self, limit_exceeded: bool) {
-        if let Some(telemetry) = &self.telemetry {
+    fn record_read_error(&mut self, limit_exceeded: bool) {
+        if let Some(telemetry) = &mut self.telemetry {
             telemetry.record_read_error(limit_exceeded);
         }
     }
 
     #[cfg(feature = "telemetry")]
     #[inline(always)]
-    fn record_buffer_growth(&self, bytes: usize) {
-        if bytes > 0 {
-            if let Some(telemetry) = &self.telemetry {
-                telemetry.record_buffer_growth(bytes);
-            }
+    fn record_buffer_growth(&mut self, bytes: usize) {
+        if bytes > 0
+            && let Some(telemetry) = &mut self.telemetry
+        {
+            telemetry.record_buffer_growth(bytes);
         }
     }
 
     #[cfg(feature = "telemetry")]
     #[inline(always)]
-    fn record_split_prefix(&self, bytes: usize, copied: bool) {
-        if let Some(telemetry) = &self.telemetry {
+    fn record_split_prefix(&mut self, bytes: usize, copied: bool) {
+        if let Some(telemetry) = &mut self.telemetry {
             telemetry.record_split_prefix(bytes, copied, self.buf.len());
         }
     }
 
     #[cfg(feature = "telemetry")]
     #[inline(always)]
-    fn record_mutable_prefix(&self, bytes: usize) {
-        if let Some(telemetry) = &self.telemetry {
+    fn record_mutable_prefix(&mut self, bytes: usize) {
+        if let Some(telemetry) = &mut self.telemetry {
             telemetry.record_mutable_prefix(bytes, self.buf.len());
         }
     }
 
     #[cfg(feature = "telemetry")]
     #[inline(always)]
-    fn record_freeze_all(&self, bytes: usize) {
-        if let Some(telemetry) = &self.telemetry {
+    fn record_freeze_all(&mut self, bytes: usize) {
+        if let Some(telemetry) = &mut self.telemetry {
             telemetry.record_freeze_all(bytes);
         }
     }
 
     #[cfg(feature = "telemetry")]
     #[inline(always)]
-    fn record_advance(&self, bytes: usize) {
-        if let Some(telemetry) = &self.telemetry {
+    fn record_advance(&mut self, bytes: usize) {
+        if let Some(telemetry) = &mut self.telemetry {
             telemetry.record_advance(bytes, self.buf.len());
         }
     }
 
     #[cfg(feature = "telemetry")]
     #[inline(always)]
-    fn record_tail(&self, bytes: usize) {
-        if let Some(telemetry) = &self.telemetry {
+    fn record_tail(&mut self, bytes: usize) {
+        if let Some(telemetry) = &mut self.telemetry {
             telemetry.record_tail(bytes);
         }
     }
 
     #[cfg(all(feature = "telemetry", feature = "monoio"))]
     #[inline(always)]
-    fn record_monoio_read_destination(&self, destination: MonoioReadDestination) {
-        match (&self.telemetry, destination) {
+    fn record_monoio_read_destination(&mut self, destination: MonoioReadDestination) {
+        match (&mut self.telemetry, destination) {
             (Some(telemetry), MonoioReadDestination::Swap) => {
                 telemetry.record_monoio_read_buffer_swap();
             }
@@ -975,6 +1004,7 @@ mod tests {
         buffer.advance(2).expect("advance payload prefix");
         let tail = buffer.take_tail();
         assert_eq!(&tail[..], b"yload");
+        buffer.flush_telemetry();
 
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot.read_calls, 1);
@@ -1043,6 +1073,7 @@ mod tests {
                 limit: 0
             }
         ));
+        buffer.flush_telemetry();
 
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot.read_calls, 0);
@@ -1067,6 +1098,7 @@ mod tests {
         dense.extend_from_slice(&vec![b'y'; 16 * 1024]);
         buffer.store_monoio_read(dense, 16 * 1024);
         buffer.record_read(16 * 1024);
+        buffer.flush_telemetry();
 
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot.monoio_read_buffer_copies, 1);

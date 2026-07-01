@@ -233,6 +233,8 @@ struct Config {
     read_reserve: usize,
     handoff_flush_bytes: usize,
     read_telemetry: bool,
+    read_telemetry_direct: bool,
+    read_telemetry_counter_flush_every: usize,
     coalescer_stats: bool,
     write_pending_bytes: usize,
     duplex_capacity: usize,
@@ -300,23 +302,32 @@ fn new_handoff_buffer(config: Config, expected_len: usize) -> HandoffBuffer {
         HandoffBufferConfig::new(expected_len + config.read_reserve)
             .with_read_reserve(config.read_reserve),
     );
-    attach_read_telemetry(buffer, config.read_telemetry)
+    attach_read_telemetry(buffer, config)
 }
 
 #[cfg(feature = "telemetry")]
-fn attach_read_telemetry(buffer: HandoffBuffer, enabled: bool) -> HandoffBuffer {
+fn attach_read_telemetry(buffer: HandoffBuffer, config: Config) -> HandoffBuffer {
+    let enabled = config.read_telemetry;
     match enabled {
         true => {
             let telemetry =
                 READ_TELEMETRY.get_or_init(HandoffReadTelemetry::with_available_parallelism);
-            buffer.with_telemetry(HandoffReadTelemetryHandle::from_arc(telemetry))
+            let mut handle = HandoffReadTelemetryHandle::from_arc(telemetry);
+            if config.read_telemetry_direct {
+                handle = handle.with_direct_counters();
+            } else if config.read_telemetry_counter_flush_every > 0 {
+                handle =
+                    handle.with_counter_flush_every(config.read_telemetry_counter_flush_every);
+            }
+            buffer.with_telemetry(handle)
         }
         false => buffer,
     }
 }
 
 #[cfg(not(feature = "telemetry"))]
-fn attach_read_telemetry(buffer: HandoffBuffer, enabled: bool) -> HandoffBuffer {
+fn attach_read_telemetry(buffer: HandoffBuffer, config: Config) -> HandoffBuffer {
+    let enabled = config.read_telemetry;
     debug_assert!(!enabled);
     let _ = enabled;
     buffer
@@ -605,6 +616,8 @@ fn parse_args() -> Cli {
     let mut read_reserve = 16 * 1024usize;
     let mut handoff_flush_bytes = 0usize;
     let mut read_telemetry = false;
+    let mut read_telemetry_direct = false;
+    let mut read_telemetry_counter_flush_every = 0usize;
     let mut coalescer_stats = false;
     let mut write_pending_bytes = 0usize;
     let mut duplex_capacity = 256 * 1024usize;
@@ -700,6 +713,18 @@ fn parse_args() -> Cli {
                 read_telemetry = true;
                 i += 1;
             }
+            "--read-telemetry-direct" => {
+                read_telemetry = true;
+                read_telemetry_direct = true;
+                i += 1;
+            }
+            "--read-telemetry-counter-flush-every" if i + 1 < args.len() => {
+                read_telemetry = true;
+                read_telemetry_counter_flush_every = args[i + 1]
+                    .parse()
+                    .expect("--read-telemetry-counter-flush-every must be an integer");
+                i += 2;
+            }
             "--coalescer-stats" => {
                 coalescer_stats = true;
                 i += 1;
@@ -748,7 +773,7 @@ fn parse_args() -> Cli {
             }
             "--help" => {
                 println!(
-                    "Usage: bench_stream_harness [--transport duplex|cached|tcp] [--role integrated|tcp-service|tcp-driver] [--implementation handoff|monoio_handoff|bytesmut_handoff|manual_vec|raw_copy] [--scenario fragmented|coalesced] [--completion ticket|fire_and_forget] [--worker-threads N] [--connections N] [--route-frames N] [--frame-len N] [--tunnel-bytes N] [--input-fragment N] [--input-model fixed|tcp] [--tcp-mss-bytes N] [--tcp-shard-mode shared|direct] [--read-reserve N] [--handoff-flush-bytes N] [--read-telemetry] [--coalescer-stats] [--write-pending-bytes N] [--duplex-capacity N] [--iterations N] [--duration-seconds N] [--service-addr HOST:PORT] [--sink-addr HOST:PORT] [--ready-file PATH] [--idle-timeout-millis N]"
+                    "Usage: bench_stream_harness [--transport duplex|cached|tcp] [--role integrated|tcp-service|tcp-driver] [--implementation handoff|monoio_handoff|bytesmut_handoff|manual_vec|raw_copy] [--scenario fragmented|coalesced] [--completion ticket|fire_and_forget] [--worker-threads N] [--connections N] [--route-frames N] [--frame-len N] [--tunnel-bytes N] [--input-fragment N] [--input-model fixed|tcp] [--tcp-mss-bytes N] [--tcp-shard-mode shared|direct] [--read-reserve N] [--handoff-flush-bytes N] [--read-telemetry] [--read-telemetry-direct] [--read-telemetry-counter-flush-every N] [--coalescer-stats] [--write-pending-bytes N] [--duplex-capacity N] [--iterations N] [--duration-seconds N] [--service-addr HOST:PORT] [--sink-addr HOST:PORT] [--ready-file PATH] [--idle-timeout-millis N]"
                 );
                 println!("  duplex: in-memory client/proxy/sink transport");
                 println!("  cached: prebuilt payload reader plus counting sink, without driver/sink tasks");
@@ -872,6 +897,8 @@ fn parse_args() -> Cli {
         read_reserve,
         handoff_flush_bytes,
         read_telemetry,
+        read_telemetry_direct,
+        read_telemetry_counter_flush_every,
         coalescer_stats,
         write_pending_bytes,
         duplex_capacity,
@@ -2609,6 +2636,11 @@ fn main() {
     println!("read_reserve={}", config.read_reserve);
     println!("handoff_flush_bytes={}", config.handoff_flush_bytes);
     println!("read_telemetry_enabled={}", config.read_telemetry);
+    println!("read_telemetry_direct={}", config.read_telemetry_direct);
+    println!(
+        "read_telemetry_counter_flush_every={}",
+        config.read_telemetry_counter_flush_every
+    );
     println!("coalescer_stats_enabled={}", config.coalescer_stats);
     println!("write_pending_bytes={}", config.write_pending_bytes());
     println!("duplex_capacity={}", config.duplex_capacity);
@@ -2716,6 +2748,8 @@ mod tests {
             read_reserve: 16 * 1024,
             handoff_flush_bytes: DEFAULT_WRITE_COALESCE_THRESHOLD,
             read_telemetry: false,
+            read_telemetry_direct: false,
+            read_telemetry_counter_flush_every: 0,
             coalescer_stats: false,
             write_pending_bytes: 0,
             duplex_capacity: 256 * 1024,
