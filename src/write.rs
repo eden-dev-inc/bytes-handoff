@@ -815,11 +815,15 @@ impl WriteHandoff {
     }
 
     fn try_send_request(&self, request: WriteMessage) -> Result<(), WriteBackpressure> {
-        let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
-        if self.closed.load(Ordering::Acquire) {
-            return Err(WriteBackpressure::closed(request.release_into_bytes()));
-        }
-        match self.tx.try_send(request) {
+        let result = {
+            let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+            if self.closed.load(Ordering::Acquire) {
+                Err(mpsc::error::TrySendError::Closed(request))
+            } else {
+                self.tx.try_send(request)
+            }
+        };
+        match result {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(request @ WriteMessage::Write(_)))
             | Err(mpsc::error::TrySendError::Full(request @ WriteMessage::FireAndForget(_)))
@@ -849,12 +853,16 @@ impl WriteHandoff {
                 return Err(WriteError::Closed);
             }
         };
-        let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
-        if self.closed.load(Ordering::Acquire) {
-            return Err(WriteError::Closed);
-        }
-        permit.send(request);
-        Ok(())
+        let result = {
+            let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+            if self.closed.load(Ordering::Acquire) {
+                Err(request)
+            } else {
+                permit.send(request);
+                Ok(())
+            }
+        };
+        result.map_err(|_request| WriteError::Closed)
     }
 
     async fn send_fire_and_forget_request_reclaim(
@@ -868,12 +876,16 @@ impl WriteHandoff {
                 return Err((WriteError::Closed, request.release_into_bytes()));
             }
         };
-        let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
-        if self.closed.load(Ordering::Acquire) {
-            return Err((WriteError::Closed, request.release_into_bytes()));
-        }
-        permit.send(WriteMessage::FireAndForget(request));
-        Ok(())
+        let result = {
+            let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+            if self.closed.load(Ordering::Acquire) {
+                Err(request)
+            } else {
+                permit.send(WriteMessage::FireAndForget(request));
+                Ok(())
+            }
+        };
+        result.map_err(|request| (WriteError::Closed, request.release_into_bytes()))
     }
 
     fn mark_closed(&self) {
@@ -1655,6 +1667,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
     use tokio::io::AsyncReadExt;
 
     use super::*;
@@ -2254,6 +2267,75 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(handoff.pending_bytes(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejected_observed_callback_drop_can_reenter_handoff() {
+        struct ReenterOnDrop {
+            handoff: WriteHandoff,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for ReenterOnDrop {
+            fn drop(&mut self) {
+                self.handoff.close();
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for close_before_rejection in [false, true] {
+            let (client, _server) = tokio::io::duplex(64);
+            let handoff = WriteHandoff::spawn(client, WriteHandoffConfig::new(1, 2));
+            if !close_before_rejection {
+                let _ticket = handoff
+                    .try_write(Bytes::from_static(b"a"))
+                    .expect("fills queue");
+            }
+            let drops = Arc::new(AtomicUsize::new(0));
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn({
+                let handoff = handoff.clone();
+                let drops = Arc::clone(&drops);
+                move || {
+                    let marker = ReenterOnDrop {
+                        handoff: handoff.clone(),
+                        drops,
+                    };
+                    let request = handoff
+                        .try_request(
+                            Bytes::from_static(b"b"),
+                            Some(WriteCompletionTarget::callback(Box::new(move |_| {
+                                drop(marker);
+                            }))),
+                        )
+                        .expect("budget permits request");
+                    if close_before_rejection {
+                        handoff.close();
+                    }
+                    let reason = handoff
+                        .try_send_request(request)
+                        .expect_err("request rejected")
+                        .reason();
+                    let _ = done_tx.send(reason);
+                }
+            });
+            let reason = done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reentrant callback Drop must finish without deadlock");
+            worker.join().expect("worker joins");
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                reason,
+                if close_before_rejection {
+                    crate::BackpressureReason::Closed
+                } else {
+                    crate::BackpressureReason::QueueFull
+                }
+            );
+            assert_eq!(
+                handoff.pending_bytes(),
+                usize::from(!close_before_rejection)
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
