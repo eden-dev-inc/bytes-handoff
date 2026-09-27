@@ -17,13 +17,19 @@
 //! features when the parent application wants to serialize or ship those
 //! metrics through `fast-telemetry` exporter loops.
 
+#[cfg(feature = "tokio")]
 mod error;
+mod message;
+#[cfg(feature = "tokio")]
 mod read;
 #[cfg(feature = "telemetry")]
 mod read_telemetry;
+#[cfg(feature = "tokio")]
 mod tune;
+#[cfg(feature = "tokio")]
 mod write;
 
+#[cfg(feature = "tokio")]
 pub use error::{BackpressureReason, BufferError, WriteBackpressure, WriteError};
 #[cfg(any(
     feature = "telemetry-export",
@@ -33,6 +39,11 @@ pub use error::{BackpressureReason, BufferError, WriteBackpressure, WriteError};
     feature = "telemetry-monoio",
 ))]
 pub use fast_telemetry_export as telemetry_export;
+pub use message::{
+    MessageBackpressure, MessageBackpressureReason, MessageConfigError, MessageHandoff,
+    MessageHandoffConfig, MessageReceiver, MessageSender, TrackedMessage,
+};
+#[cfg(feature = "tokio")]
 pub use read::{
     DEFAULT_MONOIO_SPARSE_READ_COPY_DENOMINATOR, DEFAULT_SMALL_PREFIX_COPY_MAX, HandoffBuffer,
     HandoffBufferConfig, HandoffBufferPolicy, HandoffDrainCursor,
@@ -43,6 +54,7 @@ pub use read_telemetry::{
     HandoffReadMetricsDogStatsDState, HandoffReadMetricsSnapshot, HandoffReadTelemetry,
     HandoffReadTelemetryHandle, HandoffReadTelemetryRuntime,
 };
+#[cfg(feature = "tokio")]
 pub use tune::{
     DEFAULT_TUNING_BATCH_SIZE, DEFAULT_TUNING_MAX_READS_PER_FLUSH,
     DEFAULT_TUNING_MAX_THRESHOLD_BYTES, DEFAULT_TUNING_MAX_THRESHOLD_POINTS,
@@ -52,6 +64,7 @@ pub use tune::{
     WriteCoalescingSearchStep, WriteCoalescingTuner, WriteCoalescingTunerConfig,
     WriteCoalescingTuningError,
 };
+#[cfg(feature = "tokio")]
 pub use write::{
     DEFAULT_WRITE_COALESCE_THRESHOLD, DEFAULT_WRITE_MAX_ITEMS, DEFAULT_WRITE_MAX_PENDING_BYTES,
     DEFAULT_WRITE_PENDING_CHUNKS, WriteCoalescer, WriteCoalescerConfig, WriteCoalescerStats,

@@ -17,9 +17,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Install declared MSRV
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.90.0
           components: rustfmt
 
       - name: Check formatting
@@ -32,10 +33,39 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Install declared MSRV
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.90.0
           components: clippy
 
       - name: Check lints
         run: cargo clippy --all-features --all-targets -- -D warnings
+
+  test:
+    name: cargo test (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [default, no-default, all-features]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install declared MSRV
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.90.0
+
+      - name: Test default features
+        if: matrix.features == 'default'
+        run: cargo test
+
+      - name: Test runtime-free message core
+        if: matrix.features == 'no-default'
+        run: cargo test --no-default-features
+
+      - name: Test optional features together
+        if: matrix.features == 'all-features'
+        run: cargo test --all-features
