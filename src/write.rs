@@ -1,7 +1,7 @@
 use bytes::{Bytes, BytesMut};
 use std::io::{self, IoSlice};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -171,6 +171,8 @@ pub struct WriteHandoff {
     tx: mpsc::Sender<WriteMessage>,
     budget: Arc<Budget>,
     closed: Arc<AtomicBool>,
+    admission: Arc<Mutex<()>>,
+    close_notify: Arc<Notify>,
 }
 
 pub struct WriteCoalescer {
@@ -210,13 +212,13 @@ pub struct WriteCompletionStats {
 struct WriteRequest {
     bytes: Bytes,
     completion: Option<oneshot::Sender<Result<(), WriteError>>>,
-    budget_bytes: usize,
+    charge: BudgetCharge,
 }
 
 struct ObservedWriteRequest {
     bytes: Bytes,
     completion: Option<Box<ObservedWriteCompletion>>,
-    budget_bytes: usize,
+    charge: BudgetCharge,
 }
 
 type WriteCompletionCallback = Box<dyn FnOnce(WriteCompletion) + Send + 'static>;
@@ -245,6 +247,13 @@ enum ObservedWriteCompletionTarget {
 
 struct BudgetPermit<'a> {
     budget: &'a Budget,
+    bytes: usize,
+}
+
+/// The charge follows a request through queueing and writing. Dropping a
+/// pending send future or the writer task releases it without a manual path.
+struct BudgetCharge {
+    budget: Arc<Budget>,
     bytes: usize,
 }
 
@@ -290,40 +299,40 @@ impl WriteRequest {
     fn new(
         bytes: Bytes,
         completion: Option<oneshot::Sender<Result<(), WriteError>>>,
-        budget_bytes: usize,
+        charge: BudgetCharge,
     ) -> Self {
         Self {
             bytes,
             completion,
-            budget_bytes,
+            charge,
         }
     }
 
-    fn release_budget(&mut self, budget: &Budget) {
-        budget.release(std::mem::take(&mut self.budget_bytes));
+    fn release_budget(&mut self) {
+        self.charge.release();
     }
 
-    fn release_into_bytes(mut self, budget: &Budget) -> Bytes {
-        self.release_budget(budget);
+    fn release_into_bytes(mut self) -> Bytes {
+        self.release_budget();
         self.bytes
     }
 }
 
 impl ObservedWriteRequest {
-    fn new(bytes: Bytes, completion: Box<ObservedWriteCompletion>, budget_bytes: usize) -> Self {
+    fn new(bytes: Bytes, completion: Box<ObservedWriteCompletion>, charge: BudgetCharge) -> Self {
         Self {
             bytes,
             completion: Some(completion),
-            budget_bytes,
+            charge,
         }
     }
 
-    fn release_budget(&mut self, budget: &Budget) {
-        budget.release(std::mem::take(&mut self.budget_bytes));
+    fn release_budget(&mut self) {
+        self.charge.release();
     }
 
-    fn release_into_bytes(mut self, budget: &Budget) -> Bytes {
-        self.release_budget(budget);
+    fn release_into_bytes(mut self) -> Bytes {
+        self.release_budget();
         self.bytes
     }
 }
@@ -332,34 +341,30 @@ impl WriteMessage {
     fn from_parts(
         bytes: Bytes,
         completion: Option<WriteCompletionTarget>,
-        budget_bytes: usize,
+        charge: BudgetCharge,
     ) -> Self {
         match completion {
             Some(WriteCompletionTarget::StatsTicket(tx)) => {
                 let completion = Box::new(ObservedWriteCompletion::ticket(tx, bytes.len()));
                 Self::ObservedWrite(Box::new(ObservedWriteRequest::new(
-                    bytes,
-                    completion,
-                    budget_bytes,
+                    bytes, completion, charge,
                 )))
             }
             Some(WriteCompletionTarget::Callback(callback)) => {
                 let completion = Box::new(ObservedWriteCompletion::callback(callback, bytes.len()));
                 Self::ObservedWrite(Box::new(ObservedWriteRequest::new(
-                    bytes,
-                    completion,
-                    budget_bytes,
+                    bytes, completion, charge,
                 )))
             }
-            None => Self::FireAndForget(WriteRequest::new(bytes, None, budget_bytes)),
+            None => Self::FireAndForget(WriteRequest::new(bytes, None, charge)),
         }
     }
 
-    fn release_into_bytes(self, budget: &Budget) -> Bytes {
+    fn release_into_bytes(self) -> Bytes {
         match self {
-            Self::Write(request) => request.release_into_bytes(budget),
-            Self::FireAndForget(request) => request.release_into_bytes(budget),
-            Self::ObservedWrite(request) => request.release_into_bytes(budget),
+            Self::Write(request) => request.release_into_bytes(),
+            Self::FireAndForget(request) => request.release_into_bytes(),
+            Self::ObservedWrite(request) => request.release_into_bytes(),
             Self::Drain(_) => unreachable!(),
             Self::Flush(_) => unreachable!(),
             Self::Shutdown => unreachable!(),
@@ -423,14 +428,34 @@ impl<'a> BudgetPermit<'a> {
         Self { budget, bytes }
     }
 
-    fn commit(mut self) -> usize {
-        std::mem::take(&mut self.bytes)
+    fn commit(mut self, budget: Arc<Budget>) -> BudgetCharge {
+        BudgetCharge {
+            budget,
+            bytes: std::mem::take(&mut self.bytes),
+        }
     }
 }
 
 impl Drop for BudgetPermit<'_> {
     fn drop(&mut self) {
         self.budget.release(self.bytes);
+    }
+}
+
+impl BudgetCharge {
+    fn take(&mut self) -> usize {
+        std::mem::take(&mut self.bytes)
+    }
+
+    fn release(&mut self) {
+        let bytes = self.take();
+        self.budget.release(bytes);
+    }
+}
+
+impl Drop for BudgetCharge {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -462,9 +487,23 @@ impl WriteHandoff {
         let (tx, rx) = mpsc::channel(config.max_items);
         let budget = Arc::new(Budget::new(config.max_pending_bytes));
         let closed = Arc::new(AtomicBool::new(false));
-        tokio::spawn(writer_loop(writer, rx, closed.clone(), budget.clone()));
+        let admission = Arc::new(Mutex::new(()));
+        let close_notify = Arc::new(Notify::new());
+        tokio::spawn(writer_loop(
+            writer,
+            rx,
+            closed.clone(),
+            budget.clone(),
+            close_notify.clone(),
+        ));
 
-        Self { tx, budget, closed }
+        Self {
+            tx,
+            budget,
+            closed,
+            admission,
+            close_notify,
+        }
     }
 
     pub fn try_write(&self, bytes: Bytes) -> Result<WriteTicket, WriteBackpressure> {
@@ -589,9 +628,11 @@ impl WriteHandoff {
     }
 
     pub fn close(&self) {
+        let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
         self.closed.store(true, Ordering::Release);
         self.budget.close();
         let _ = self.tx.try_send(WriteMessage::Shutdown);
+        self.close_notify.notify_waiters();
     }
 
     fn try_enqueue(
@@ -645,7 +686,8 @@ impl WriteHandoff {
                 if self.closed.load(Ordering::Acquire) {
                     return Err((WriteError::Closed, bytes));
                 }
-                let request = WriteRequest::new(bytes, None, permit.commit());
+                let request =
+                    WriteRequest::new(bytes, None, permit.commit(Arc::clone(&self.budget)));
                 self.send_fire_and_forget_request_reclaim(request).await
             }
         }
@@ -702,7 +744,11 @@ impl WriteHandoff {
         permit: BudgetPermit<'_>,
     ) -> Result<WriteMessage, WriteBackpressure> {
         match self.closed.load(Ordering::Acquire) {
-            false => Ok(WriteMessage::from_parts(bytes, completion, permit.commit())),
+            false => Ok(WriteMessage::from_parts(
+                bytes,
+                completion,
+                permit.commit(Arc::clone(&self.budget)),
+            )),
             true => Err(WriteBackpressure::closed(bytes)),
         }
     }
@@ -714,7 +760,11 @@ impl WriteHandoff {
         permit: BudgetPermit<'_>,
     ) -> Result<WriteMessage, WriteError> {
         match self.closed.load(Ordering::Acquire) {
-            false => Ok(WriteMessage::from_parts(bytes, completion, permit.commit())),
+            false => Ok(WriteMessage::from_parts(
+                bytes,
+                completion,
+                permit.commit(Arc::clone(&self.budget)),
+            )),
             true => Err(WriteError::Closed),
         }
     }
@@ -726,7 +776,11 @@ impl WriteHandoff {
         permit: BudgetPermit<'_>,
     ) -> Result<WriteRequest, WriteBackpressure> {
         match self.closed.load(Ordering::Acquire) {
-            false => Ok(WriteRequest::new(bytes, completion, permit.commit())),
+            false => Ok(WriteRequest::new(
+                bytes,
+                completion,
+                permit.commit(Arc::clone(&self.budget)),
+            )),
             true => Err(WriteBackpressure::closed(bytes)),
         }
     }
@@ -738,7 +792,11 @@ impl WriteHandoff {
         permit: BudgetPermit<'_>,
     ) -> Result<WriteRequest, WriteError> {
         match self.closed.load(Ordering::Acquire) {
-            false => Ok(WriteRequest::new(bytes, completion, permit.commit())),
+            false => Ok(WriteRequest::new(
+                bytes,
+                completion,
+                permit.commit(Arc::clone(&self.budget)),
+            )),
             true => Err(WriteError::Closed),
         }
     }
@@ -757,22 +815,26 @@ impl WriteHandoff {
     }
 
     fn try_send_request(&self, request: WriteMessage) -> Result<(), WriteBackpressure> {
-        match self.tx.try_send(request) {
+        let result = {
+            let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+            if self.closed.load(Ordering::Acquire) {
+                Err(mpsc::error::TrySendError::Closed(request))
+            } else {
+                self.tx.try_send(request)
+            }
+        };
+        match result {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(request @ WriteMessage::Write(_)))
             | Err(mpsc::error::TrySendError::Full(request @ WriteMessage::FireAndForget(_)))
             | Err(mpsc::error::TrySendError::Full(request @ WriteMessage::ObservedWrite(_))) => {
-                Err(WriteBackpressure::queue_full(
-                    request.release_into_bytes(&self.budget),
-                ))
+                Err(WriteBackpressure::queue_full(request.release_into_bytes()))
             }
             Err(mpsc::error::TrySendError::Closed(request @ WriteMessage::Write(_)))
             | Err(mpsc::error::TrySendError::Closed(request @ WriteMessage::FireAndForget(_)))
             | Err(mpsc::error::TrySendError::Closed(request @ WriteMessage::ObservedWrite(_))) => {
                 self.mark_closed();
-                Err(WriteBackpressure::closed(
-                    request.release_into_bytes(&self.budget),
-                ))
+                Err(WriteBackpressure::closed(request.release_into_bytes()))
             }
             Err(mpsc::error::TrySendError::Full(WriteMessage::Shutdown))
             | Err(mpsc::error::TrySendError::Full(WriteMessage::Drain(_)))
@@ -784,51 +846,46 @@ impl WriteHandoff {
     }
 
     async fn send_request(&self, request: WriteMessage) -> Result<(), WriteError> {
-        match self.tx.send(request).await {
-            Ok(()) => Ok(()),
-            Err(err) => match err.0 {
-                WriteMessage::Write(mut request) => {
-                    request.release_budget(&self.budget);
-                    self.mark_closed();
-                    Err(WriteError::Closed)
-                }
-                WriteMessage::FireAndForget(mut request) => {
-                    request.release_budget(&self.budget);
-                    self.mark_closed();
-                    Err(WriteError::Closed)
-                }
-                WriteMessage::ObservedWrite(mut request) => {
-                    request.release_budget(&self.budget);
-                    self.mark_closed();
-                    Err(WriteError::Closed)
-                }
-                WriteMessage::Drain(_) => unreachable!(),
-                WriteMessage::Flush(_) => unreachable!(),
-                WriteMessage::Shutdown => unreachable!(),
-            },
-        }
+        let permit = match self.tx.reserve().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.mark_closed();
+                return Err(WriteError::Closed);
+            }
+        };
+        let result = {
+            let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+            if self.closed.load(Ordering::Acquire) {
+                Err(request)
+            } else {
+                permit.send(request);
+                Ok(())
+            }
+        };
+        result.map_err(|_request| WriteError::Closed)
     }
 
     async fn send_fire_and_forget_request_reclaim(
         &self,
         request: WriteRequest,
     ) -> Result<(), (WriteError, Bytes)> {
-        match self.tx.send(WriteMessage::FireAndForget(request)).await {
-            Ok(()) => Ok(()),
-            Err(err) => match err.0 {
-                WriteMessage::FireAndForget(request) => {
-                    self.mark_closed();
-                    Err((WriteError::Closed, request.release_into_bytes(&self.budget)))
-                }
-                WriteMessage::Write(_)
-                | WriteMessage::ObservedWrite(_)
-                | WriteMessage::Drain(_)
-                | WriteMessage::Flush(_)
-                | WriteMessage::Shutdown => {
-                    unreachable!()
-                }
-            },
-        }
+        let permit = match self.tx.reserve().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.mark_closed();
+                return Err((WriteError::Closed, request.release_into_bytes()));
+            }
+        };
+        let result = {
+            let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+            if self.closed.load(Ordering::Acquire) {
+                Err(request)
+            } else {
+                permit.send(WriteMessage::FireAndForget(request));
+                Ok(())
+            }
+        };
+        result.map_err(|request| (WriteError::Closed, request.release_into_bytes()))
     }
 
     fn mark_closed(&self) {
@@ -843,6 +900,8 @@ impl Clone for WriteHandoff {
             tx: self.tx.clone(),
             budget: self.budget.clone(),
             closed: self.closed.clone(),
+            admission: self.admission.clone(),
+            close_notify: self.close_notify.clone(),
         }
     }
 }
@@ -1181,6 +1240,7 @@ async fn writer_loop<W>(
     mut rx: mpsc::Receiver<WriteMessage>,
     closed: Arc<AtomicBool>,
     budget: Arc<Budget>,
+    close_notify: Arc<Notify>,
 ) where
     W: AsyncWrite + Unpin,
 {
@@ -1190,7 +1250,19 @@ async fn writer_loop<W>(
 
     loop {
         messages.clear();
-        let received = rx.recv_many(&mut messages, MAX_BATCH_ITEMS).await;
+        let notified = close_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if closed.load(Ordering::Acquire) {
+            rx.close();
+        }
+        let received = tokio::select! {
+            received = rx.recv_many(&mut messages, MAX_BATCH_ITEMS) => received,
+            () = &mut notified => {
+                rx.close();
+                continue;
+            }
+        };
         if received == 0 {
             break;
         }
@@ -1520,13 +1592,12 @@ fn complete_closed(budget: &Budget, requests: &mut [WriteRequest], deliver_compl
 }
 
 fn complete_request(
-    budget: &Budget,
+    _budget: &Budget,
     request: &mut WriteRequest,
     result: Result<(), WriteError>,
     deliver_completion: bool,
 ) {
-    budget.release(request.budget_bytes);
-    request.budget_bytes = 0;
+    request.charge.release();
     if deliver_completion {
         send_completion(request, result);
     } else {
@@ -1541,13 +1612,12 @@ fn send_completion(request: &mut WriteRequest, result: Result<(), WriteError>) {
 }
 
 fn complete_observed_request(
-    budget: &Budget,
+    _budget: &Budget,
     request: &mut ObservedWriteRequest,
     result: Result<(), WriteError>,
     write_window: Option<(Instant, Instant)>,
 ) {
-    budget.release(request.budget_bytes);
-    request.budget_bytes = 0;
+    request.charge.release();
     let (write_started_at, completed_at) = match write_window {
         Some((write_started_at, completed_at)) => (Some(write_started_at), completed_at),
         None => (None, Instant::now()),
@@ -1561,8 +1631,7 @@ fn complete_observed_request(
 fn take_budget(requests: &mut [WriteRequest]) -> usize {
     let mut released = 0usize;
     for request in requests {
-        released = released.saturating_add(request.budget_bytes);
-        request.budget_bytes = 0;
+        released = released.saturating_add(request.charge.take());
     }
     released
 }
@@ -1593,10 +1662,12 @@ fn drain_closed(budget: &Budget, rx: &mut mpsc::Receiver<WriteMessage>) {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll};
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
     use tokio::io::AsyncReadExt;
 
     use super::*;
@@ -1977,12 +2048,367 @@ mod tests {
         ));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_enqueue_releases_reserved_bytes() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let handoff = WriteHandoff::spawn(client, WriteHandoffConfig::new(1, 3));
+        let first = handoff
+            .try_write(Bytes::from_static(b"a"))
+            .expect("first write");
+        let mut waiting = Box::pin(handoff.write(Bytes::from_static(b"bb")));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        assert_eq!(handoff.pending_bytes(), 3);
+        drop(waiting);
+        first.wait().await.expect("first write completes");
+        let mut byte = [0];
+        server
+            .read_exact(&mut byte)
+            .await
+            .expect("read first write");
+        assert_eq!(handoff.pending_bytes(), 0);
+        let second = handoff
+            .try_write(Bytes::from_static(b"bb"))
+            .expect("budget reusable");
+        second.wait().await.expect("second write completes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_observed_enqueue_releases_reserved_bytes() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let handoff = WriteHandoff::spawn(client, WriteHandoffConfig::new(1, 3));
+        let first = handoff
+            .try_write(Bytes::from_static(b"a"))
+            .expect("first write");
+        let mut waiting = Box::pin(handoff.write_with_completion_stats(Bytes::from_static(b"bb")));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        assert_eq!(handoff.pending_bytes(), 3);
+        drop(waiting);
+        first.wait().await.expect("first write completes");
+        let mut byte = [0];
+        server
+            .read_exact(&mut byte)
+            .await
+            .expect("read first write");
+        assert_eq!(handoff.pending_bytes(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_coalescer_enqueue_releases_reserved_bytes() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let handoff = WriteHandoff::spawn(client, WriteHandoffConfig::new(1, 3));
+        let first = handoff
+            .try_write(Bytes::from_static(b"a"))
+            .expect("first write");
+        let mut coalescer = WriteCoalescer::with_threshold(handoff.clone(), 2);
+        let mut waiting = Box::pin(coalescer.write_fire_and_forget(Bytes::from_static(b"bb")));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        assert_eq!(handoff.pending_bytes(), 3);
+        drop(waiting);
+        first.wait().await.expect("first write completes");
+        let mut byte = [0];
+        server
+            .read_exact(&mut byte)
+            .await
+            .expect("read first write");
+        assert_eq!(handoff.pending_bytes(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_ticket_does_not_hold_budget() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let handoff = WriteHandoff::spawn(client, WriteHandoffConfig::new(1, 3));
+        drop(
+            handoff
+                .try_write(Bytes::from_static(b"abc"))
+                .expect("accepted"),
+        );
+        let mut bytes = [0; 3];
+        server
+            .read_exact(&mut bytes)
+            .await
+            .expect("write completes");
+        handoff.drain().await.expect("writer reached barrier");
+        assert_eq!(handoff.pending_bytes(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn io_error_releases_active_and_queued_charges() {
+        struct FailWriter;
+        impl AsyncWrite for FailWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "test failure",
+                )))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let handoff = WriteHandoff::spawn(FailWriter, WriteHandoffConfig::new(2, 4));
+        let first = handoff
+            .try_write(Bytes::from_static(b"aa"))
+            .expect("first write");
+        let second = handoff
+            .try_write(Bytes::from_static(b"bb"))
+            .expect("queued write");
+        assert!(matches!(first.wait().await, Err(WriteError::Io(_))));
+        assert!(matches!(second.wait().await, Err(WriteError::Closed)));
+        assert_eq!(handoff.pending_bytes(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn writer_panic_releases_active_and_queued_charges() {
+        struct PanicWriter;
+        impl AsyncWrite for PanicWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                panic!("writer failed")
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let handoff = WriteHandoff::spawn(PanicWriter, WriteHandoffConfig::new(2, 4));
+        let first = handoff
+            .try_write(Bytes::from_static(b"aa"))
+            .expect("first write");
+        let second = handoff
+            .try_write(Bytes::from_static(b"bb"))
+            .expect("queued write");
+        assert!(matches!(first.wait().await, Err(WriteError::Closed)));
+        assert!(matches!(second.wait().await, Err(WriteError::Closed)));
+        assert_eq!(handoff.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn runtime_shutdown_releases_active_writer_charge() {
+        struct PendingWriter(Arc<AtomicUsize>);
+        impl AsyncWrite for PendingWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Poll::Pending
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime created");
+        let handoff = runtime.block_on(async {
+            let handoff = WriteHandoff::spawn(
+                PendingWriter(Arc::clone(&polls)),
+                WriteHandoffConfig::new(1, 2),
+            );
+            let _ticket = handoff
+                .try_write(Bytes::from_static(b"ab"))
+                .expect("accepted");
+            tokio::task::yield_now().await;
+            assert!(polls.load(Ordering::SeqCst) > 0);
+            handoff
+        });
+        assert_eq!(handoff.pending_bytes(), 2);
+        drop(runtime);
+        assert_eq!(handoff.pending_bytes(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn callback_panic_does_not_retain_budget() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let handoff = WriteHandoff::spawn(client, WriteHandoffConfig::new(1, 2));
+        handoff
+            .try_write_with_completion_callback(Bytes::from_static(b"ab"), |_| {
+                panic!("callback failed")
+            })
+            .expect("accepted");
+        let mut bytes = [0; 2];
+        server
+            .read_exact(&mut bytes)
+            .await
+            .expect("write completed");
+        for _ in 0..100 {
+            if handoff.pending_bytes() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(handoff.pending_bytes(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejected_observed_callback_drop_can_reenter_handoff() {
+        struct ReenterOnDrop {
+            handoff: WriteHandoff,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for ReenterOnDrop {
+            fn drop(&mut self) {
+                self.handoff.close();
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for close_before_rejection in [false, true] {
+            let (client, _server) = tokio::io::duplex(64);
+            let handoff = WriteHandoff::spawn(client, WriteHandoffConfig::new(1, 2));
+            if !close_before_rejection {
+                let _ticket = handoff
+                    .try_write(Bytes::from_static(b"a"))
+                    .expect("fills queue");
+            }
+            let drops = Arc::new(AtomicUsize::new(0));
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn({
+                let handoff = handoff.clone();
+                let drops = Arc::clone(&drops);
+                move || {
+                    let marker = ReenterOnDrop {
+                        handoff: handoff.clone(),
+                        drops,
+                    };
+                    let request = handoff
+                        .try_request(
+                            Bytes::from_static(b"b"),
+                            Some(WriteCompletionTarget::callback(Box::new(move |_| {
+                                drop(marker);
+                            }))),
+                        )
+                        .expect("budget permits request");
+                    if close_before_rejection {
+                        handoff.close();
+                    }
+                    let reason = handoff
+                        .try_send_request(request)
+                        .expect_err("request rejected")
+                        .reason();
+                    let _ = done_tx.send(reason);
+                }
+            });
+            let reason = done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reentrant callback Drop must finish without deadlock");
+            worker.join().expect("worker joins");
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                reason,
+                if close_before_rejection {
+                    crate::BackpressureReason::Closed
+                } else {
+                    crate::BackpressureReason::QueueFull
+                }
+            );
+            assert_eq!(
+                handoff.pending_bytes(),
+                usize::from(!close_before_rejection)
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_finishes_accepted_writes_and_releases_budget() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let handoff = WriteHandoff::spawn(client, WriteHandoffConfig::new(2, 6));
+        let first = handoff
+            .try_write(Bytes::from_static(b"abc"))
+            .expect("first write");
+        let second = handoff
+            .try_write(Bytes::from_static(b"def"))
+            .expect("second write");
+        handoff.close();
+        first.wait().await.expect("first accepted write");
+        second.wait().await.expect("second accepted write");
+        let mut bytes = [0; 6];
+        server
+            .read_exact(&mut bytes)
+            .await
+            .expect("read accepted writes");
+        assert_eq!(&bytes, b"abcdef");
+        assert_eq!(handoff.pending_bytes(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_wakes_writer_when_a_channel_slot_is_reserved() {
+        struct DropWriter(Arc<AtomicUsize>);
+        impl Drop for DropWriter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        impl AsyncWrite for DropWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let handoff = WriteHandoff::spawn(
+            DropWriter(Arc::clone(&drops)),
+            WriteHandoffConfig::new(1, 1),
+        );
+        let reserved = handoff.tx.reserve().await.expect("channel is open");
+        handoff.close();
+        drop(reserved);
+        for _ in 0..100 {
+            if drops.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn request_batches_use_vectored_writes() {
         let writer = CountingWriter::default();
         let calls = writer.vectored_calls.clone();
         let output = writer.output.clone();
-        let budget = Budget::new(64);
+        let budget = Arc::new(Budget::new(64));
         let mut requests = vec![
             request(Bytes::from_static(b"abc"), &budget),
             request(Bytes::from_static(b"def"), &budget),
@@ -1999,11 +2425,18 @@ mod tests {
         assert_eq!(budget.pending(), 0);
     }
 
-    fn request(bytes: Bytes, budget: &Budget) -> WriteRequest {
+    fn request(bytes: Bytes, budget: &Arc<Budget>) -> WriteRequest {
         let budget_bytes = budget
             .try_acquire(bytes.len())
             .expect("test budget has capacity");
-        WriteRequest::new(bytes, None, budget_bytes)
+        WriteRequest::new(
+            bytes,
+            None,
+            BudgetCharge {
+                budget: Arc::clone(budget),
+                bytes: budget_bytes,
+            },
+        )
     }
 
     #[derive(Default)]

@@ -39,14 +39,28 @@ that this crate keeps.
 
 ## Feature Flags
 
-The default crate API targets Tokio `AsyncRead` and `AsyncWrite`.
+The default crate API targets Tokio `AsyncRead` and `AsyncWrite`. The `tokio`
+feature is on by default and preserves the existing stream APIs. For a runtime-free
+owned-message queue, use `default-features = false`; that build does not depend
+on Tokio or the stream-specific `bytes` and `thiserror` crates:
+
+```toml
+bytes-handoff = { version = "2.0", default-features = false }
+```
+
+The `monoio`, `telemetry`, and related optional features imply the Tokio stream
+API. Existing default-feature applications keep those APIs unchanged. In 1.3.x,
+`--no-default-features` still exposed the stream API. When upgrading such an
+application to 2.0, enable `features = ["tokio"]` explicitly to retain those
+stream types and methods. The unpublished 1.4.0 candidate used the same feature
+split and is superseded by 2.0.0 because that no-default API change is breaking.
 
 Enable `monoio` when the application runs thread-local Monoio shards and wants
 to read from `monoio::io::AsyncReadRent` sources without changing the
 `HandoffBuffer` parsing model:
 
 ```toml
-bytes-handoff = { version = "1.3", features = ["monoio"] }
+bytes-handoff = { version = "2.0", features = ["monoio"] }
 ```
 
 Enable `telemetry` to attach `fast-telemetry` counters, histograms, and gauges to
@@ -54,7 +68,7 @@ Enable `telemetry` to attach `fast-telemetry` counters, histograms, and gauges t
 serialize Prometheus or DogStatsD text:
 
 ```toml
-bytes-handoff = { version = "1.3", features = ["telemetry"] }
+bytes-handoff = { version = "2.0", features = ["telemetry"] }
 ```
 
 Enable `telemetry-otlp` or `telemetry-clickhouse` when the parent application
@@ -68,7 +82,7 @@ read API plus `fast-telemetry-export`'s Monoio-native exporter and local
 flushing helpers:
 
 ```toml
-bytes-handoff = { version = "1.3", features = ["telemetry-monoio"] }
+bytes-handoff = { version = "2.0", features = ["telemetry-monoio"] }
 ```
 
 The telemetry feature is disabled by default. When it is off, the optional
@@ -117,6 +131,7 @@ The repository includes small runnable examples:
   bytes accepted by the parser.
 - `read_policy`: configure prefix-copy and Monoio sparse-read handoff policy.
 - `write_handoff`: submit owned bytes to an async writer and await completion.
+- `message_handoff`: transfer a whole owned message with item and byte admission.
 - `write_coalescer`: batch tiny fire-and-forget writes and flush at a message
   boundary.
 - `coalescing_tuner`: choose a write coalescing threshold from measured
@@ -134,6 +149,7 @@ cargo run --example read_and_drain
 cargo run --example read_policy
 cargo run --example write_coalescer
 cargo run --example coalescing_tuner
+cargo run --no-default-features --example message_handoff
 cargo run --features monoio --example monoio_line_protocol
 cargo run --features telemetry --example read_telemetry
 ```
@@ -202,6 +218,37 @@ where
 sparse-read buffer swap heuristic. The default keeps tiny prefixes from holding
 large read allocations while still allowing larger prefixes to use
 `BytesMut::split_to(...).freeze()`.
+
+## Owned Message Handoff
+
+`MessageHandoff` moves complete owned values through a synchronous queue without
+choosing an async runtime. Both limits include messages already handed to a
+consumer, and stay charged while any `TrackedMessage` clone remains alive.
+
+```rust
+use bytes_handoff::{MessageHandoff, MessageHandoffConfig};
+
+let (sender, receiver) =
+    MessageHandoff::new(MessageHandoffConfig::new(128, 1024 * 1024))?;
+let payload = vec![1_u8; 4096];
+sender.try_send(payload, 4096)?;
+
+let message = receiver.try_recv().expect("accepted message");
+assert_eq!(message.len(), 4096);
+drop(message); // Releases one item and 4096 declared bytes.
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`try_send` returns the original value through `MessageBackpressure::into_value`
+when either limit is reached or the queue is closed. Zero-byte messages still
+consume one item. `close()` on either endpoint stops submissions while accepted
+messages remain available to `try_recv()` or `drain()`. Dropping the last sender
+also closes the queue; dropping the last receiver closes it and discards queued
+messages. The wrapper has no owning extraction method. Values that themselves
+provide independent clones or owned handles need an application-specific wrapper
+to keep those copies within a desired budget. The byte count is supplied by the
+caller and represents logical payload admission, not allocator or transport
+memory usage.
 
 ## Write Handoff
 
@@ -550,7 +597,7 @@ should run inside Monoio workers.
 Enable `monoio` to use Monoio's ownership-based I/O traits directly:
 
 ```toml
-bytes-handoff = { version = "1.3", features = ["monoio"] }
+bytes-handoff = { version = "2.0", features = ["monoio"] }
 ```
 
 With the feature enabled, `HandoffBuffer::read_available_monoio` accepts
