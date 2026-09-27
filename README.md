@@ -45,18 +45,22 @@ owned-message queue, use `default-features = false`; that build does not depend
 on Tokio or the stream-specific `bytes` and `thiserror` crates:
 
 ```toml
-bytes-handoff = { version = "1.4", default-features = false }
+bytes-handoff = { version = "2.0", default-features = false }
 ```
 
 The `monoio`, `telemetry`, and related optional features imply the Tokio stream
-API. Existing default-feature applications keep those APIs unchanged.
+API. Existing default-feature applications keep those APIs unchanged. In 1.3.x,
+`--no-default-features` still exposed the stream API. When upgrading such an
+application to 2.0, enable `features = ["tokio"]` explicitly to retain those
+stream types and methods. The unpublished 1.4.0 candidate used the same feature
+split and is superseded by 2.0.0 because that no-default API change is breaking.
 
 Enable `monoio` when the application runs thread-local Monoio shards and wants
 to read from `monoio::io::AsyncReadRent` sources without changing the
 `HandoffBuffer` parsing model:
 
 ```toml
-bytes-handoff = { version = "1.3", features = ["monoio"] }
+bytes-handoff = { version = "2.0", features = ["monoio"] }
 ```
 
 Enable `telemetry` to attach `fast-telemetry` counters, histograms, and gauges to
@@ -64,7 +68,7 @@ Enable `telemetry` to attach `fast-telemetry` counters, histograms, and gauges t
 serialize Prometheus or DogStatsD text:
 
 ```toml
-bytes-handoff = { version = "1.3", features = ["telemetry"] }
+bytes-handoff = { version = "2.0", features = ["telemetry"] }
 ```
 
 Enable `telemetry-otlp` or `telemetry-clickhouse` when the parent application
@@ -78,7 +82,7 @@ read API plus `fast-telemetry-export`'s Monoio-native exporter and local
 flushing helpers:
 
 ```toml
-bytes-handoff = { version = "1.3", features = ["telemetry-monoio"] }
+bytes-handoff = { version = "2.0", features = ["telemetry-monoio"] }
 ```
 
 The telemetry feature is disabled by default. When it is off, the optional
@@ -593,7 +597,7 @@ should run inside Monoio workers.
 Enable `monoio` to use Monoio's ownership-based I/O traits directly:
 
 ```toml
-bytes-handoff = { version = "1.3", features = ["monoio"] }
+bytes-handoff = { version = "2.0", features = ["monoio"] }
 ```
 
 With the feature enabled, `HandoffBuffer::read_available_monoio` accepts
